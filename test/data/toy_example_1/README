@@ -1,0 +1,7 @@
+This toy example was provided by Patrick Turley as an initial test / confirmation that
+preliminary results seemed to be calculated correctly.
+
+The bim file isn't a full .bim file, but for the level of GRMA processing at the moment,
+it doesn't need to be.  At some point, when it is convenient enough, it should probably
+be upgraded to a full .bim file.
+

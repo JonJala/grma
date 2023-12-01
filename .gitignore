@@ -1,0 +1,23 @@
+# Ignore ~ backup files from editors that create them
+*~
+
+# Ignore compiled Python code
+*.pyc
+
+# Ignore pycache
+**/__pycache__
+
+# Ignore log files
+*.log
+
+# Ignore .nfs files
+.nfs*
+
+# Ignore backup files
+*.bak
+*.bkup
+
+# Ignore coverage info
+.coverage*
+**/htmlcov
+
