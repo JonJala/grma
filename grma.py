@@ -448,6 +448,7 @@ def setup_func(argv: List[str], get_parser: ParserFunc,
 def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     """
     Responsible for coordinating whatever initial validation of inputs can be done
+    after argparse has done its part
 
     :param pargs: Result of argparse parsing user command / flags
     :param user_args: Flags explicitly set by the user along with their values
@@ -541,7 +542,7 @@ def main_func(argv: List[str]):
         # Write out the results to disk
         logging.info("Writing results to disk.")
         filename = f"{iargs[OUT_PREFIX]}.res" # TODO(jonbjala)
-        logging.info(f"\t{filename}")
+        logging.debug(f"\t{filename}")
         write_results_to_file(filename, betas, ses)
 
         # Log any remaining information TODO(jonbjala) Timing info?

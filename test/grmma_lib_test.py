@@ -19,6 +19,8 @@ test_directory = os.path.abspath(os.path.join(main_directory, 'test'))
 data_directory = os.path.abspath(os.path.join(test_directory, 'data'))
 
 
+# TODO(jonbjala) Many more tests will need to be written
+
 class TestResidualizePhenotypes:
 
     @pytest.mark.parametrize("N", [1, 10])
@@ -71,4 +73,4 @@ class TestGrma:
 
 
         assert np.allclose(actual_betas, expected_betas, atol=0.0001)
-        # TODO(jonbjala) SEs
+        # TODO(jonbjala) Compare SEs once expected values are available

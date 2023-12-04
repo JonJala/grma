@@ -4,6 +4,8 @@
 Library / core code for GRMA method
 """
 
+# TODO(jonbjala) Functions should have header comments to describe parameters, returns, and pre-/post-conditions
+
 import itertools as it
 import logging
 import time
@@ -19,9 +21,13 @@ from bedbimfam import (BED_SUFFIX, BIM_SUFFIX, FAM_COLS, FAM_FID_COL, FAM_IID_CO
                        get_num_snps_from_bim_file, read_bed_file)
 
 
+# Object to hold relatedness.  Currently implemented as a list of lists (of ints), where
+# the ith element of the outer list is the list of indices of all people to include in
+# the residualization step (the list can simply be passed to numpy for indexing purposes)
 THRESHOLDED_REL_TYPE = List[List[int]]
 
 
+# Columns used in the steps to construct relatedness object
 FID_COL = "FID"
 IID_COL = "IID"
 INDEX_COL = "INDEX"
@@ -29,6 +35,7 @@ INDEX1_COL = "INDEX1"
 INDEX2_COL = "INDEX2"
 
 
+# Columns used from the King output (this will need to be adjusted if King output is changed)
 KING_REL_COL = "Kinship"
 KING_FID1_COL = "FID1"
 KING_IID1_COL = "ID1"
@@ -36,9 +43,11 @@ KING_FID2_COL = "FID2"
 KING_IID2_COL = "ID2"
 NEEDED_KING_COLS = [KING_FID1_COL, KING_IID1_COL, KING_FID2_COL, KING_IID2_COL, KING_REL_COL]
 
-
+# Column name used to label phenotype when pulled in from separate phenotype file
 PHENOFILE_PHENO_COL = "Phenofile_Phenotype"
 
+
+# Default number of SNPs to process at a time
 DEFAULT_SNPS_PER_BLOCK=100
 
 
@@ -132,6 +141,7 @@ def residualize_phenotypes(phenotypes: np.ndarray, rel_info: THRESHOLDED_REL_TYP
 def residualize_genotypes(genotypes: np.ndarray, rel_info: THRESHOLDED_REL_TYPE, *,                          
                           rel_set_sizes: np.ndarray = None) -> np.ndarray:
 
+    # TODO(jonbjala) Might want to experiment with different numpy API calls and approaches to see if there are good speed / memory tradeoffs
     #mean_genos = np.vstack([np.sum(G[:, rel_list], axis=1) for rel_list in rel_info]).T / rel_set_sizes
     mean_genos = np.vstack([np.nanmean(genotypes[:, rel_list], axis=1) for rel_list in rel_info]).T
 
@@ -141,6 +151,9 @@ def residualize_genotypes(genotypes: np.ndarray, rel_info: THRESHOLDED_REL_TYPE,
 # -------------------------
 def run_regressions(residualized_genotypes: np.ndarray,
                     residualized_phenotypes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+
+    # TODO(jonbjala) The math could (will) change when adding covariates, and the calculations for SEs have
+    #                not been fully vetted by Patrick
 
     G_sq_sum_per_snp = np.nansum(np.square(residualized_genotypes), axis=1)
 
