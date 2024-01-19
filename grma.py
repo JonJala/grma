@@ -43,10 +43,10 @@ HEADER = f"""
 <><>
 """
 
-# Relatedness threshold constants
-MIN_RELATEDNESS = 0.0
-MAX_RELATEDNESS = 1.0
-DEFAULT_REL_THRESH = 0.125
+# Relatedness degree constants
+MIN_RELATEDNESS = 1
+MAX_RELATEDNESS = 4
+DEFAULT_REL_DEG = 1
 
 # The default short file prefix to use for output and logs
 DEFAULT_SHORT_PREFIX = "grma"
@@ -63,7 +63,7 @@ FAM_FILE = "Fam file"
 REL_FILE = "Relatedness File"
 PHENO_FILE = "Phenotype File"
 COVAR_FILE = "Covariate File"
-REL_THRESH = "Relatedness Threshold"
+REL_DEG = "Relatedness Degree"
 SNPS_PER_BLOCK = "SNPs Per Block"
 
 
@@ -107,22 +107,23 @@ def input_file(s_input: str) -> str:
 
 
 #################################
-def relatedness(s_input: str) -> float:
+def relatedness(s_input: str) -> str:
     """
-    Used for parsing some inputs to this program, namely a relatedness threshold.
+    Used for parsing some inputs to this program, namely a relatedness degree.
 
-    :return str: The relatedness string input as a float
+    :return str: The relatedness string input as a str
     """
-
+    set_of_inputs = ["FS", "1", "2", "3", "4"]
+ 
     stripped_input = s_input.strip()
-
-    input_as_float = float(stripped_input)
-    if input_as_float < MIN_RELATEDNESS:
-        raise ValueError(f"Input ({input_as_float}) < lower range value ({MIN_RELATEDNESS})")
-    if input_as_float > MAX_RELATEDNESS:
-        raise ValueError(f"Input ({input_as_float}) > upper range value ({MAX_RELATEDNESS})")
-
-    return input_as_float  
+    if stripped_input not in set_of_inputs:
+        raise ValueError("Illegal argument - degree of relatedness")
+    else:
+        try:
+            stripped_input = int(stripped_input)
+        except:
+            pass
+        return stripped_input 
 
 
 #################################
@@ -207,10 +208,11 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
     in_opt.add_argument("--relfile", metavar="FILE", type=input_file, required=True,
                          help=f"File containing relatedness info (in King-like format).  "
                               f"Needs the following columns: {lib.NEEDED_KING_COLS}")
-    in_opt.add_argument("--threshold", metavar="THRESHOLD", type=relatedness,
-                         default=DEFAULT_REL_THRESH,
-                         help=f"Relatedness threshold (between {MIN_RELATEDNESS} and "
-                              f"{MAX_RELATEDNESS}): default = {DEFAULT_REL_THRESH}")
+    in_opt.add_argument("--degree", metavar="DEGREE", type=relatedness,
+                         default=DEFAULT_REL_DEG,
+                         help=f"Relatedness degree that is FS or between {MIN_RELATEDNESS} and "
+                              f"{MAX_RELATEDNESS}: default = {DEFAULT_REL_DEG}")
+
 
     in_opt.add_argument("--pheno", metavar="FILE", type=input_file, default="",
                          help="Optional input to specify a (Plink-style) phenotype file: "
@@ -481,7 +483,7 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         REL_FILE : pargs.relfile,
         PHENO_FILE : pargs.pheno,
         COVAR_FILE : pargs.covar,
-        REL_THRESH : pargs.threshold,
+        REL_DEG : pargs.degree,
         SNPS_PER_BLOCK : pargs.snps_per_block
     }
 
@@ -536,7 +538,7 @@ def main_func(argv: List[str]):
         betas, ses = lib.grma(
             rel_input=iargs[REL_FILE], bed_file=iargs[BED_FILE], bim_file=iargs[BIM_FILE],
             fam_file=iargs[FAM_FILE], pheno_file=iargs[PHENO_FILE], covar_file=iargs[COVAR_FILE],
-            rel_threshold=iargs[REL_THRESH], snps_per_block=iargs[SNPS_PER_BLOCK]
+            rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK]
         )
 
         # Write out the results to disk
