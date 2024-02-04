@@ -45,7 +45,7 @@ HEADER = f"""
 
 # Relatedness degree constants
 MIN_RELATEDNESS = 1
-MAX_RELATEDNESS = 4
+MAX_RELATEDNESS = 4 # This is the max degree that King outputs 
 DEFAULT_REL_DEG = 1
 
 # The default short file prefix to use for output and logs
@@ -105,25 +105,6 @@ def input_file(s_input: str) -> str:
 
     return stripped_filename
 
-
-#################################
-def relatedness(s_input: str) -> str:
-    """
-    Used for parsing some inputs to this program, namely a relatedness degree.
-
-    :return str: The relatedness string input as a str
-    """
-    set_of_inputs = ["FS", "1", "2", "3", "4"]
- 
-    stripped_input = s_input.strip()
-    if stripped_input not in set_of_inputs:
-        raise ValueError("Illegal argument - degree of relatedness")
-    else:
-        try:
-            stripped_input = int(stripped_input)
-        except:
-            pass
-        return stripped_input 
 
 
 #################################
@@ -208,8 +189,9 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
     in_opt.add_argument("--relfile", metavar="FILE", type=input_file, required=True,
                          help=f"File containing relatedness info (in King-like format).  "
                               f"Needs the following columns: {lib.NEEDED_KING_COLS}")
-    in_opt.add_argument("--degree", metavar="DEGREE", type=relatedness,
+    in_opt.add_argument("--degree", metavar="DEGREE",
                          default=DEFAULT_REL_DEG,
+                         choices=["FS", "1", "2", "3", "4"],
                          help=f"Relatedness degree that is FS or between {MIN_RELATEDNESS} and "
                               f"{MAX_RELATEDNESS}: default = {DEFAULT_REL_DEG}")
 

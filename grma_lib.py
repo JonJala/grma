@@ -108,8 +108,10 @@ def _get_id_df_from_fam_file(fam_filename: str) -> int:
 
 # -------------------------
 def convert_king_output_to_rel_info(
-    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree
+    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: str
 ) -> tuple[THRESHOLDED_REL_TYPE, np.ndarray]:
+    MAX_RELATEDNESS = 4  # Maximum degree of relatedness from king output
+
     # Read in King output and filter out unneeded rows (where relatedness is too weak)
     if isinstance(king_output, str):
         king_df = pd.read_csv(king_output, sep=r"\s+")[NEEDED_KING_COLS]
@@ -120,27 +122,26 @@ def convert_king_output_to_rel_info(
             f"Type of parameter king_output ({type(king_output)}) is not supported."
         )
 
-
-    # If FS, then throw everything other than FS and convert to 1 (for later closest relative processing). 
+    # If FS, then throw everything other than FS and convert to 1 (for later closest relative processing).
     # If not FS, then convert FS and PO to 1.
+    # Keep Dup/MZTwin (and FS) in all cases.
+    INF_TO_DEG_MAP = {"Dup/MZTwin": 1, "PO": 1, "FS": 1, "2nd": 2, "3rd": 3, "4th": 4, "UN": 5,}
+    
     if rel_degree == "FS":
-        king_df = king_df[king_df[KING_REL_COL].isin(["FS"])]
-        king_df = king_df.replace({KING_REL_COL: {"FS": 1}})
+        king_df = king_df[king_df[KING_REL_COL].isin(["FS", "Dup/MZTwin"])]
+        king_df[KING_REL_COL] = king_df[KING_REL_COL].map(INF_TO_DEG_MAP)
     else:
         # Replace values of PO, FS with 1 and others with their numeric value. Then, keep only those degrees that are closer.
-        king_df = king_df.replace(
-            {KING_REL_COL: {"PO": 1, "FS": 1, "2nd": 2, "3rd": 3, "4th": 4}}
-        )
-        king_df = king_df[king_df[KING_REL_COL].isin(range(1, rel_degree + 1))]
-        
+        king_df[KING_REL_COL] = king_df[KING_REL_COL].map(INF_TO_DEG_MAP)
+        king_df = king_df[king_df[KING_REL_COL] <= int(rel_degree)]
 
     # Use the .fam file to get FID/IID mapping to person number
     id_df = _get_id_df_from_fam_file(fam_filename)
-    #N = len(id_df)
+    N = len(id_df)
 
     # Construct DataFrame that contains person number (INDEX) pairs that are sufficiently related
 
-    # By merging id_df into king_df twice, obtain king_df with the index columns containing ID - 1.
+    # By merging id_df into king_df twice, obtain king_df with index columns mapping to a unique ID.
     id_df.rename(
         inplace=True,
         columns={FID_COL: KING_FID1_COL, IID_COL: KING_IID1_COL, INDEX_COL: INDEX1_COL},
@@ -156,47 +157,36 @@ def convert_king_output_to_rel_info(
     )
     king_df = king_df.merge(id_df, on=[KING_FID2_COL, KING_IID2_COL], copy=False)
 
-    # Look through both columns for the lowest rel_degree. then keep indices with the lowest rel_degree.
-    # Iterate through all the indices. Then, for each person_num, find the lowest value in the InfType column and put it in a dictionary of {index : degree}
+    # Find the minimum value of KING_REL_COL given groups of indices in index cols. Then combine index, degree pairs into a single lowest_degree series.
+    ind1_mins = king_df.groupby(by=INDEX1_COL)[KING_REL_COL].min()
+    ind2_mins = king_df.groupby(by=INDEX2_COL)[KING_REL_COL].min()
 
-    M = max(max(king_df[INDEX1_COL]), max(king_df[INDEX2_COL]))
-    closest_id = {}
-    for person_num in range(0, M + 1):
-        filter1 = king_df[KING_REL_COL][king_df[INDEX2_COL] == person_num]
-        filter2 = king_df[KING_REL_COL][king_df[INDEX1_COL] == person_num]
+    # Initialize a Pandas Series that contains every index number with a degree that is too high
+    max_degree_series = pd.Series([MAX_RELATEDNESS + 1] * N)
 
-        if filter1.empty:
-            if filter2.empty:
-                closest_id[person_num] = "NaN"
-            elif not filter2.empty:
-                closest_id[person_num] = min(filter2)
+    # Combine the two ind_mins Series into a Series that contains the min degree of individuals who have sufficiently close relatives
+    # Then, to have a complete Series containing all indices of individuals, combine that with max_degree_series
+    lowest_degree = ind1_mins.combine(ind2_mins, min, MAX_RELATEDNESS + 1)
+    lowest_degree = lowest_degree.combine(max_degree_series, min, MAX_RELATEDNESS + 1)
 
-        elif filter2.empty:
-            if filter1.empty:
-                closest_id[person_num] = "NaN"
-            elif not filter1.empty:
-                closest_id[person_num] = min(filter1)
-
-        elif not filter1.empty and not filter2.empty:
-            closest_id[person_num] = min(min(filter1), min(filter2))
-
+    # Store a list of lists that contains groups of individuals who are closely related
     rel_info = [
         list(
             sorted(
                 it.chain(
                     king_df[INDEX1_COL][
                         (king_df[INDEX2_COL] == person_num)
-                        & (king_df[KING_REL_COL] == closest_id[person_num])
+                        & (king_df[KING_REL_COL] == lowest_degree[person_num])
                     ],
                     king_df[INDEX2_COL][
                         (king_df[INDEX1_COL] == person_num)
-                        & (king_df[KING_REL_COL] == closest_id[person_num])
+                        & (king_df[KING_REL_COL] == lowest_degree[person_num])
                     ],
                     [person_num],
                 )
             )
         )
-        for person_num in range(0, M + 1)
+        for person_num in range(N)
     ]
 
     rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info], dtype=float)
@@ -212,20 +202,9 @@ def residualize_phenotypes(
 ) -> np.ndarray:
     # TODO(jonbjala)  Handle missing phenotype values? DROP THEM
     N = len(phenotypes)
-    rel_set_sizes = (
-        np.array([len(rel_list) for rel_list in rel_info], dtype=float)
-        if rel_set_sizes is None
-        else rel_set_sizes
-    )  # TODO(jonbjala) Make this a function?
+    rel_set_sizes = (np.array([len(rel_list) for rel_list in rel_info], dtype=float) if rel_set_sizes is None else rel_set_sizes)  # TODO(jonbjala) Make this a function?
 
-    mean_phenos = (
-        np.fromiter(
-            (np.sum(phenotypes[rel_list]) for rel_list in rel_info),
-            dtype=float,
-            count=N,
-        )
-        / rel_set_sizes
-    )
+    mean_phenos = (np.fromiter((np.sum(phenotypes[rel_list]) for rel_list in rel_info), dtype=float, count=N,)/ rel_set_sizes)
 
     return phenotypes - mean_phenos
 
@@ -239,9 +218,7 @@ def residualize_genotypes(
 ) -> np.ndarray:
     # TODO(jonbjala) Might want to experiment with different numpy API calls and approaches to see if there are good speed / memory tradeoffs
     # mean_genos = np.vstack([np.sum(G[:, rel_list], axis=1) for rel_list in rel_info]).T / rel_set_sizes
-    mean_genos = np.vstack(
-        [np.nanmean(genotypes[:, rel_list], axis=1) for rel_list in rel_info]
-    ).T
+    mean_genos = np.vstack([np.nanmean(genotypes[:, rel_list], axis=1) for rel_list in rel_info]).T
 
     return genotypes - mean_genos
 
@@ -297,7 +274,7 @@ def grma(
     # Construct the relatedness object
     logging.debug("Converting King output to actionable relatedness info...")
     start_time = time.time()
-    thresh_rel_info, rel_set_sizes = convert_king_output_to_rel_info(
+    rel_info, rel_set_sizes = convert_king_output_to_rel_info(
         rel_input, fam_file, rel_degree
     )
     logging.info(f"Processed King output in {time.time() - start_time} seconds")
@@ -309,7 +286,7 @@ def grma(
         phenotypes=get_phenotypes_from_file(
             pheno_filename=pheno_file, fam_filename=fam_file
         ),
-        rel_info=thresh_rel_info,
+        rel_info=rel_info,
         rel_set_sizes=rel_set_sizes,
     )
     logging.info(f"Residualized the phenotypes in {time.time() - start_time} seconds")
@@ -334,7 +311,7 @@ def grma(
                     M_start=M_start,
                     num_snps=num_snps_in_block,
                 ),
-                rel_info=thresh_rel_info,
+                rel_info=rel_info,
                 rel_set_sizes=rel_set_sizes,
             ),
             residualized_phenotypes=P,
