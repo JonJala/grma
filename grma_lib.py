@@ -92,17 +92,21 @@ def get_phenotypes_from_file(pheno_filename: str, fam_filename: str):
 # -------------------------
 
 
-# Creates a dataframe of FID, IID and Index number (from 0) from the .fam file
+# Creates a dataframe of FID, IID and Index number (from 0) from the .fam file or a .fam df
 def _get_id_df_from_fam_file(fam_filename: str) -> int:
-    id_df = pd.read_csv(
-        fam_filename,
-        sep=r"\s+",
-        usecols=(0, 1),
-        names=[FID_COL, IID_COL],
-        index_col=False,
-    )
-    id_df[INDEX_COL] = range(len(id_df))
+    
+    # Make id_df using either a fam file or a fam dataframe
+    if isinstance(fam_filename, str):
+        id_df = pd.read_csv(fam_filename, sep=r"\s+", usecols = (0, 1), names = [FID_COL, IID_COL], index_col=False)
+        
+    elif isinstance(fam_filename, pd.DataFrame):
+        id_df = fam_filename[[FID_COL, IID_COL]]
+    else:
+        raise TypeError(f"Type of parameter fam_file ({type(fam_filename)}) is not supported.")    
 
+    # Create an index col 
+    id_df[INDEX_COL] = range(len(id_df))
+    
     return id_df
 
 
@@ -118,13 +122,11 @@ def convert_king_output_to_rel_info(
     elif isinstance(king_output, pd.DataFrame):
         king_df = king_output
     else:
-        raise TypeError(
-            f"Type of parameter king_output ({type(king_output)}) is not supported."
-        )
+        raise TypeError(f"Type of parameter king_output ({type(king_output)}) is not supported.")
 
-    # If FS, then throw everything other than FS and convert to 1 (for later closest relative processing).
+    # If FS, then throw everything other than FS and Dup/MZTwin and convert to 1 (for later closest relative processing).
     # If not FS, then convert FS and PO to 1.
-    # Keep Dup/MZTwin (and FS) in all cases.
+    # Keep Dup/MZTwin (and FS) in all cases (converted to 1).
     INF_TO_DEG_MAP = {"Dup/MZTwin": 1, "PO": 1, "FS": 1, "2nd": 2, "3rd": 3, "4th": 4, "UN": 5,}
     
     if rel_degree == "FS":
@@ -139,7 +141,7 @@ def convert_king_output_to_rel_info(
     id_df = _get_id_df_from_fam_file(fam_filename)
     N = len(id_df)
 
-    # Construct DataFrame that contains person number (INDEX) pairs that are sufficiently related
+    # Construct DataFrame that contains person number (INDEX) pairs that are related along with their degree of relation (from king output)
 
     # By merging id_df into king_df twice, obtain king_df with index columns mapping to a unique ID.
     id_df.rename(
