@@ -191,7 +191,7 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
                               f"Needs the following columns: {lib.NEEDED_KING_COLS}")
     in_opt.add_argument("--degree", metavar="DEGREE",
                          default=DEFAULT_REL_DEG,
-                         choices=["FS", "1", "2", "3", "4"],
+                         choices=lib.REL_DEG_INPUTS,
                          help=f"Relatedness degree that is FS or between {MIN_RELATEDNESS} and "
                               f"{MAX_RELATEDNESS}: default = {DEFAULT_REL_DEG}")
 

@@ -63,6 +63,8 @@ NEEDED_KING_COLS = [
 # Column name used to label phenotype when pulled in from separate phenotype file
 PHENOFILE_PHENO_COL = "Phenofile_Phenotype"
 
+# List of inputs to accept as flags to specify degree of relation allowed
+REL_DEG_INPUTS = ["FS", "1", "2", "3", "4"]
 
 # Default number of SNPs to process at a time
 DEFAULT_SNPS_PER_BLOCK = 100
@@ -175,6 +177,7 @@ def convert_king_output_to_rel_info(
     rel_info = [
         list(
             sorted(
+                set(
                 it.chain(
                     king_df[INDEX1_COL][
                         (king_df[INDEX2_COL] == person_num)
@@ -185,6 +188,7 @@ def convert_king_output_to_rel_info(
                         & (king_df[KING_REL_COL] == lowest_degree[person_num])
                     ],
                     [person_num],
+                )
                 )
             )
         )
