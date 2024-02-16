@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+pd.options.mode.copy_on_write = True
 
 from bedbimfam import (BED_SUFFIX, BIM_SUFFIX, FAM_SUFFIX)
 import grma_lib as lib
@@ -104,7 +105,6 @@ def input_file(s_input: str) -> str:
         raise ValueError(f"Input \"{stripped_filename}\" does not appear to be a file.")
 
     return stripped_filename
-
 
 
 #################################
@@ -483,7 +483,6 @@ def write_results_to_file(filename: str, betas: np.ndarray, ses: np.ndarray):
     # TODO(jonbjala) Write this function
     print(f"Results = {betas}, {ses}")
     pass
-
 
 
 #################################

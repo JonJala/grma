@@ -15,6 +15,7 @@ import bitarray as ba
 import bitarray.util as baut
 import numpy as np
 import pandas as pd
+pd.options.mode.copy_on_write = True
 
 from bedbimfam import (
     BED_SUFFIX,

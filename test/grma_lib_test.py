@@ -12,18 +12,19 @@ sys.path.append(main_directory)
 import numpy as np
 import pytest
 import pandas as pd
+pd.options.mode.copy_on_write = True
 import itertools as it
 
 import grma_lib as sut
 
 
-rng = np.random.default_rng()
+# rng = np.random.default_rng(seed=0)
 test_directory = os.path.abspath(os.path.join(main_directory, "test"))
 data_directory = os.path.abspath(os.path.join(test_directory, "data"))
 testcase_name = "toy_example_1"
 testcase_dir = os.path.join(data_directory, testcase_name)
-        # fam_file = '/disk/genetics/ws/dhruvaj/grma/test/data/toy_example_1/toy_example_1.fam'
-#fam_file = os.path.join(testcase_dir, f"{testcase_name}.fam")
+# fam_file = '/disk/genetics/ws/dhruvaj/grma/test/data/toy_example_1/toy_example_1.fam'
+# fam_file = os.path.join(testcase_dir, f"{testcase_name}.fam")
 
 # TODO(jonbjala) Many more tests will need to be written
 
@@ -61,7 +62,7 @@ def KingOutput_DisconnectedRels():
     }
     df = pd.DataFrame(king_output)
     return df
- 
+
 def generate_KingOutput_SameDegree(inftype: str):
     
     NUM_RELS = 7
@@ -86,14 +87,15 @@ def generate_KingOutput_SameDegree(inftype: str):
     df = pd.DataFrame(king_output)
     df = df.loc[df["ID1"] != df["ID2"]]
     return df    
-    
+
 @pytest.fixture()
 def KingOutput_SameDegree(request):
     # Allowed InfTypes are ["Dup/MZTwin", "FS", "PO" "1", "2", "3", "4"]
     return generate_KingOutput_SameDegree(inftype=request.param)
 
 def fam_file_format(num_rows: int):
-    # fam file can be at most 20 indivs long due to PHENO list being 20 values long. 
+    # Sets rng to simulate num_rows number of phenotypes
+    rng = np.random.default_rng(seed=0)
     NUM_ROWS = num_rows
 
     FID = [1] * NUM_ROWS
@@ -101,9 +103,8 @@ def fam_file_format(num_rows: int):
     IIDF = [0] * NUM_ROWS
     IIDM = [0] * NUM_ROWS 
     SEX = [1] * NUM_ROWS
-    PHENO = [4.0, 3.0, 4.0, 3.0, 2.0, 3.0, 6.0, 4.0, 4.0, 3.0, 4.0, 3.0, 2.0, 3.0, 6.0, 4.0, 4.0, 3.0, 4.0, 3.0]
-    PHENO = PHENO[0:NUM_ROWS]
-    
+    PHENO = list(rng.integers(1, 6, size=num_rows).astype(float))
+
     fam_file = {
         "FID": FID,
         "IID": IID,
@@ -235,5 +236,3 @@ class TestKingOutputtoRelInfo:
         
         actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=sut.REL_DEG_INPUTS[rel_index])
         assert len(list(it.chain(*actual_rel_info))) == expected_size
-        
-        
