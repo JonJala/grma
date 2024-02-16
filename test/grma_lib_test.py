@@ -62,7 +62,7 @@ def KingOutput_DisconnectedRels():
     df = pd.DataFrame(king_output)
     return df
  
-def generate_KingOutput_SameDegree():
+def generate_KingOutput_SameDegree(inftype: str):
     
     NUM_RELS = 7
     NUM_ROWS = NUM_RELS * (NUM_RELS)
@@ -73,7 +73,7 @@ def generate_KingOutput_SameDegree():
     FID1 = [1] * NUM_ROWS
     FID2 = [1] * NUM_ROWS
     Kinship = [0.50] * NUM_ROWS
-    InfType = ["Dup/MZTwin"] * NUM_ROWS
+    InfType = [inftype] * NUM_ROWS
 
     king_output = {
         "ID1" : ID1,
@@ -87,11 +87,13 @@ def generate_KingOutput_SameDegree():
     df = df.loc[df["ID1"] != df["ID2"]]
     return df    
     
-@pytest.fixture
-def KingOutput_SameDegree():
-    return generate_KingOutput_SameDegree()
+@pytest.fixture()
+def KingOutput_SameDegree(request):
+    # Allowed InfTypes are ["Dup/MZTwin", "FS", "PO" "1", "2", "3", "4"]
+    return generate_KingOutput_SameDegree(inftype=request.param)
 
-def fam_file_format(num_rows):
+def fam_file_format(num_rows: int):
+    # fam file can be at most 20 indivs long due to PHENO list being 20 values long. 
     NUM_ROWS = num_rows
 
     FID = [1] * NUM_ROWS
@@ -114,7 +116,7 @@ def fam_file_format(num_rows):
     return fam_df
 
 @pytest.fixture
-def base_fam_file():
+def short_fam_file():
     return fam_file_format(num_rows=8)
 
 @pytest.fixture
@@ -122,7 +124,7 @@ def long_fam_file():
     return fam_file_format(num_rows=20)
 
 class TestKingOutputtoRelInfo:
-    def test_DropEnds(self, base_king_output, base_fam_file):
+    def test_DropEnds(self, base_king_output, short_fam_file):
         # Start and end IDs are dropped given rel degree 3 but everyone else stays
         rel_degree = "3"
         df = base_king_output
@@ -130,12 +132,12 @@ class TestKingOutputtoRelInfo:
         
         expected_rel_info = [[0], [1, 2], [1, 2, 5], [3], [1, 4], [2, 5], [5, 6], [7]]
         expected_rel_size = np.array([1.0, 2.0, 3.0, 1.0, 2.0, 2.0, 2.0, 1.0])
-        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=df, fam_filename=base_fam_file, rel_degree=rel_degree)
+        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=df, fam_filename=short_fam_file, rel_degree=rel_degree)
 
         assert actual_rel_info == expected_rel_info
         assert np.array_equal(actual_rel_sizes, expected_rel_size)
         
-    def test_DropBetween(self, base_king_output, base_fam_file):    
+    def test_DropBetween(self, base_king_output, short_fam_file):    
         # Start is UN so dropped and last ID is kept given rel degree 2. Some pairs are dropped in between. 
         rel_degree = "2"
         df = base_king_output
@@ -143,12 +145,12 @@ class TestKingOutputtoRelInfo:
         
         expected_rel_info = [[0], [1, 2], [1, 2, 5], [3], [1, 4], [2, 5, 7], [5, 6], [5,7]]
         expected_rel_size = np.array([1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 2.0, 2.0])
-        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=df, fam_filename=base_fam_file, rel_degree=rel_degree)
+        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=df, fam_filename=short_fam_file, rel_degree=rel_degree)
 
         assert actual_rel_info == expected_rel_info
         assert np.array_equal(actual_rel_sizes, expected_rel_size)
      
-    def test_FS(self, base_king_output, base_fam_file):    
+    def test_FS(self, base_king_output, short_fam_file):    
         # Checking rel degree = FS protocol works as expected. 
         rel_degree = "FS"
         df = base_king_output
@@ -156,19 +158,19 @@ class TestKingOutputtoRelInfo:
         
         expected_rel_info = [[0], [1, 2], [1, 2, 5], [3], [4], [2, 5], [6], [7]]
         expected_rel_size = np.array([1.0, 2.0, 3.0, 1.0, 1.0, 2.0, 1.0, 1.0])
-        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=df, fam_filename=base_fam_file, rel_degree=rel_degree)
+        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=df, fam_filename=short_fam_file, rel_degree=rel_degree)
 
         assert actual_rel_info == expected_rel_info
         assert np.array_equal(actual_rel_sizes, expected_rel_size) 
         
-    def test_NoObs(self, base_king_output, base_fam_file):
+    def test_NoObs(self, base_king_output, short_fam_file):
         rel_degree = "1"
         df = base_king_output
         df["InfType"] = ["2nd", "3rd", "3rd", "4th", "2nd", "3rd", "4th", "4th", "3rd", "2nd", "3rd",]
         
         expected_rel_info = [[0], [1], [2], [3], [4], [5], [6], [7]]
         expected_rel_size = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
-        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=df, fam_filename=base_fam_file, rel_degree=rel_degree)
+        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=df, fam_filename=short_fam_file, rel_degree=rel_degree)
 
         assert actual_rel_info == expected_rel_info
         assert np.array_equal(actual_rel_sizes, expected_rel_size)          
@@ -176,10 +178,11 @@ class TestKingOutputtoRelInfo:
     # test__iid_value_doesnt_matter makes sure that no matter where the excluded ID is (due to having relatives that are not close enough), the rel info object is calculated correctly.
     # It does this by iterating through 1 until the Max_ID, and setting every row that contains a degree equal to the counter to UN.
     # Since this DF holds individuals who are all fully connected with the rest of the pop and all with the same degree of relation, this ensures that the iid observed has length of the rel_list for iid = 1 (due to UN relatives), while the rest are still connected to everyone else (Max_ID - 1)       
-    DF2 = generate_KingOutput_SameDegree()
+    DF2 = generate_KingOutput_SameDegree(inftype="Dup/MZTwin") # InfType doesn't matter here, as we only care about max_ID for range in iid parametrization. 
     DF2_MAX_ID = max(DF2['ID1'].max(), DF2['ID2'].max())
     # Since iid is a range, the test will be run DF2_MAX_ID times, each time with a single iid value. 
     @pytest.mark.parametrize("iid", range(1, DF2_MAX_ID + 1))
+    @pytest.mark.parametrize("KingOutput_SameDegree", ["Dup/MZTwin"], indirect=True)
     def test__iid_value_doesnt_matter(self, KingOutput_SameDegree, long_fam_file, iid):
 
         rel_degree = "4"
@@ -204,7 +207,7 @@ class TestKingOutputtoRelInfo:
         fam_df = long_fam_file
         king_df= KingOutput_DisconnectedRels
         
-        expected_sizes = [[1]] * (len(fam_df))
+        expected_sizes = [[1]] * len(fam_df)
         expected_sizes[0:(4 + 2*rel_index)] = [["a", "b"]] * (4+ 2*rel_index)
 
         actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=sut.REL_DEG_INPUTS[rel_index])
@@ -212,5 +215,25 @@ class TestKingOutputtoRelInfo:
         assert len(list(it.chain(*actual_rel_info))) == len(list(it.chain(*expected_sizes)))
         assert all(len(actual_rel_info[i]) == len(expected_sizes[i]) for i in range(len(fam_df)))
 
-            
+    # test__varying_threshold_within_every_degree uses the fully connected df to vary both InfType values within the df and rel_degrees and ensures that rel sizes are correct. 
+    ALLOWED_INFTYPES = ["Dup/MZTwin", "FS", "PO", "2nd", "3rd", "4th"]
+    @pytest.mark.parametrize("KingOutput_SameDegree", ALLOWED_INFTYPES, indirect=True)    
+    @pytest.mark.parametrize("rel_index", range(len(sut.REL_DEG_INPUTS)))
+    def test__varying_threshold_within_every_degree(self, KingOutput_SameDegree, long_fam_file, rel_index):
+        fam_df = long_fam_file
+        king_df = KingOutput_SameDegree
+        MAX_ID = max(king_df['ID1'].max(), king_df['ID2'].max())
+        ALLOWED_INFTYPES = ["Dup/MZTwin", "FS", "PO", "2nd", "3rd", "4th"]
+        inftype = king_df["InfType"][1]
+        inftype_index = ALLOWED_INFTYPES.index(inftype)
+        
+        if inftype_index - 1 <= rel_index:
+            num_singletons = len(fam_df) - MAX_ID
+            expected_size = (MAX_ID * MAX_ID) + num_singletons
+        else:
+            expected_size = len(fam_df)
+        
+        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=sut.REL_DEG_INPUTS[rel_index])
+        assert len(list(it.chain(*actual_rel_info))) == expected_size
+        
         
