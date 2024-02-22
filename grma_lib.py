@@ -15,6 +15,7 @@ import bitarray as ba
 import bitarray.util as baut
 import numpy as np
 import pandas as pd
+# Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to increase clarity about whether objects are views or copies (https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#)
 pd.options.mode.copy_on_write = True
 
 from bedbimfam import (
@@ -66,6 +67,9 @@ PHENOFILE_PHENO_COL = "Phenofile_Phenotype"
 
 # List of inputs to accept as flags to specify degree of relation allowed
 REL_DEG_INPUTS = ["FS", "1", "2", "3", "4"]
+
+# List of possible InfTypes in a King output file. 
+INF_TO_DEG_MAP = {"Dup/MZTwin": 1, "FS": 1, "PO": 1, "2nd": 2, "3rd": 3, "4th": 4, "UN": 5,}
 
 # Default number of SNPs to process at a time
 DEFAULT_SNPS_PER_BLOCK = 100
@@ -127,10 +131,10 @@ def convert_king_output_to_rel_info(
     else:
         raise TypeError(f"Type of parameter king_output ({type(king_output)}) is not supported.")
 
-    # If FS, then throw everything other than FS and Dup/MZTwin and convert to 1 (for later closest relative processing).
+    # Using INF_TO_DEG_MAP, if FS, then throw everything other than FS and Dup/MZTwin and convert to 1 (for later closest relative processing).
     # If not FS, then convert FS and PO to 1.
     # Keep Dup/MZTwin (and FS) in all cases (converted to 1).
-    INF_TO_DEG_MAP = {"Dup/MZTwin": 1, "PO": 1, "FS": 1, "2nd": 2, "3rd": 3, "4th": 4, "UN": 5,}
+    
     
     if rel_degree == "FS":
         king_df = king_df[king_df[KING_REL_COL].isin(["FS", "Dup/MZTwin"])]

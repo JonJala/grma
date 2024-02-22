@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+# Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to increase clarity about whether objects are views or copies (https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#)
 pd.options.mode.copy_on_write = True
 
 from bedbimfam import (BED_SUFFIX, BIM_SUFFIX, FAM_SUFFIX)
