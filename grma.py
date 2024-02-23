@@ -16,6 +16,8 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+# Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to increase clarity about whether objects are views or copies (https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#)
+pd.options.mode.copy_on_write = True
 
 from bedbimfam import (BED_SUFFIX, BIM_SUFFIX, FAM_SUFFIX)
 import grma_lib as lib
@@ -43,10 +45,10 @@ HEADER = f"""
 <><>
 """
 
-# Relatedness threshold constants
-MIN_RELATEDNESS = 0.0
-MAX_RELATEDNESS = 1.0
-DEFAULT_REL_THRESH = 0.125
+# Relatedness degree constants
+MIN_RELATEDNESS = 1
+MAX_RELATEDNESS = 4 # This is the max degree that King outputs 
+DEFAULT_REL_DEG = 1
 
 # The default short file prefix to use for output and logs
 DEFAULT_SHORT_PREFIX = "grma"
@@ -63,7 +65,7 @@ FAM_FILE = "Fam file"
 REL_FILE = "Relatedness File"
 PHENO_FILE = "Phenotype File"
 COVAR_FILE = "Covariate File"
-REL_THRESH = "Relatedness Threshold"
+REL_DEG = "Relatedness Degree"
 SNPS_PER_BLOCK = "SNPs Per Block"
 
 
@@ -104,25 +106,6 @@ def input_file(s_input: str) -> str:
         raise ValueError(f"Input \"{stripped_filename}\" does not appear to be a file.")
 
     return stripped_filename
-
-
-#################################
-def relatedness(s_input: str) -> float:
-    """
-    Used for parsing some inputs to this program, namely a relatedness threshold.
-
-    :return str: The relatedness string input as a float
-    """
-
-    stripped_input = s_input.strip()
-
-    input_as_float = float(stripped_input)
-    if input_as_float < MIN_RELATEDNESS:
-        raise ValueError(f"Input ({input_as_float}) < lower range value ({MIN_RELATEDNESS})")
-    if input_as_float > MAX_RELATEDNESS:
-        raise ValueError(f"Input ({input_as_float}) > upper range value ({MAX_RELATEDNESS})")
-
-    return input_as_float  
 
 
 #################################
@@ -207,10 +190,12 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
     in_opt.add_argument("--relfile", metavar="FILE", type=input_file, required=True,
                          help=f"File containing relatedness info (in King-like format).  "
                               f"Needs the following columns: {lib.NEEDED_KING_COLS}")
-    in_opt.add_argument("--threshold", metavar="THRESHOLD", type=relatedness,
-                         default=DEFAULT_REL_THRESH,
-                         help=f"Relatedness threshold (between {MIN_RELATEDNESS} and "
-                              f"{MAX_RELATEDNESS}): default = {DEFAULT_REL_THRESH}")
+    in_opt.add_argument("--degree", metavar="DEGREE",
+                         default=DEFAULT_REL_DEG,
+                         choices=lib.REL_DEG_INPUTS,
+                         help=f"Relatedness degree that is FS or between {MIN_RELATEDNESS} and "
+                              f"{MAX_RELATEDNESS}: default = {DEFAULT_REL_DEG}")
+
 
     in_opt.add_argument("--pheno", metavar="FILE", type=input_file, default="",
                          help="Optional input to specify a (Plink-style) phenotype file: "
@@ -481,7 +466,7 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         REL_FILE : pargs.relfile,
         PHENO_FILE : pargs.pheno,
         COVAR_FILE : pargs.covar,
-        REL_THRESH : pargs.threshold,
+        REL_DEG : pargs.degree,
         SNPS_PER_BLOCK : pargs.snps_per_block
     }
 
@@ -499,7 +484,6 @@ def write_results_to_file(filename: str, betas: np.ndarray, ses: np.ndarray):
     # TODO(jonbjala) Write this function
     print(f"Results = {betas}, {ses}")
     pass
-
 
 
 #################################
@@ -536,7 +520,7 @@ def main_func(argv: List[str]):
         betas, ses = lib.grma(
             rel_input=iargs[REL_FILE], bed_file=iargs[BED_FILE], bim_file=iargs[BIM_FILE],
             fam_file=iargs[FAM_FILE], pheno_file=iargs[PHENO_FILE], covar_file=iargs[COVAR_FILE],
-            rel_threshold=iargs[REL_THRESH], snps_per_block=iargs[SNPS_PER_BLOCK]
+            rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK]
         )
 
         # Write out the results to disk
