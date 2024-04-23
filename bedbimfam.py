@@ -88,9 +88,9 @@ def get_num_snps_from_bim_file(bim_filename: str):
 # -------------------------
 def get_phenotypes_from_fam_file(fam_filename: str):
     fam_df = pd.read_csv(fam_filename, sep=r"\s+", usecols=(5,),
-                         names=[PHENO_COL], index_col=False)
+                         names=[FAM_PHENO_COL], index_col=False)
 
-    return fam_df[PHENO_COL].to_numpy()
+    return fam_df[FAM_PHENO_COL].to_numpy()
 
 
 
@@ -116,7 +116,7 @@ def read_bed_file(bed_filename: str, N: int, M: int, M_start: int = 0, num_snps:
         initial_bytes = bed_file.read(3)        
         if not(initial_bytes[0:2] == _BED_FILE_PREFIX_MAGIC_BYTEARRAY):
             raise RuntimeError("Error: Initial bytes of bed file [0x%s] are not expected [%s].",
-                initial_bytes[0:2].hex(), BED_FILE_PREFIX_MAGIC_HEX)
+                initial_bytes[0:2].hex(), _BED_FILE_PREFIX_MAGIC_HEX)
 
         if not(initial_bytes[2] == _BED_FILE_PREFIX_SNP_MAJOR_MAGIC_BYTEARRAY[0]):
             raise RuntimeError("Error: BED file not in SNP major order, third byte = %s" % 
