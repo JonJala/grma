@@ -225,15 +225,14 @@ def calculate_neff(rel_info: THRESHOLDED_REL_TYPE, rel_set_sizes: np.ndarray) ->
     dup_indices = [] 
     num_dups = 0
     for rel_length in range(1, int(max(rel_set_sizes) + 1)):
-        bool_vals = [True] * len(rel_info)
+        bool_vals = np.array([True] * len(rel_info))
         for index, inner_list in enumerate(rel_info):
             if len(inner_list) == rel_length:
-                if all(bool_vals[i] for i in inner_list) == True:
-                    indices_to_check = [i for i in inner_list if i != index]
-                    sublists_to_check = [rel_info[i] for i in indices_to_check]
+                if all(bool_vals[inner_list]) == True:
+                    sublists_to_check = [rel_info[i] for i in inner_list if i != index]
                     # all() returns true if iterable (sublists_to_check) is empty so works to find singletons as well.
-                    if len(sublists_to_check) == rel_length - 1 and all(sorted(sublist) == sorted(inner_list) for sublist in sublists_to_check):
-                        num_dups += 1 * (rel_length - 1)
+                    if all(sublist == inner_list for sublist in sublists_to_check):
+                        num_dups += (rel_length - 1)
                         dup_indices.append(tuple(inner_list))
                         for i in inner_list:
                             bool_vals[i] = False
@@ -242,11 +241,11 @@ def calculate_neff(rel_info: THRESHOLDED_REL_TYPE, rel_set_sizes: np.ndarray) ->
     old_indices_of_dups = set(it.chain(*set(dup_indices)))
 
     # Finding indices that aren't duplicates to create N_matrix
-    non_dup_indices = [pindex for pindex, pval in enumerate(rel_info) if pindex not in old_indices_of_dups]
+    non_dup_indices = list(set(range(len(rel_info))) - old_indices_of_dups)
     
     # Calculate indices of non-duplicate people / samples
     num_samples_non_dup = len(non_dup_indices)
-    logging.debug(f"Number of non-singleton individuals = {num_samples_non_dup}")
+    logging.debug(f"Number of non-dup individuals = {num_samples_non_dup}")
 
     # Construct a reverse lookup to compensate for dropped duplicates when referring to rel_info
     # the indices of non-duplicates are set to values that np.arange produces (0, 1, 2, 3...). everything else (the duplicates' indices) is 0.
@@ -308,7 +307,8 @@ def residualize_genotypes(
     geno_time = time.time()
     mean_genos = np.vstack([np.nanmean(genotypes[:, rel_list], axis=1) for rel_list in rel_info]).T
     empty_slices = sum(1 for rel_list in rel_info if np.isnan(genotypes[:, rel_list]).all())
-    print(f"Number of empty slices: {empty_slices}")
+    print(genotypes)
+    print(mean_genos)
     logging.info(f"Residualizing genotypes takes {time.time() - geno_time} seconds")
     return genotypes - mean_genos
 
