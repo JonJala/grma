@@ -481,14 +481,13 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
 
 
 #################################
-def write_results_to_file(filename: str, results: np.ndarray):
-    #print(f"Results = {betas}, {ses}")
+def write_results_to_file(filename: str, results: pd.DataFrame):
+
     res_start_time = time.time()
-    results_df = pd.DataFrame(results)
-    #results_file = np.savetxt(filename, results, delimiter='\t', comments='')
-    results_df.to_csv(filename, index = False, header=False, sep='\t')
+
+    results.to_csv(filename, index = False, header=True, sep='\t')
     logging.info(f"Time taken to write results is {time.time() - res_start_time}")
-    return results_df
+    return results
     
 
 

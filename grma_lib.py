@@ -219,23 +219,46 @@ def convert_king_output_to_rel_info(
 
 def calculate_neff(rel_info: THRESHOLDED_REL_TYPE, rel_set_sizes: np.ndarray) -> int:
     
+    # Implementing rank algorithm where duplicates are dropped from the matrix before calculating rank
+    # Finding the total number of pairs, triplets, and other duplicate groups uptil the largest group size and storing the number of linearly independent cols as num_dups
+    # while storing the indices that compose these duplicates
+    dup_indices = [] 
+    num_dups = 0
+    for rel_length in range(1, int(max(rel_set_sizes) + 1)):
+        bool_vals = [True] * len(rel_info)
+        for index, inner_list in enumerate(rel_info):
+            if len(inner_list) == rel_length:
+                if all(bool_vals[i] for i in inner_list) == True:
+                    indices_to_check = [i for i in inner_list if i != index]
+                    sublists_to_check = [rel_info[i] for i in indices_to_check]
+                    # all() returns true if iterable (sublists_to_check) is empty so works to find singletons as well.
+                    if len(sublists_to_check) == rel_length - 1 and all(sorted(sublist) == sorted(inner_list) for sublist in sublists_to_check):
+                        num_dups += 1 * (rel_length - 1)
+                        dup_indices.append(tuple(inner_list))
+                        for i in inner_list:
+                            bool_vals[i] = False
 
-    # Calculate indices of non-singleton people / samples
-    indices_of_non_singletons = [pindex for pindex, pvals in enumerate(rel_info) if len(pvals) > 1]
-    num_samples_no_singletons = len(indices_of_non_singletons)
-    logging.debug(f"Number of non-singleton individuals = {num_samples_no_singletons}")
+    # Taking the set of indices that compose these duplicates
+    old_indices_of_dups = set(it.chain(*set(dup_indices)))
 
-    # Construct a reverse lookup to compensate for dropped singletons when referring to rel_info
-    # the indices of non-singletons are set to values that np.arange produces (0, 1, 2, 3...). everything else (the singletons' indices) is 0.
-    # reverse indices has, at the old indices of non-singletons, the new indices of the non-singletons. therefore, reverse_indices[old_pindex] = new_pindex
+    # Finding indices that aren't duplicates to create N_matrix
+    non_dup_indices = [pindex for pindex, pval in enumerate(rel_info) if pindex not in old_indices_of_dups]
+    
+    # Calculate indices of non-duplicate people / samples
+    num_samples_non_dup = len(non_dup_indices)
+    logging.debug(f"Number of non-singleton individuals = {num_samples_non_dup}")
+
+    # Construct a reverse lookup to compensate for dropped duplicates when referring to rel_info
+    # the indices of non-duplicates are set to values that np.arange produces (0, 1, 2, 3...). everything else (the duplicates' indices) is 0.
+    # reverse indices has, at the old indices of non-duplicates, the new indices of the non-duplicates. therefore, reverse_indices[old_pindex] = new_pindex
     reverse_indices = np.zeros(len(rel_info), dtype=int)
-    reverse_indices[indices_of_non_singletons] = np.arange(num_samples_no_singletons)
+    reverse_indices[non_dup_indices] = np.arange(num_samples_non_dup)
 
     # Construct matrix whose rank needs to be evaluated
     
     neff_time = time.time()
-    N_matrix = np.identity(num_samples_no_singletons, dtype=float)
-    for new_pindex, old_pindex in enumerate(indices_of_non_singletons):
+    N_matrix = np.identity(num_samples_non_dup, dtype=float)
+    for new_pindex, old_pindex in enumerate(non_dup_indices):
         # new p_vals is the result of converting the inner list in rel_info to a list of the new_pindices to know which columns to index into
         # the length of new_pvals then gives the number we should find the reciprocal of for the matrix R
         new_pvals = [reverse_indices[non_adj_person_num]
@@ -244,37 +267,10 @@ def calculate_neff(rel_info: THRESHOLDED_REL_TYPE, rel_set_sizes: np.ndarray) ->
         N_matrix[new_pindex, new_pvals] -= np.reciprocal(len(new_pvals), dtype=float)
     logging.info(f"Time to create matrix {time.time() - neff_time}")
     
-    # Implementing rank algorithm where duplicates are dropped from the matrix before calculating rank
-    # Finding the total number of pairs, triplets, and other duplicate groups uptil the largest group size and storing the number of linearly independent cols as num_dups
-    # while storing the indices that compose these duplicates
-    dup_indices = [] 
-    num_dups = 0
-    for rel_length in range(2, int(max(rel_set_sizes) + 1)):
-        bool_vals = [True] * len(rel_info)
-        for index, inner_list in enumerate(rel_info):
-            if len(inner_list) == rel_length:
-                if all(bool_vals[i] for i in inner_list) == True:
-                    indices_to_check = [i for i in inner_list if i != index]
-                    sublists_to_check = [rel_info[i] for i in indices_to_check]
-                    if len(sublists_to_check) == rel_length - 1 and all(sorted(sublist) == sorted(inner_list) for sublist in sublists_to_check): #and all(len(sublist) == rel_length for sublist in sublists_to_check)
-                        num_dups += 1 * (rel_length - 1)
-                        dup_indices.append(tuple(inner_list))
-                        for i in inner_list:
-                            bool_vals[i] = False
-
-    # Taking the set of indices that compose these duplicates
-    old_indices_of_dups = list(it.chain(*set(dup_indices)))
-    
-    # Using reverse lookup to get the new indices of N_matrix to be removed given the indices of the duplicates
-    new_indices_of_dups = reverse_indices[old_indices_of_dups]
-    
-    # Removing the rows and columns corresponding to the duplicates 
-    subset_matrix = np.delete(np.delete(N_matrix, new_indices_of_dups, axis = 0), new_indices_of_dups, axis = 1)
-    
     # Calculating the rank of the smaller submatrix
     start_time = time.time()
     logging.info("Calculating rank of subset matrix")
-    subset_rank = np.linalg.matrix_rank(subset_matrix)
+    subset_rank = np.linalg.matrix_rank(N_matrix)
     logging.info(f"Num duplicates of any group size = {num_dups}")
     logging.info(f"subset rank is {subset_rank}")
     n_eff = num_dups + subset_rank
@@ -330,7 +326,7 @@ def run_regressions(
         np.nansum(residualized_genotypes * residualized_phenotypes, axis=1)
         / G_sq_sum_per_snp
     )
-    ses = np.sqrt(np.dot(residualized_phenotypes, residualized_phenotypes) / G_sq_sum_per_snp / N_eff)
+    ses = np.sqrt(np.dot(residualized_phenotypes, residualized_phenotypes) / (G_sq_sum_per_snp * N_eff))
     logging.info(f"Running regressions takes {time.time() - reg_time}")
     return betas, ses
 
@@ -343,7 +339,7 @@ def calculate_Zstats_and_pvals(betas: np.ndarray, ses: np.ndarray) -> tuple[np.n
     return zstats, pvals
 
 # -------------------------
-def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np.ndarray, pvals: np.ndarray, bim_filename: str) -> np.ndarray:
+def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np.ndarray, pvals: np.ndarray, bim_filename: str) -> pd.DataFrame:
     
     combined_df = pd.DataFrame({
         'Beta': betas,
@@ -355,12 +351,8 @@ def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np
     bim_df = pd.read_csv(bim_filename, sep='\t', header=None, names=['chr', 'id', 'pos', 'bpcoord', 'A1', 'A2'])
     # Append bim file
     results_df = pd.concat([combined_df, bim_df], axis=1)
-    headers = list(results_df.columns)   
-    results = results_df.to_numpy()
-    # Add header
-    results = np.vstack([headers, results])
-    
-    return results
+
+    return results_df
 
 # -------------------------
 def grma(
@@ -373,7 +365,7 @@ def grma(
     covar_file: str = "",
     rel_degree: float = 0.125,
     snps_per_block: int = DEFAULT_SNPS_PER_BLOCK,
-) -> np.ndarray:
+) -> pd.DataFrame:
     # TODO(jonbjala) Need to add the extra covariates at all levels of the software (covar_file)
 
     logging.info("Beginning grma()...")
@@ -447,10 +439,8 @@ def grma(
         betas[M_start : M_start + len(block_betas)] = block_betas
         ses[M_start : M_start + len(block_ses)] = block_ses
 
-    logging.info(
-        f"Residualized genotypes and ran regressions in "
-        f"{time.time() - start_time} seconds"
-    )
+    logging.info(f"Residualized genotypes and ran regressions in {time.time() - start_time} seconds")
+    
     zstats, pvals = calculate_Zstats_and_pvals(betas=betas, ses=ses)
     results = combine_results_with_bim_file(betas=betas, ses=ses, zstats=zstats, pvals=pvals, bim_filename=bim_file)
 
