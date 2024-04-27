@@ -149,7 +149,6 @@ def convert_king_output_to_rel_info(
     logging.info(f"Getting id_df takes {time.time() - king_time} seconds")
 
     # Construct DataFrame that contains person number (INDEX) pairs that are related along with their degree of relation (from king output)
-    king_time = time.time()
     # By merging id_df into king_df twice, obtain king_df with index columns mapping to a unique ID.
     id_df.rename(
         inplace=True,
@@ -167,7 +166,6 @@ def convert_king_output_to_rel_info(
     king_df = king_df.merge(id_df, on=[KING_FID2_COL, KING_IID2_COL], copy=False)
     print(f"Len of king_df is {len(king_df)}")
     print(f"Length of ID df is {N}")
-    logging.info(f"Merging king_df and id_df takes {time.time() - king_time} seconds")
     # Find the minimum value of KING_REL_COL given groups of indices in index cols. Then combine index, degree pairs into a single lowest_degree series.
     king_time = time.time()
     ind1_mins = king_df.groupby(by=INDEX1_COL)[KING_REL_COL].min()
@@ -217,62 +215,46 @@ def convert_king_output_to_rel_info(
 
 # -------------------------
 
-def calculate_neff(rel_info: THRESHOLDED_REL_TYPE, rel_set_sizes: np.ndarray) -> int:
+def calculate_neff(rel_info: THRESHOLDED_REL_TYPE) -> int:
     
-    # Implementing rank algorithm where duplicates are dropped from the matrix before calculating rank
-    # Finding the total number of pairs, triplets, and other duplicate groups uptil the largest group size and storing the number of linearly independent cols as num_dups
-    # while storing the indices that compose these duplicates
-    dup_indices = [] 
-    num_dups = 0
-    for rel_length in range(1, int(max(rel_set_sizes) + 1)):
-        bool_vals = np.array([True] * len(rel_info))
-        for index, inner_list in enumerate(rel_info):
-            if len(inner_list) == rel_length:
-                if all(bool_vals[inner_list]) == True:
-                    sublists_to_check = [rel_info[i] for i in inner_list if i != index]
-                    # all() returns true if iterable (sublists_to_check) is empty so works to find singletons as well.
-                    if all(sublist == inner_list for sublist in sublists_to_check):
-                        num_dups += (rel_length - 1)
-                        dup_indices.append(tuple(inner_list))
-                        for i in inner_list:
-                            bool_vals[i] = False
-
-    # Taking the set of indices that compose these duplicates
-    old_indices_of_dups = set(it.chain(*set(dup_indices)))
-
-    # Finding indices that aren't duplicates to create N_matrix
-    non_dup_indices = list(set(range(len(rel_info))) - old_indices_of_dups)
-    
-    # Calculate indices of non-duplicate people / samples
-    num_samples_non_dup = len(non_dup_indices)
-    logging.debug(f"Number of non-dup individuals = {num_samples_non_dup}")
-
-    # Construct a reverse lookup to compensate for dropped duplicates when referring to rel_info
-    # the indices of non-duplicates are set to values that np.arange produces (0, 1, 2, 3...). everything else (the duplicates' indices) is 0.
-    # reverse indices has, at the old indices of non-duplicates, the new indices of the non-duplicates. therefore, reverse_indices[old_pindex] = new_pindex
+    eliminated = np.full(len(rel_info), False, dtype=bool)
+    rank_of_eliminated = 0
+    for cur_index, cur_list in enumerate(rel_info):
+        # If the current index has already been previously eliminated, no need to check again
+        if eliminated[cur_index]:
+            continue    
+        # Check if all people in this relationship list have the same list, and if so, eliminate them all
+        if all(cur_list == rel_info[i] for i in cur_list if i != cur_index): # Relies on the lists being sorted
+            rank_of_eliminated += (len(cur_list) - 1)
+            eliminated[cur_list] = True
+            
+    remaining_indices = np.argwhere(~eliminated).flatten()
+    num_remaining = len(remaining_indices)
+    # Construct reverse lookup to map from remaining indices to matrix indices
     reverse_indices = np.zeros(len(rel_info), dtype=int)
-    reverse_indices[non_dup_indices] = np.arange(num_samples_non_dup)
-
-    # Construct matrix whose rank needs to be evaluated
-    
+    reverse_indices[remaining_indices] = np.arange(num_remaining)
+        
     neff_time = time.time()
-    N_matrix = np.identity(num_samples_non_dup, dtype=float)
-    for new_pindex, old_pindex in enumerate(non_dup_indices):
-        # new p_vals is the result of converting the inner list in rel_info to a list of the new_pindices to know which columns to index into
-        # the length of new_pvals then gives the number we should find the reciprocal of for the matrix R
-        new_pvals = [reverse_indices[non_adj_person_num]
-                     for non_adj_person_num in rel_info[old_pindex]]
-        # new_pindex is the row, new_pvals are the columns
-        N_matrix[new_pindex, new_pvals] -= np.reciprocal(len(new_pvals), dtype=float)
+    N_matrix = np.identity(num_remaining , dtype=float)
+    for mat_index, old_p_index in enumerate(remaining_indices):
+        # Get the relational list that corresponds to the current matrix row
+        cur_list = rel_info[old_p_index]
+        
+        # Get the corresponding entries in the current row of the N matrix, taking care to
+        # not include any that have been eliminated
+        mat_list = [reverse_indices[p_index] for p_index in cur_list if not eliminated[p_index]]
+        
+        # Subtract off the inverse of the relational list size from the correct elements
+        N_matrix[mat_index, mat_list] -= np.reciprocal(len(cur_list), dtype=float)
     logging.info(f"Time to create matrix {time.time() - neff_time}")
     
     # Calculating the rank of the smaller submatrix
     start_time = time.time()
     logging.info("Calculating rank of subset matrix")
     subset_rank = np.linalg.matrix_rank(N_matrix)
-    logging.info(f"Num duplicates of any group size = {num_dups}")
+    logging.info(f"Num duplicates of any group size = {rank_of_eliminated}")
     logging.info(f"subset rank is {subset_rank}")
-    n_eff = num_dups + subset_rank
+    n_eff = rank_of_eliminated + subset_rank
     logging.info(f"N_eff is {n_eff}")
     logging.info(f"total time taken to calculate smaller subset is {time.time() - start_time}")
     
@@ -393,9 +375,8 @@ def grma(
     #Calculate the effective N
     logging.debug("Calculating effective N...")
     start_time = time.time()
-    N_eff = calculate_neff(rel_info=rel_info, rel_set_sizes=rel_set_sizes)
+    N_eff = calculate_neff(rel_info=rel_info)
     logging.info(f"Calculated effective N in {time.time() - start_time} seconds")
-
 
     # Residualize the phenotypes
     logging.debug("Residualizing phenotypes...")
