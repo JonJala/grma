@@ -13,6 +13,7 @@ import os
 import re
 import sys
 from typing import Any, Callable, Dict, List, Tuple
+import time
 
 import numpy as np
 import pandas as pd
@@ -197,10 +198,10 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
                               f"{MAX_RELATEDNESS}: default = {DEFAULT_REL_DEG}")
 
 
-    in_opt.add_argument("--pheno", metavar="FILE", type=input_file, default="",
+    in_opt.add_argument("--pheno", metavar="FILE", type=input_file,
                          help="Optional input to specify a (Plink-style) phenotype file: "
                               "https://www.cog-genomics.org/plink/1.9/input#pheno")
-    in_opt.add_argument("--covar", metavar="FILE", type=input_file, default="",
+    in_opt.add_argument("--covar", metavar="FILE", type=input_file,
                          help="Optional input to specify a (Plink-style) covariates file: "
                               "https://www.cog-genomics.org/plink/2.0/input#covar")
 
@@ -450,7 +451,7 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     logging.debug("Checking whether bed/bim/fam files were specified.")
     unspecified_bedbimfam = []
     for suffix, argflag in [(BED_SUFFIX, 'bed'), (BIM_SUFFIX, 'bim'), (FAM_SUFFIX, 'fam')]:
-        if not args.bedbimfam and not getattr(args, argflag):
+        if not pargs.bfile and not getattr(pargs, argflag):
             unspecified_bedbimfam.append(suffix)
     if unspecified_bedbimfam:
         raise ValueError(f"Unspecified input file types: {unspecified_bedbimfam}")
@@ -460,9 +461,9 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     internal_values = {
         OUT_PREFIX : pargs.out,
         OUT_DIR : os.path.dirname(pargs.out),
-        BED_FILE : args.bed if args.bed else f"{args.bedbimfam}{BED_SUFFIX}",
-        BIM_FILE : args.bim if args.bim else f"{args.bedbimfam}{BIM_SUFFIX}",
-        FAM_FILE : args.fam if args.fam else f"{args.bedbimfam}{FAM_SUFFIX}",
+        BED_FILE : pargs.bed if pargs.bed else f"{pargs.bfile}{BED_SUFFIX}",
+        BIM_FILE : pargs.bim if pargs.bim else f"{pargs.bfile}{BIM_SUFFIX}",
+        FAM_FILE : pargs.fam if pargs.fam else f"{pargs.bfile}{FAM_SUFFIX}",
         REL_FILE : pargs.relfile,
         PHENO_FILE : pargs.pheno,
         COVAR_FILE : pargs.covar,
@@ -480,10 +481,14 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
 
 
 #################################
-def write_results_to_file(filename: str, betas: np.ndarray, ses: np.ndarray):
-    # TODO(jonbjala) Write this function
-    print(f"Results = {betas}, {ses}")
-    pass
+def write_results_to_file(filename: str, results: pd.DataFrame):
+
+    res_start_time = time.time()
+
+    results.to_csv(filename, index = False, header=True, sep='\t')
+    logging.info(f"Time taken to write results is {time.time() - res_start_time}")
+    return results
+    
 
 
 #################################
@@ -517,7 +522,7 @@ def main_func(argv: List[str]):
 
         # Run the GRMA pipeline
         logging.info("Calling main GRMA function")
-        betas, ses = lib.grma(
+        results = lib.grma(
             rel_input=iargs[REL_FILE], bed_file=iargs[BED_FILE], bim_file=iargs[BIM_FILE],
             fam_file=iargs[FAM_FILE], pheno_file=iargs[PHENO_FILE], covar_file=iargs[COVAR_FILE],
             rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK]
@@ -527,7 +532,7 @@ def main_func(argv: List[str]):
         logging.info("Writing results to disk.")
         filename = f"{iargs[OUT_PREFIX]}.res" # TODO(jonbjala)
         logging.debug(f"\t{filename}")
-        write_results_to_file(filename, betas, ses)
+        write_results_to_file(filename, results)
 
         # Log any remaining information TODO(jonbjala) Timing info?
         logging.info("\nExecution complete.\n")
