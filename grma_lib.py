@@ -16,6 +16,9 @@ import bitarray.util as baut
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
+import statsmodels.api as sm
+from ast import literal_eval
+import multiprocessing as mp
 # Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to increase clarity about whether objects are views or copies (https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#)
 pd.options.mode.copy_on_write = True
 
@@ -55,11 +58,13 @@ KING_FID1_COL = "FID1"
 KING_IID1_COL = "ID1"
 KING_FID2_COL = "FID2"
 KING_IID2_COL = "ID2"
+KING_KINSHIP_COL = "Kinship"
 NEEDED_KING_COLS = [
     KING_FID1_COL,
     KING_IID1_COL,
     KING_FID2_COL,
     KING_IID2_COL,
+    KING_KINSHIP_COL,
     KING_REL_COL,
 ]
 
@@ -67,10 +72,13 @@ NEEDED_KING_COLS = [
 PHENOFILE_PHENO_COL = "Phenofile_Phenotype"
 
 # List of inputs to accept as flags to specify degree of relation allowed
-REL_DEG_INPUTS = ["FS", "1", "2", "3", "4"]
+REL_DEG_INPUTS = ["FS", "1", "2", "3", "4", "Pop"]
 
-# List of possible InfTypes in a King output file. 
-INF_TO_DEG_MAP = {"Dup/MZTwin": 1, "FS": 1, "PO": 1, "2nd": 2, "3rd": 3, "4th": 4, "UN": 5,}
+# Map of rel degree to numeric value to subset king output
+REL_TO_DEG_MAP = {"FS": 0, "1": 1, "2": 2, "3": 3, "4": 4, "Pop": 5}
+
+# Map of possible InfTypes in a King output file. 
+INF_TO_DEG_MAP = {"Dup/MZTwin": 0, "FS": 0, "PO": 1, "2nd": 2, "3rd": 3, "4th": 4, "UN": 5,}
 
 # Default number of SNPs to process at a time
 DEFAULT_SNPS_PER_BLOCK = 100
@@ -79,7 +87,7 @@ DEFAULT_SNPS_PER_BLOCK = 100
 # -------------------------
 def get_phenotypes_from_file(pheno_filename: str, fam_filename: str):
     # TODO(jonbjala)  Handle missing phenotype values?  Have support for case/control?  https://www.cog-genomics.org/plink/1.9/formats#fam
-    # Drop phenotype values that are missing
+    # Drop phenotype values that are missing - not so simple as corresponding portions of bed/bim files should also be cut
 
     fam_df = pd.read_csv(fam_filename, sep=r"\s+", names=FAM_COLS, index_col=False)
     pheno_col = FAM_PHENO_COL
@@ -96,7 +104,7 @@ def get_phenotypes_from_file(pheno_filename: str, fam_filename: str):
 
 
 # Creates a dataframe of FID, IID and Index number (from 0) from the .fam file or a .fam df
-def _get_id_df_from_fam_file(fam_filename: str) -> int:
+def _get_id_df_from_fam_file(fam_filename: str) -> pd.DataFrame:
     
     # Make id_df using either a fam file or a fam dataframe
     if isinstance(fam_filename, str):
@@ -112,13 +120,44 @@ def _get_id_df_from_fam_file(fam_filename: str) -> int:
     
     return id_df
 
+# -------------------------
+
+
+# Creates a dataframe of covariates that is filled to the size of the fam file 
+def format_covar_file(covar_filename: str, fam_filename: str) -> np.ndarray:
+    
+    # Make id_df using either a fam file or a fam dataframe (NEEDS HEADER IN FILE)
+   # TODO(dhruvaj) If multiple covar files, then merge them into 1 file
+    if isinstance(covar_filename, str):
+        covar_df = pd.read_csv(covar_filename, sep=r"\s+", index_col=False)
+        
+    elif isinstance(covar_filename, pd.DataFrame):
+        covar_df = covar_filename
+    else:
+        raise TypeError(f"Type of parameter fam_file ({type(covar_filename)}) is not supported.")    
+    
+    # Get id_df to merge FID and IID and set any missing covariates to NA
+    id_df = _get_id_df_from_fam_file(fam_filename)
+    
+    covar_df = id_df.merge(covar_df, on=[FID_COL, IID_COL], copy = False, how = "left")
+    covar_df = covar_df.drop(columns=[FID_COL, IID_COL, INDEX_COL])
+    
+    return covar_df.to_numpy()
 
 # -------------------------
 def convert_king_output_to_rel_info(
-    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: str
+    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: str, rel_info_file: str
 ) -> tuple[THRESHOLDED_REL_TYPE, np.ndarray]:
     MAX_RELATEDNESS = 4  # Maximum degree of relatedness from king output
 
+    if rel_info_file:
+        with open(rel_info_file, 'r') as f:
+            list_str = f.read()
+        # Convert the string back to a list of lists
+        rel_info = literal_eval(list_str)
+        rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info], dtype=float)
+        return rel_info, rel_set_sizes
+    
     king_time = time.time()
     # Read in King output and filter out unneeded rows (where relatedness is too weak)
     if isinstance(king_output, str):
@@ -129,24 +168,13 @@ def convert_king_output_to_rel_info(
         raise TypeError(f"Type of parameter king_output ({type(king_output)}) is not supported.")
     logging.info(f"Reading in king output takes {time.time() - king_time} seconds")
 
-    # Using INF_TO_DEG_MAP, if FS, then throw everything other than FS and Dup/MZTwin and convert to 1 (for later closest relative processing).
-    # If not FS, then convert FS and PO to 1.
-    # Keep Dup/MZTwin (and FS) in all cases (converted to 1).
-    king_time = time.time()
-    
-    if rel_degree == "FS":
-        king_df = king_df[king_df[KING_REL_COL].isin(["FS", "Dup/MZTwin"])]
-        king_df[KING_REL_COL] = king_df[KING_REL_COL].map(INF_TO_DEG_MAP)
-    else:
-        # Replace values of PO, FS with 1 and others with their numeric value. Then, keep only those degrees that are closer.
-        king_df[KING_REL_COL] = king_df[KING_REL_COL].map(INF_TO_DEG_MAP)
-        king_df = king_df[king_df[KING_REL_COL] <= int(rel_degree)]
-    logging.info(f"Converting degrees to numbers takes {time.time() - king_time} seconds")
+    # Convert InfTypes using INF_TO_DEG_MAP and filter out weak relations using REL_TO_DEG_MAP
+    king_df[KING_REL_COL] = king_df[KING_REL_COL].map(INF_TO_DEG_MAP)
+    king_df = king_df[king_df[KING_REL_COL] <= REL_TO_DEG_MAP[rel_degree]]
+        
     # Use the .fam file to get FID/IID mapping to person number
-    king_time = time.time()
     id_df = _get_id_df_from_fam_file(fam_filename)
     N = len(id_df)
-    logging.info(f"Getting id_df takes {time.time() - king_time} seconds")
 
     # Construct DataFrame that contains person number (INDEX) pairs that are related along with their degree of relation (from king output)
     # By merging id_df into king_df twice, obtain king_df with index columns mapping to a unique ID.
@@ -168,6 +196,8 @@ def convert_king_output_to_rel_info(
     print(f"Length of ID df is {N}")
     # Find the minimum value of KING_REL_COL given groups of indices in index cols. Then combine index, degree pairs into a single lowest_degree series.
     king_time = time.time()
+    # Pandas Series are 1 dimensional so each element contains a group (index and min rel degree). However, the index is based on by=INDEX_COL so you can access 
+    # correct group in the series by using the original index number
     ind1_mins = king_df.groupby(by=INDEX1_COL)[KING_REL_COL].min()
     ind2_mins = king_df.groupby(by=INDEX2_COL)[KING_REL_COL].min()
 
@@ -176,7 +206,10 @@ def convert_king_output_to_rel_info(
 
     # Combine the two ind_mins Series into a Series that contains the min degree of individuals who have sufficiently close relatives
     # Then, to have a complete Series containing all indices of individuals, combine that with max_degree_series
+    # Since, it's a Pandas series, the order of the indices doesn't matter (though indices are usually sorted by default). lowest_degree[person_num] will give the lowest degree for that person regardless of the positional index value.
     lowest_degree = ind1_mins.combine(ind2_mins, min, MAX_RELATEDNESS + 1)
+    # Store the indices of individuals whose lowest degree is UN
+    unrel_indices = np.nonzero(lowest_degree == MAX_RELATEDNESS + 1)
     lowest_degree = lowest_degree.combine(max_degree_series, min, MAX_RELATEDNESS + 1)
     logging.info(f"Finding the lowest value of relation for all people and combining into series takes {time.time() - king_time} seconds")
     # Store a list of lists that contains groups of individuals who are closely related
@@ -201,21 +234,30 @@ def convert_king_output_to_rel_info(
         )
         for person_num in range(N)
     ]
+    # Update rel_lists for those individuals whose lowest degree is UN if running Pop GRMA
+    if rel_degree == "Pop":
+        for index in unrel_indices[0]:
+            rel_info[index] = list(unrel_indices[0])
+        
     logging.info(f"Making rel_lists takes {time.time() - king_time} seconds.")
     rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info], dtype=float)
     print(f"Max of rel set sizes is {max(rel_set_sizes)}")
     print(f"Min of rel set sizes is {min(rel_set_sizes)}")
     
-    """file_path = '/disk/genetics3/data_dirs/ukb/private/v3/processed/user/dhruvaj/grma_ukb_testing/rel_info_degFS.txt'
-    rel_info_str = str(rel_info)
-    with open(file_path, "w") as f:
-        f.write(rel_info_str)
-    """        
+    # TODO(dhruvaj) Make this a save_rel_info function
+    #file_path = f'/disk/genetics3/data_dirs/ukb/private/v3/processed/user/dhruvaj/grma_ukb_testing/rel_info_deg{rel_degree}_EA_all_ancestry.txt'
+    #rel_info_str = str(rel_info)
+    #with open(file_path, "w") as f:
+    #    f.write(rel_info_str)
+            
     return rel_info, rel_set_sizes
 
 # -------------------------
 
-def calculate_neff(rel_info: THRESHOLDED_REL_TYPE) -> int:
+def calculate_neff(rel_info: THRESHOLDED_REL_TYPE, N_eff: int) -> int:
+    
+    if N_eff:
+        return N_eff
     
     eliminated = np.full(len(rel_info), False, dtype=bool)
     rank_of_eliminated = 0
@@ -254,20 +296,20 @@ def calculate_neff(rel_info: THRESHOLDED_REL_TYPE) -> int:
     subset_rank = np.linalg.matrix_rank(N_matrix)
     logging.info(f"Num duplicates of any group size = {rank_of_eliminated}")
     logging.info(f"subset rank is {subset_rank}")
-    n_eff = rank_of_eliminated + subset_rank
-    logging.info(f"N_eff is {n_eff}")
+    N_eff = rank_of_eliminated + subset_rank
+    logging.info(f"N_eff is {N_eff}")
     logging.info(f"total time taken to calculate smaller subset is {time.time() - start_time}")
     
 
-    return n_eff
+    return N_eff
 
 # -------------------------
-def residualize_phenotypes(
+def demean_phenotypes(
     phenotypes: np.ndarray,
     rel_info: THRESHOLDED_REL_TYPE,
     rel_set_sizes: np.ndarray = None,
 ) -> np.ndarray:
-    # TODO(jonbjala)  Handle missing phenotype values? DROP THEM
+    # TODO(jonbjala)  Handle missing phenotype values?
     N = len(phenotypes)
     rel_set_sizes = (np.array([len(rel_list) for rel_list in rel_info], dtype=float) if rel_set_sizes is None else rel_set_sizes)  # TODO(jonbjala) Make this a function?
 
@@ -275,6 +317,24 @@ def residualize_phenotypes(
 
     return phenotypes - mean_phenos
 
+# -------------------------
+def residualize_phenotypes_on_covars(phenotypes:np.ndarray, covars:np.ndarray) -> np.ndarray:
+    # Regress phenotypes on covariates - assumes phenotypes has no NAs
+    # Store rows where covar is NA
+    valid_rows = ~np.isnan(covars).any(axis=1)
+    
+    # Run OLS regression 
+    covars = sm.add_constant(covars)
+    model = sm.OLS(phenotypes, covars, missing = 'drop').fit()
+    ols_resids = model.resid
+    
+    # Fill residuals with correct residuals and NAs for missing covars
+    residuals = np.full(len(phenotypes), np.nan)    
+    residuals[valid_rows] = ols_resids 
+    
+    return residuals
+    
+    
 
 # -------------------------
 def residualize_genotypes(
@@ -285,12 +345,12 @@ def residualize_genotypes(
 ) -> np.ndarray:
     # TODO(jonbjala) Might want to experiment with different numpy API calls and approaches to see if there are good speed / memory tradeoffs
     # mean_genos = np.vstack([np.sum(G[:, rel_list], axis=1) for rel_list in rel_info]).T / rel_set_sizes
-    # genotypes has dimension num_snps x N
+    # genotypes has dimension num_snps x N. The entry in the X matrix is the score (num alleles - 0, 1, or 2)
     geno_time = time.time()
+    # Subtract row mean value from each snp for the row composed of the related group individuals. 
+    # np.nanmean throws a warning because there are some rows that are all NaNs. It's still correct.
     mean_genos = np.vstack([np.nanmean(genotypes[:, rel_list], axis=1) for rel_list in rel_info]).T
-    empty_slices = sum(1 for rel_list in rel_info if np.isnan(genotypes[:, rel_list]).all())
-    print(genotypes)
-    print(mean_genos)
+    #empty_slices = sum(1 for rel_list in rel_info if np.isnan(genotypes[:, rel_list], axis = 1).all())
     logging.info(f"Residualizing genotypes takes {time.time() - geno_time} seconds")
     return genotypes - mean_genos
 
@@ -299,8 +359,7 @@ def residualize_genotypes(
 def run_regressions(
     residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray, N_eff: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    # TODO(jonbjala) The math could (will) change when adding covariates, and the calculations for SEs have
-    #                not been fully vetted by Patrick
+     
     reg_time = time.time()
     G_sq_sum_per_snp = np.nansum(np.square(residualized_genotypes), axis=1)
 
@@ -340,11 +399,13 @@ def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np
 def grma(
     *,
     rel_input: Union[str, pd.DataFrame, np.ndarray],
+    rel_info_file: str,
+    N_eff: int,
     bed_file: str,
     bim_file: str,
     fam_file: str,
     pheno_file: str = "",
-    covar_file: str = "",
+    covar_file: str,
     rel_degree: float = 0.125,
     snps_per_block: int = DEFAULT_SNPS_PER_BLOCK,
 ) -> pd.DataFrame:
@@ -368,29 +429,42 @@ def grma(
     logging.debug("Converting King output to actionable relatedness info...")
     start_time = time.time()
     rel_info, rel_set_sizes = convert_king_output_to_rel_info(
-        rel_input, fam_file, rel_degree
+        king_output=rel_input, fam_filename=fam_file, rel_degree=rel_degree, rel_info_file=rel_info_file
     )
     logging.info(f"Processed King output in {time.time() - start_time} seconds")
 
     #Calculate the effective N
     logging.debug("Calculating effective N...")
     start_time = time.time()
-    N_eff = calculate_neff(rel_info=rel_info)
+    N_eff = calculate_neff(rel_info=rel_info, N_eff=N_eff)
     logging.info(f"Calculated effective N in {time.time() - start_time} seconds")
 
-    # Residualize the phenotypes
-    logging.debug("Residualizing phenotypes...")
-    start_time = time.time()
-    P = residualize_phenotypes(
-        phenotypes=get_phenotypes_from_file(
-            pheno_filename=pheno_file, fam_filename=fam_file
-        ),
-        rel_info=rel_info,
-        rel_set_sizes=rel_set_sizes,
-    )
-    logging.info(f"Residualized the phenotypes in {time.time() - start_time} seconds")
 
-    # Residualize the genotypes and run the regressions for each block of SNPs - (FWL?)
+    # Set P = residuals of phenotypes on covars
+    # Demean P
+    if isinstance(covar_file, str):
+        logging.info("Residualizing phenotypes on covariates...")
+        start_time = time.time()
+        P = residualize_phenotypes_on_covars(phenotypes=get_phenotypes_from_file(
+            pheno_filename=pheno_file, fam_filename=fam_file
+        ), covars=format_covar_file(covar_file, fam_file))
+        logging.info("Got residuals and returned as P")
+        logging.info(f"Residualized phenotypes on covariates in {time.time() - start_time} seconds")
+        P = demean_phenotypes(phenotypes=P, rel_info=rel_info, rel_set_sizes=rel_set_sizes)
+        
+    else:
+        logging.debug("Demeaning phenotypes...")
+        start_time = time.time()
+        P = demean_phenotypes(
+            phenotypes=get_phenotypes_from_file(
+                pheno_filename=pheno_file, fam_filename=fam_file
+            ),
+            rel_info=rel_info,
+            rel_set_sizes=rel_set_sizes,
+        )
+        logging.info(f"Demeaned the phenotypes in {time.time() - start_time} seconds")        
+   
+    # Residualize the genotypes and run the regressions for each block of SNPs
     logging.debug("Residualizing genotypes and running regressions...")
     start_time = time.time()
 
@@ -419,7 +493,7 @@ def grma(
 
         betas[M_start : M_start + len(block_betas)] = block_betas
         ses[M_start : M_start + len(block_ses)] = block_ses
-
+        
     logging.info(f"Residualized genotypes and ran regressions in {time.time() - start_time} seconds")
     
     zstats, pvals = calculate_Zstats_and_pvals(betas=betas, ses=ses)
@@ -431,3 +505,4 @@ def grma(
 #################################
 if __name__ == "__main__":
     print("This script is not meant to be called directly.")
+    
