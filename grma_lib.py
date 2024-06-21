@@ -104,7 +104,7 @@ def get_phenotypes_from_file(pheno_filename: str, fam_filename: str):
 
 
 # Creates a dataframe of FID, IID and Index number (from 0) from the .fam file or a .fam df
-def _get_id_df_from_fam_file(fam_filename: str) -> pd.DataFrame:
+def _get_id_df_from_fam_file(fam_filename: Union[str, pd.DataFrame]) -> pd.DataFrame:
     
     # Make id_df using either a fam file or a fam dataframe
     if isinstance(fam_filename, str):
@@ -124,7 +124,7 @@ def _get_id_df_from_fam_file(fam_filename: str) -> pd.DataFrame:
 
 
 # Creates a dataframe of covariates that is filled to the size of the fam file 
-def format_covar_file(covar_filename: str, fam_filename: str) -> np.ndarray:
+def format_covar_file(covar_filename: Union[str, pd.DataFrame], fam_filename: Union[str, pd.DataFrame]) -> np.ndarray:
     
     # Make id_df using either a fam file or a fam dataframe (NEEDS HEADER IN FILE)
    # TODO(dhruvaj) If multiple covar files, then merge them into 1 file
@@ -322,19 +322,25 @@ def residualize_phenotypes_on_covars(phenotypes:np.ndarray, covars:np.ndarray) -
     # Regress phenotypes on covariates - assumes phenotypes has no NAs
     # Store rows where covar is NA
     valid_rows = ~np.isnan(covars).any(axis=1)
+
+    # Add constant to X matrix
+    valid_covars = covars[valid_rows]
+    const = np.ones((valid_covars.shape[0], 1)) 
+    valid_covars = np.hstack((valid_covars, const))
+
+    # Run reg
+    x, _, _, _ = np.linalg.lstsq(a = valid_covars, b = phenotypes[valid_rows], rcond = None)
     
-    # Run OLS regression 
-    covars = sm.add_constant(covars)
-    model = sm.OLS(phenotypes, covars, missing = 'drop').fit()
-    ols_resids = model.resid
+    # Calc residuals
+    pred_vals = np.dot(valid_covars, x)
+    ols_resids = phenotypes[valid_rows] - pred_vals
     
     # Fill residuals with correct residuals and NAs for missing covars
     residuals = np.full(len(phenotypes), np.nan)    
     residuals[valid_rows] = ols_resids 
     
     return residuals
-    
-    
+        
 
 # -------------------------
 def residualize_genotypes(
@@ -399,14 +405,14 @@ def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np
 def grma(
     *,
     rel_input: Union[str, pd.DataFrame, np.ndarray],
-    rel_info_file: str,
-    N_eff: int,
     bed_file: str,
     bim_file: str,
     fam_file: str,
+    rel_info_file: str = "",
+    N_eff: int = None,
     pheno_file: str = "",
-    covar_file: str,
-    rel_degree: float = 0.125,
+    covar_file: str = "",
+    rel_degree: str = "1",
     snps_per_block: int = DEFAULT_SNPS_PER_BLOCK,
 ) -> pd.DataFrame:
     # TODO(jonbjala) Need to add the extra covariates at all levels of the software (covar_file)
@@ -439,30 +445,27 @@ def grma(
     N_eff = calculate_neff(rel_info=rel_info, N_eff=N_eff)
     logging.info(f"Calculated effective N in {time.time() - start_time} seconds")
 
-
-    # Set P = residuals of phenotypes on covars
-    # Demean P
-    if isinstance(covar_file, str):
+ # Retrieve raw phenotypes from the file
+    p_not_demeaned = get_phenotypes_from_file(pheno_filename=pheno_file, fam_filename=fam_file)
+               
+    # Incorporate / residualize on covariates if they exist
+    if covar_file:
         logging.info("Residualizing phenotypes on covariates...")
         start_time = time.time()
-        P = residualize_phenotypes_on_covars(phenotypes=get_phenotypes_from_file(
-            pheno_filename=pheno_file, fam_filename=fam_file
-        ), covars=format_covar_file(covar_file, fam_file))
-        logging.info("Got residuals and returned as P")
+        p_not_demeaned = residualize_phenotypes_on_covars(
+            phenotypes=p_not_demeaned ,
+            covars=format_covar_file(covar_file, fam_file))
         logging.info(f"Residualized phenotypes on covariates in {time.time() - start_time} seconds")
-        P = demean_phenotypes(phenotypes=P, rel_info=rel_info, rel_set_sizes=rel_set_sizes)
-        
-    else:
-        logging.debug("Demeaning phenotypes...")
-        start_time = time.time()
-        P = demean_phenotypes(
-            phenotypes=get_phenotypes_from_file(
-                pheno_filename=pheno_file, fam_filename=fam_file
-            ),
-            rel_info=rel_info,
-            rel_set_sizes=rel_set_sizes,
+  
+    # Demean the phenotypes
+    logging.debug("Demeaning phenotypes...")
+    start_time = time.time()
+    P = demean_phenotypes(
+               phenotypes=p_not_demeaned,
+                rel_info=rel_info,
+                rel_set_sizes=rel_set_sizes,
         )
-        logging.info(f"Demeaned the phenotypes in {time.time() - start_time} seconds")        
+    logging.info(f"Demeaned the phenotypes in {time.time() - start_time} seconds")      
    
     # Residualize the genotypes and run the regressions for each block of SNPs
     logging.debug("Residualizing genotypes and running regressions...")
@@ -505,4 +508,5 @@ def grma(
 #################################
 if __name__ == "__main__":
     print("This script is not meant to be called directly.")
+
     
