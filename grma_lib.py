@@ -16,9 +16,8 @@ import bitarray.util as baut
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
-import statsmodels.api as sm
 from ast import literal_eval
-import multiprocessing as mp
+
 # Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to increase clarity about whether objects are views or copies (https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#)
 pd.options.mode.copy_on_write = True
 
@@ -245,10 +244,10 @@ def convert_king_output_to_rel_info(
     print(f"Min of rel set sizes is {min(rel_set_sizes)}")
     
     # TODO(dhruvaj) Make this a save_rel_info function
-    #file_path = f'/disk/genetics3/data_dirs/ukb/private/v3/processed/user/dhruvaj/grma_ukb_testing/rel_info_deg{rel_degree}_EA_all_ancestry.txt'
-    #rel_info_str = str(rel_info)
-    #with open(file_path, "w") as f:
-    #    f.write(rel_info_str)
+    file_path = f'/disk/genetics3/data_dirs/ukb/private/v3/processed/user/dhruvaj/grma_ukb_testing/rel_info_deg{rel_degree}_Height_all_ancestry.txt'
+    rel_info_str = str(rel_info)
+    with open(file_path, "w") as f:
+        f.write(rel_info_str)
             
     return rel_info, rel_set_sizes
 
