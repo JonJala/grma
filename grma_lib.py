@@ -16,7 +16,9 @@ import bitarray.util as baut
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
+import scipy.sparse as sp
 from ast import literal_eval
+import pickle
 
 # Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to increase clarity about whether objects are views or copies (https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#)
 pd.options.mode.copy_on_write = True
@@ -150,10 +152,9 @@ def convert_king_output_to_rel_info(
     MAX_RELATEDNESS = 4  # Maximum degree of relatedness from king output
 
     if rel_info_file:
-        with open(rel_info_file, 'r') as f:
-            list_str = f.read()
-        # Convert the string back to a list of lists
-        rel_info = literal_eval(list_str)
+        with open(rel_info_file, 'rb') as f:
+            rel_info = pickle.load(f)
+        # Store rel_set_sizes
         rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info], dtype=float)
         return rel_info, rel_set_sizes
     
@@ -166,6 +167,10 @@ def convert_king_output_to_rel_info(
     else:
         raise TypeError(f"Type of parameter king_output ({type(king_output)}) is not supported.")
     logging.info(f"Reading in king output takes {time.time() - king_time} seconds")
+    
+    # If kinship threshold specified, subset to acceptable kinships coeff
+    #if kinship:
+    #    king_df = king_df[king_df[KING_KINSHIP_COL] >= kinship]
 
     # Convert InfTypes using INF_TO_DEG_MAP and filter out weak relations using REL_TO_DEG_MAP
     king_df[KING_REL_COL] = king_df[KING_REL_COL].map(INF_TO_DEG_MAP)
@@ -235,73 +240,92 @@ def convert_king_output_to_rel_info(
     ]
     # Update rel_lists for those individuals whose lowest degree is UN if running Pop GRMA
     if rel_degree == "Pop":
+        logging.info(f"Constructed rel_info and starting to update rel_lists for UN in {time.time() - king_time} seconds")
+        unrel_list = list(unrel_indices[0])
         for index in unrel_indices[0]:
-            rel_info[index] = list(unrel_indices[0])
+            rel_info[index] = unrel_list
         
     logging.info(f"Making rel_lists takes {time.time() - king_time} seconds.")
     rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info], dtype=float)
     print(f"Max of rel set sizes is {max(rel_set_sizes)}")
     print(f"Min of rel set sizes is {min(rel_set_sizes)}")
+    print(f"Len of unrel_indices is {len(unrel_list)}")
+    counter = 0
+    for inner_list in rel_info:
+        if len(inner_list) > 1:
+            counter += 1
+    print(f"Num non-singletons is {counter}")
+    print(f"Len of rel_info is {len(rel_info)}")
+    
+    # print teh number of singletons, number of 2 length inner lists and so on till the max list length of rel info
+    #max_size = int(max(rel_set_sizes))
+    #for i in range(1, max_size + 1):
+    #    print(f"Number of {i} length inner lists is {rel_set_sizes.tolist().count(i)}") 
     
     # TODO(dhruvaj) Make this a save_rel_info function
-    file_path = f'/disk/genetics3/data_dirs/ukb/private/v3/processed/user/dhruvaj/grma_ukb_testing/rel_info_deg{rel_degree}_Height_all_ancestry.txt'
+    """file_path = f'/disk/genetics3/data_dirs/ukb/private/v3/processed/user/dhruvaj/grma_ukb_testing/rel_info_deg{rel_degree}_EA_all_ancestry.txt'
     rel_info_str = str(rel_info)
     with open(file_path, "w") as f:
-        f.write(rel_info_str)
+        f.write(rel_info_str)"""
+    file_name = f'rel_info_deg{rel_degree}_BMI_div_anc.pkl'
+    with open(file_name, 'wb') as f:
+        pickle.dump(rel_info, f)
             
     return rel_info, rel_set_sizes
 
 # -------------------------
 
-def calculate_neff(rel_info: THRESHOLDED_REL_TYPE, N_eff: int) -> int:
+def calculate_R_matrix(rel_info: THRESHOLDED_REL_TYPE) -> tuple[sp.csr_matrix, np.ndarray, float]:
     
-    if N_eff:
-        return N_eff
-    
-    eliminated = np.full(len(rel_info), False, dtype=bool)
-    rank_of_eliminated = 0
+    duplicates = np.full(len(rel_info), False, dtype=bool)
+    checked = np.full(len(rel_info), False, dtype=bool)
     for cur_index, cur_list in enumerate(rel_info):
-        # If the current index has already been previously eliminated, no need to check again
-        if eliminated[cur_index]:
+        # If the current index has already been classified a duplicate or checked then skip
+        if duplicates[cur_index] or checked[cur_index]:
             continue    
-        # Check if all people in this relationship list have the same list, and if so, eliminate them all
-        if all(cur_list == rel_info[i] for i in cur_list if i != cur_index): # Relies on the lists being sorted
-            rank_of_eliminated += (len(cur_list) - 1)
-            eliminated[cur_list] = True
-            
-    remaining_indices = np.argwhere(~eliminated).flatten()
+        # if everyone in the curernt list is the same as rel_info[i] for i in cur_list and everyone in cur_list is not in eliminated, then eliminate all of them
+        # if someone is eliminated already but is in the current_list, then dont eliminate cur list and change previous eliminated to False
+        if all(cur_list == rel_info[i] and not (duplicates[i] or checked[i]) for i in cur_list): # Relies on the lists being sorted
+            duplicates[cur_list] = True
+        else:
+            for i in cur_list:
+                change_list = rel_info[i]
+                duplicates[change_list] = False
+        checked[cur_list] = True
+ 
+    # Make R matrix for the remaining indices 
+    remaining_indices = np.argwhere(~duplicates).flatten()
     num_remaining = len(remaining_indices)
+
     # Construct reverse lookup to map from remaining indices to matrix indices
     reverse_indices = np.zeros(len(rel_info), dtype=int)
     reverse_indices[remaining_indices] = np.arange(num_remaining)
         
-    neff_time = time.time()
-    N_matrix = np.identity(num_remaining , dtype=float)
+    mat_time = time.time()
+    R_matrix = np.identity(num_remaining,  dtype=float)
     for mat_index, old_p_index in enumerate(remaining_indices):
         # Get the relational list that corresponds to the current matrix row
         cur_list = rel_info[old_p_index]
         
-        # Get the corresponding entries in the current row of the N matrix, taking care to
-        # not include any that have been eliminated
-        mat_list = [reverse_indices[p_index] for p_index in cur_list if not eliminated[p_index]]
+        # Get the corresponding entries in the current row of the R matrix
+        mat_list = [reverse_indices[p_index] for p_index in cur_list]
         
         # Subtract off the inverse of the relational list size from the correct elements
-        N_matrix[mat_index, mat_list] -= np.reciprocal(len(cur_list), dtype=float)
-    logging.info(f"Time to create matrix {time.time() - neff_time}")
+        R_matrix[mat_index, mat_list] -= np.reciprocal(len(cur_list), dtype=float)
+    logging.info(f"Time to create R matrix {time.time() - mat_time}")
     
-    # Calculating the rank of the smaller submatrix
-    start_time = time.time()
-    logging.info("Calculating rank of subset matrix")
-    subset_rank = np.linalg.matrix_rank(N_matrix)
-    logging.info(f"Num duplicates of any group size = {rank_of_eliminated}")
-    logging.info(f"subset rank is {subset_rank}")
-    N_eff = rank_of_eliminated + subset_rank
-    logging.info(f"N_eff is {N_eff}")
-    logging.info(f"total time taken to calculate smaller subset is {time.time() - start_time}")
+    # Calculate trace of R matrix
+    # TODO (dhruvaj) could try doing sigma 1-1/N_i though since np.trace is implemented in C, this takes a couple seconds anyway.
+    trace_rr = np.trace(R_matrix)
+    sparsity = 1.0 - (np.count_nonzero(R_matrix) / float(R_matrix.size) )
+    logging.info(f"Sparsity of R matrix is {sparsity}")
+
+    # convert to sparse format
+    mat_time = time.time()
+    R_matrix = sp.csr_matrix(R_matrix)
+    print(f"Time to convert to csr {time.time() - mat_time}")
     
-
-    return N_eff
-
+    return R_matrix, duplicates, trace_rr
 # -------------------------
 def demean_phenotypes(
     phenotypes: np.ndarray,
@@ -359,12 +383,30 @@ def residualize_genotypes(
     logging.info(f"Residualizing genotypes takes {time.time() - geno_time} seconds")
     return genotypes - mean_genos
 
+def calculate_ses(R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float, residualized_genotypes: np.ndarray, var_y: float) -> np.ndarray:
+    ses_time = time.time()
+    block_indices = np.argwhere(duplicates).flatten() # len b
+    remaining_indices = np.argwhere(~duplicates).flatten() # len nb
+    G_sq_sum_per_snp = np.nansum(np.square(residualized_genotypes), axis=1) # This is X'X = M x 1
+    
+    # Calculate X'RR'X for block indices. X is M x b, R doesn't matter
+    block_XRRX = np.nansum(np.square(residualized_genotypes[:, block_indices]), axis=1) # This is X_b'X_b and is M x 1
 
+    # Calculating X'RR'X for reamining indices. X is M x nb, R is nb x nb
+    X = residualized_genotypes[:, remaining_indices]
+    XR = X @ R_matrix
+    non_block_XRRX = np.nansum(np.square(XR), axis=1) # This is X'RR'X and is M x 1
+    XRRX = block_XRRX + non_block_XRRX
+
+    ses = np.sqrt((XRRX * var_y) / (np.square(G_sq_sum_per_snp) * (trace_rr - (XRRX / G_sq_sum_per_snp))))
+    logging.info(f"Time to calculate ses is {time.time() - ses_time}")
+    
+    return ses
 # -------------------------
 def run_regressions(
-    residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray, N_eff: int
+    residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray, R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float, var_y: float
 ) -> tuple[np.ndarray, np.ndarray]:
-     
+    # Why not just calculate np.dot(resid_phenos, resid_phenos) once outside and then divide by G_sq_sum_per_snp * N_eff?
     reg_time = time.time()
     G_sq_sum_per_snp = np.nansum(np.square(residualized_genotypes), axis=1)
 
@@ -372,9 +414,22 @@ def run_regressions(
         np.nansum(residualized_genotypes * residualized_phenotypes, axis=1)
         / G_sq_sum_per_snp
     )
-    ses = np.sqrt(np.dot(residualized_phenotypes, residualized_phenotypes) / (G_sq_sum_per_snp * N_eff))
+    ses = calculate_ses(R_matrix, duplicates, trace_rr, residualized_genotypes, var_y)
     logging.info(f"Running regressions takes {time.time() - reg_time}")
     return betas, ses
+# -------------------------
+def get_var_y(residualized_phenotypes: np.ndarray) -> float:
+    N = len(residualized_phenotypes)
+    return np.dot(residualized_phenotypes, residualized_phenotypes) / N
+
+def get_var_x(residualized_genotypes: np.ndarray, N: int) -> np.ndarray:
+    reg_time = time.time()
+    G_sq_sum_per_snp = np.nansum(np.square(residualized_genotypes), axis=1)
+    Var_X = G_sq_sum_per_snp / N
+    
+    logging.info(f"Getting Var_X takes {time.time() - reg_time}")
+    
+    return Var_X
 
 # -------------------------
 def calculate_Zstats_and_pvals(betas: np.ndarray, ses: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -385,13 +440,29 @@ def calculate_Zstats_and_pvals(betas: np.ndarray, ses: np.ndarray) -> tuple[np.n
     return zstats, pvals
 
 # -------------------------
-def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np.ndarray, pvals: np.ndarray, bim_filename: str) -> pd.DataFrame:
+def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np.ndarray, pvals: np.ndarray, var_x: np.ndarray, var_y: float, bim_filename: str) -> pd.DataFrame:
     
     combined_df = pd.DataFrame({
         'Beta': betas,
         'SE': ses,
         'Z': zstats,
-        'Pval': pvals
+        'Pval': pvals, 
+        'Var_X': var_x,
+        'Var_Y': var_y
+        })
+    
+    bim_df = pd.read_csv(bim_filename, sep='\t', header=None, names=['chr', 'id', 'pos', 'bpcoord', 'A1', 'A2'])
+    # Append bim file
+    results_df = pd.concat([combined_df, bim_df], axis=1)
+
+    return results_df
+
+# -------------------------
+def combine_var_results_with_bim_file(var_x: np.ndarray, var_y: np.ndarray, bim_filename: str) -> pd.DataFrame:
+    
+    combined_df = pd.DataFrame({
+        'Var_X': var_x,
+        'Var_Y': var_y
         })
     
     bim_df = pd.read_csv(bim_filename, sep='\t', header=None, names=['chr', 'id', 'pos', 'bpcoord', 'A1', 'A2'])
@@ -427,8 +498,9 @@ def grma(
     logging.debug(f"\t{M=}")
 
     # Construct the vector to hold the results
-    betas = np.zeros(M)
-    ses = np.zeros(M)
+    #betas = np.zeros(M)
+    #ses = np.zeros(M)
+    var_x = np.zeros(M)
 
     # Construct the relatedness object
     logging.debug("Converting King output to actionable relatedness info...")
@@ -441,7 +513,7 @@ def grma(
     #Calculate the effective N
     logging.debug("Calculating effective N...")
     start_time = time.time()
-    N_eff = calculate_neff(rel_info=rel_info, N_eff=N_eff)
+    R_matrix, trace_rr, duplicates = calculate_R_matrix(rel_info=rel_info)
     logging.info(f"Calculated effective N in {time.time() - start_time} seconds")
 
  # Retrieve raw phenotypes from the file
@@ -464,8 +536,8 @@ def grma(
                 rel_info=rel_info,
                 rel_set_sizes=rel_set_sizes,
         )
-    logging.info(f"Demeaned the phenotypes in {time.time() - start_time} seconds")      
-   
+    logging.info(f"Demeaned the phenotypes in {time.time() - start_time} seconds")  
+    var_y = get_var_y(P)
     # Residualize the genotypes and run the regressions for each block of SNPs
     logging.debug("Residualizing genotypes and running regressions...")
     start_time = time.time()
@@ -477,7 +549,7 @@ def grma(
         M_start = block_num * snps_per_block
         num_snps_in_block = min(M - M_start, snps_per_block)
 
-        block_betas, block_ses = run_regressions(
+        block_var_x = get_var_x(
             residualized_genotypes=residualize_genotypes(
                 genotypes=read_bed_file(
                     bed_filename=bed_file,
@@ -489,18 +561,18 @@ def grma(
                 rel_info=rel_info,
                 rel_set_sizes=rel_set_sizes,
             ),
-            residualized_phenotypes=P,
-            N_eff=N_eff,
+            N=len(P),
         )
-
-        betas[M_start : M_start + len(block_betas)] = block_betas
-        ses[M_start : M_start + len(block_ses)] = block_ses
+        var_x[M_start : M_start + len(block_var_x)] = block_var_x
+    
         
     logging.info(f"Residualized genotypes and ran regressions in {time.time() - start_time} seconds")
+    logging.info(f"Var_y for rel_degree {rel_degree} is {var_y} ")
     
-    zstats, pvals = calculate_Zstats_and_pvals(betas=betas, ses=ses)
-    results = combine_results_with_bim_file(betas=betas, ses=ses, zstats=zstats, pvals=pvals, bim_filename=bim_file)
-
+    #zstats, pvals = calculate_Zstats_and_pvals(betas=betas, ses=ses)
+    #results = combine_results_with_bim_file(betas=betas, ses=ses, zstats=zstats, pvals=pvals, bim_filename=bim_file)
+    results = combine_var_results_with_bim_file(var_x=var_x, var_y=var_y, bim_filename=bim_file)
+    
     return results
 
 
