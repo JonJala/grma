@@ -65,7 +65,6 @@ BIM_FILE = "Bim file"
 FAM_FILE = "Fam file"
 REL_FILE = "Relatedness File"
 REL_INFO_FILE = "Rel info File"
-N_EFF = "Effective Sample Size"
 PHENO_FILE = "Phenotype File"
 COVAR_FILE = "Covariate File"
 REL_DEG = "Relatedness Degree"
@@ -199,9 +198,6 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
                          help=f"Relatedness degree that is one of {lib.REL_DEG_INPUTS}: default = {DEFAULT_REL_DEG}")
     in_opt.add_argument("--relinfo", metavar="FILE", type = input_file,
                         help="Optional input to avoid re-computing rel_info (after grma has already computed once)")
-    in_opt.add_argument("--neff", metavar="N_EFF", type=int,
-                         help="Optional input to specify the effective sample size and avoid re-computation")
-
     in_opt.add_argument("--pheno", metavar="FILE", type=input_file,
                          help="Optional input to specify a (Plink-style) phenotype file: "
                               "https://www.cog-genomics.org/plink/1.9/input#pheno")
@@ -470,7 +466,6 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         FAM_FILE : pargs.fam if pargs.fam else f"{pargs.bfile}{FAM_SUFFIX}",
         REL_FILE : pargs.relfile,
         REL_INFO_FILE : pargs.relinfo,
-        N_EFF : pargs.neff,
         PHENO_FILE : pargs.pheno,
         COVAR_FILE : pargs.covar,
         REL_DEG : pargs.degree,
@@ -529,7 +524,7 @@ def main_func(argv: List[str]):
         # Run the GRMA pipeline
         logging.info("Calling main GRMA function")
         results = lib.grma(
-            rel_input=iargs[REL_FILE], rel_info_file=iargs[REL_INFO_FILE], N_eff=iargs[N_EFF], bed_file=iargs[BED_FILE], bim_file=iargs[BIM_FILE],
+            rel_input=iargs[REL_FILE], rel_info_file=iargs[REL_INFO_FILE], bed_file=iargs[BED_FILE], bim_file=iargs[BIM_FILE],
             fam_file=iargs[FAM_FILE], pheno_file=iargs[PHENO_FILE], covar_file=iargs[COVAR_FILE],
             rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK]
         )
