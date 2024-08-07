@@ -258,11 +258,6 @@ def convert_king_output_to_rel_info(
     print(f"Num non-singletons is {counter}")
     print(f"Len of rel_info is {len(rel_info)}")
     
-    # print teh number of singletons, number of 2 length inner lists and so on till the max list length of rel info
-    #max_size = int(max(rel_set_sizes))
-    #for i in range(1, max_size + 1):
-    #    print(f"Number of {i} length inner lists is {rel_set_sizes.tolist().count(i)}") 
-    
     # TODO(dhruvaj) Make this a save_rel_info function
     """file_path = f'/disk/genetics3/data_dirs/ukb/private/v3/processed/user/dhruvaj/grma_ukb_testing/rel_info_deg{rel_degree}_EA_all_ancestry.txt'
     rel_info_str = str(rel_info)
@@ -271,6 +266,7 @@ def convert_king_output_to_rel_info(
     file_name = f'rel_info_deg{rel_degree}_BMI_all_anc.pkl'
     with open(file_name, 'wb') as f:
         pickle.dump(rel_info, f)
+    logging.info(f"Saved rel_info to {file_name}")
             
     return rel_info, rel_set_sizes
 
@@ -278,9 +274,11 @@ def convert_king_output_to_rel_info(
 
 def calculate_R_matrix(rel_info: THRESHOLDED_REL_TYPE) -> tuple[sp.csr_matrix, np.ndarray, float]:
     
+    trace_rr = 0
     duplicates = np.full(len(rel_info), False, dtype=bool)
     checked = np.full(len(rel_info), False, dtype=bool)
     for cur_index, cur_list in enumerate(rel_info):
+        trace_rr += 1 - np.reciprocal(len(cur_list), dtype=float) # 0.1s faster to calculate this in a sep loop of duplicates
         # If the current index has already been classified a duplicate or checked then skip
         if duplicates[cur_index] or checked[cur_index]:
             continue    
@@ -317,7 +315,6 @@ def calculate_R_matrix(rel_info: THRESHOLDED_REL_TYPE) -> tuple[sp.csr_matrix, n
     
     # Calculate trace of R matrix
     # TODO (dhruvaj) could try doing sigma 1-1/N_i though since np.trace is implemented in C, this takes a couple seconds anyway.
-    trace_rr = np.trace(R_matrix)
     sparsity = 1.0 - (np.count_nonzero(R_matrix) / float(R_matrix.size) )
     logging.info(f"Sparsity of R matrix is {sparsity}")
 
@@ -325,6 +322,8 @@ def calculate_R_matrix(rel_info: THRESHOLDED_REL_TYPE) -> tuple[sp.csr_matrix, n
     mat_time = time.time()
     R_matrix = sp.csr_matrix(R_matrix)
     print(f"Time to convert to csr {time.time() - mat_time}")
+    
+    logging.info(f"Trace rr is {trace_rr}")
     
     return R_matrix, duplicates, trace_rr
 # -------------------------
@@ -384,7 +383,8 @@ def residualize_genotypes(
     logging.info(f"Residualizing genotypes takes {time.time() - geno_time} seconds")
     return genotypes - mean_genos
 
-def calculate_ses(R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float, residualized_genotypes: np.ndarray, var_y: float) -> np.ndarray:
+def calculate_ses(R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float, residualized_genotypes: np.ndarray, var_y: float, N: int) -> np.ndarray:
+    # TODO (dhruvaj) Pass residualized phenotypes in, instead of var_y and N? - there may be small changes from rounding if divide and multiply by N after passing var_y around
     ses_time = time.time()
     block_indices = np.argwhere(duplicates).flatten() # len b
     remaining_indices = np.argwhere(~duplicates).flatten() # len nb
@@ -401,7 +401,7 @@ def calculate_ses(R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: flo
     non_block_XRRX = np.nansum(np.square(XR), axis=1) # This is X'RR'X and is M x 1
     XRRX = block_XRRX + non_block_XRRX
 
-    ses = np.sqrt((XRRX * var_y) / (np.square(G_sq_sum_per_snp) * (trace_rr - (XRRX / G_sq_sum_per_snp))))
+    ses = np.sqrt((XRRX * var_y * N) / (np.square(G_sq_sum_per_snp) * (trace_rr - (XRRX / G_sq_sum_per_snp))))
     logging.info(f"Time to calculate ses is {time.time() - ses_time}")
     
     return ses
@@ -416,7 +416,7 @@ def run_regressions(
         np.nansum(residualized_genotypes * residualized_phenotypes, axis=1)
         / G_sq_sum_per_snp
     )
-    ses = calculate_ses(R_matrix=R_matrix, duplicates=duplicates, trace_rr=trace_rr, residualized_genotypes=residualized_genotypes, var_y=var_y)
+    ses = calculate_ses(R_matrix=R_matrix, duplicates=duplicates, trace_rr=trace_rr, residualized_genotypes=residualized_genotypes, var_y=var_y, N=N)
     var_x = G_sq_sum_per_snp / N
     logging.info(f"Running regressions takes {time.time() - reg_time}")
     return betas, ses, var_x
