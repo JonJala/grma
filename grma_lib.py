@@ -496,7 +496,7 @@ def grma(
     logging.info(f"After returning from calculate R matrix: Duplicates type is {duplicates.dtype}. Duplicates length is {len(duplicates)}. duplicates num of true values is {np.sum(duplicates)}")
     logging.info(f"Processed R matrix in {time.time() - start_time} seconds")
 
- # Retrieve raw phenotypes from the file
+    # Retrieve raw phenotypes from the file
     p_not_demeaned = get_phenotypes_from_file(pheno_filename=pheno_file, fam_filename=fam_file)
                
     # Incorporate / residualize on covariates if they exist

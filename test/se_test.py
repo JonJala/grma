@@ -2,131 +2,50 @@
 Testing of grma_lib.py
 """
 
+import itertools as it
 import os
 import sys
-
-main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(main_directory)
 
 import numpy as np
 import pytest
 import pandas as pd
 pd.options.mode.copy_on_write = True #https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#
-import itertools as it
+import scipy.sparse as sp
 
-import grma_lib as sut
-
-
-# rng = np.random.default_rng(seed=0)
+main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(main_directory)
 test_directory = os.path.abspath(os.path.join(main_directory, "test"))
 data_directory = os.path.abspath(os.path.join(test_directory, "data"))
-# testcase_name = "toy_example_1"
-# testcase_dir = os.path.join(data_directory, testcase_name)
-# fam_file = os.path.join(testcase_dir, f"{testcase_name}.fam")
 
-# # TODO(jonbjala) Many more tests will need to be written
+import grma_lib as sut
+test_func = sut.calculate_ses
 
-# @pytest.fixture
-# def base_king_output():
-#     king_output = {
-#         "ID1": [1, 1, 1, 2, 2, 3, 3, 4, 5, 6, 6],
-#         "ID2": [2, 3, 4, 3, 5, 5, 6, 5, 7, 7, 8],
-#         "FID1": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-#         "FID2": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-#         "Kinship": [0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50,],
-#     }
-#     df = pd.DataFrame(king_output)
-#     return df
+np.set_printoptions(threshold=sys.maxsize) # TODO(jonbjala) Remove this line
 
-
-# @pytest.fixture
-# def king_output_disconnected_rels():
-#     KING_DF_LENGTH = 6
-    
-#     king_output = {
-#         "ID1": [i for i in range(1, 2 * KING_DF_LENGTH, 2)],
-#         "ID2": [i for i in range(2, 2 * KING_DF_LENGTH + 1, 2)],
-#         "FID1": [1] * KING_DF_LENGTH,
-#         "FID2": [1] * KING_DF_LENGTH,
-#         "Kinship": [0.50] * KING_DF_LENGTH,
-#         "InfType": ["Dup/MZTwin", "FS", "PO", "2nd", "3rd", "4th"],
-#     }
-#     df = pd.DataFrame(king_output)
-#     return df
-
-# def generate_king_output_same_degree(inftype: str):
-#     NUM_RELS = 7
-#     NUM_ROWS = NUM_RELS * NUM_RELS
-
-#     king_output = {
-#         "ID1": [i for i in range(1, NUM_RELS + 1) for _ in range(NUM_RELS)],
-#         "ID2": [i for _ in range(NUM_RELS) for i in range(1, NUM_RELS + 1)],
-#         "FID1": [1] * NUM_ROWS,
-#         "FID2": [1] * NUM_ROWS,
-#         "Kinship": [0.50] * NUM_ROWS,
-#         "InfType": [inftype] * NUM_ROWS,
-#     }
-#     df = pd.DataFrame(king_output)
-#     df = df.loc[df["ID1"] != df["ID2"]]
-#     return df    
-
-# @pytest.fixture()
-# def king_output_same_degree(request):
-#     # Allowed InfTypes are ["Dup/MZTwin", "FS", "PO" "1", "2", "3", "4", "UN"]
-#     return generate_king_output_same_degree(inftype=request.param)
-
-# def fam_file_format(num_rows: int):
-#     # Sets rng to simulate num_rows number of phenotypes
-#     rng = np.random.default_rng(seed=0)
-#     fam_file = {
-#         "FID": [1] * num_rows,
-#         "IID": [i for i in range(1, num_rows + 1)],
-#         "IIDF": [0] * num_rows,
-#         "IIDM": [0] * num_rows,
-#         "SEX": [1] * num_rows,
-#         "PHENO": list(rng.integers(1, 6, size=num_rows).astype(float)),
-#     }
-#     fam_df = pd.DataFrame(fam_file)
-#     return fam_df
-
-# @pytest.fixture
-# def short_fam_file():
-#     return fam_file_format(num_rows=8)
-
-# @pytest.fixture
-# def long_fam_file():
-#     return fam_file_format(num_rows=20)
-
-# # List of InfTypes that are available in the InfType column of a King output file.
-# ALLOWED_INFTYPES = [key for key in sut.INF_TO_DEG_MAP.keys()]
-
-# # Getting MAX_ID of king_output_same_degree to use in tests
-# DF2 = generate_king_output_same_degree(inftype="Dup/MZTwin") # InfType doesn't matter here, as we only care about max_ID for range in iid parametrization. 
-# DF2_MAX_ID = max(DF2['ID1'].max(), DF2['ID2'].max())
 
 rng = np.random.default_rng(seed=143823)
 
 def residualize(rel_info: sut.THRESHOLDED_REL_TYPE, unresidualized: np.ndarray) -> np.ndarray:
     _, num_ppl = unresidualized.shape
 
-    results = np.zeros_like(unresidualized)
+    results = np.zeros_like(unresidualized, dtype=float)
 
     for person in range(num_ppl):
-        results[:, person] = results[:, person] - np.mean(unresidualized[:, rel_info[person]], axis=1)
+        results[:, person] = unresidualized[:, person] - np.mean(unresidualized[:, rel_info[person]], axis=1)
 
     return results
 
 def generate_pheno_geno(num_snps, num_ppl, allele_freq=0.5, pheno_var=1.0):
-    return rng.normal(scale=pheno_var, size=(1, num_ppl), dtype=float), \
-           rng.binomial(n=2, p=allele_freq, size=(num_snps, num_ppl), dtype=float)
+    return rng.normal(scale=pheno_var, size=(1, num_ppl)), \
+           rng.binomial(n=2, p=allele_freq, size=(num_snps, num_ppl))
 
 
 def convert_rel_info_to_R(rel_info):
     num_ppl = len(rel_info)
 
     result = np.identity(num_ppl, dtype=float)
-    for person in rel_info:
-        result[person, rel_info[person]] - np.reciprocal(len(rel_info[person]))
+    for person, rel_list in enumerate(rel_info):
+        result[person, rel_list] -= np.reciprocal(len(rel_list), dtype=float)
 
     return result
 
@@ -134,18 +53,19 @@ def convert_rel_info_to_R(rel_info):
 def calculate_expected_ses(rel_info, residualized_phenotypes, residualized_genotypes) -> np.ndarray:
     sqrt_e_ssr = np.linalg.norm(residualized_phenotypes)
 
-    X = residualized_genotypes
+    X = residualized_genotypes.T   # In the write-up, X seems to be 1 (or N) x M
     R = convert_rel_info_to_R(rel_info)
-    
-    inv_X_t_X = np.linalg.inv(X.T @ X)
-    right_term = (X.T @ R @ R.T @ X) @ inv_X_t_X
 
-    main_term_numerator = inv_X_t_X @ right_term
-    main_term_denominator = np.trace(R @ R.T) - right_term
+    inv_X_t_X = np.reciprocal(np.sum(np.square(X), axis=0, keepdims=True))
+
+    right_term = np.sum((X.T @ R @ R.T).T * X, axis=0, keepdims=True) * inv_X_t_X
+
+    main_term_numerator = inv_X_t_X * right_term
+    main_term_denominator = np.trace(R @ R.T).reshape(1, -1) - right_term
 
     result = sqrt_e_ssr * np.sqrt(main_term_numerator / main_term_denominator)
 
-    return result
+    return result.ravel()
 
 
 REL_INFO_1 = [
@@ -158,133 +78,276 @@ REL_INFO_1 = [
     [1, 5, 6],
     [0, 7, 8],
     [0, 7, 8],
-    [1, 5, 7, 8, 9]
+    [1, 5, 7, 8, 9],
+    [10, 11],
+    [10, 11],
+    [12, 13, 14, 15],
+    [12, 13, 14, 15],
+    [12, 13, 14, 15],
+    [12, 13, 14, 15]
 ]
+
+DUPLICATES_1 = np.array([False, False, False, False, False, False, False, False, False, False,
+                True, True, True, True, True, True])
+
+R_MATRIX_1 = np.array(
+    [
+        [0.75, 0.0, -0.25, -0.25, -0.25, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.8, -0.2, -0.2, -0.2, -0.2, 0.0, 0.0, 0.0, 0.0],
+        [-0.2, -0.2, 0.8, -0.2, -0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [-0.2, -0.2, -0.2, 0.8, -0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [-0.2, -0.2, -0.2, -0.2, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, -0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0],
+        [0.0, -0.3333, 0.0, 0.0, 0.0, -0.3333, 0.6667, 0.0, 0.0, 0.0],
+        [-0.3333, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6667, -0.3333, 0.0],
+        [-0.3333, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.3333, 0.6667, 0.0],
+        [0.0, -0.2, 0.0, 0.0, 0.0, -0.2, 0.0, -0.2, -0.2, 0.8]
+    ]
+)
+
+
+
+
+
+REL_INFO_2 = [
+    [0, 1],
+    [0, 1],
+    [2, 3, 4],
+    [2, 3],
+    [4, 5],
+    [4, 5]
+]
+
+DUPLICATES_2 = np.array([True, True, False, False, False, False])
+
+R_MATRIX_2 = np.array(
+    [
+        [-0.6667, -0.3333, -0.3333, 0.0],
+        [-0.5, 0.5, 0.0, 0.0],
+        [0.0, 0.0, 0.5, -0.5],
+        [0.0, 0.0, -0.5, 0.5]
+    ]
+)
+
+GENO_2 = np.array(
+    [
+        [1.0, 1.0, 0.0, 0.0, 1.0, 1.0],
+        [1.0, 1.0, 0.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 0.0, 1.0, 1.0]
+    ]
+)
+
+PHENO_2 = np.array(
+    [
+        [0.9, 0.7, 0.5, 0.5, 0.6, 0.3]
+    ]
+)
+
+SES_2 = np.array(
+    [
+        [0.3983, 0.2230, 0.2934]
+    ]
+)
+
+
+
 
 
 class TestCalculateSes:
-
-    test_func = sut.calculate_ses
 
     @pytest.mark.parametrize("num_ppl", [1, 10, 1000])
     @pytest.mark.parametrize("num_snps", [1, 10, 1000])
     def test__all_singletons__all_nan_or_inf(self, num_ppl, num_snps):
         rel_info = [[i] for i in range(num_ppl)]
+        r_matrix = convert_rel_info_to_R(rel_info)
+        duplicates = np.full(num_ppl, False)
 
         phenotypes, genotypes = generate_pheno_geno(num_snps=num_snps, num_ppl=num_ppl)
         residualized_phenotypes = residualize(rel_info=rel_info, unresidualized=phenotypes)
         residualized_genotypes = residualize(rel_info=rel_info, unresidualized=genotypes)
 
-        actual_results = test_func(rel_info=rel_info, residualized_genotypes=residualized_genotypes,
-                                   residualized_phenotypes=residualized_phenotypes)
+        actual_results = test_func(R_matrix=sp.csr_matrix(r_matrix), duplicates=duplicates,
+                                   trace_rr=np.trace(r_matrix),
+                                   residualized_genotypes=residualized_genotypes,
+                                   var_y=np.var(residualized_phenotypes), N=num_ppl)
         assert np.all((actual_results == np.nan) | (actual_results == np.inf))
 
 
-    @pytest.mark.parametrize("num_ppl", [2, 20, 2000])  # Needs to be even
-    @pytest.mark.parametrize("num_snps", [20, 2000])
-    @pytest.mark.parametrize("allele_freq", [0.25, 0.5, 0.75])
-    def test__all_contiguous_doubles__expected_results(self, num_ppl, num_snps, allele_freq):
-        rel_info = [[2*i, 2*i + 1] for i in range(num_ppl >> 1)]
+    @pytest.mark.parametrize("num_ppl", [4, 20, 100])  # Needs to be even
+    @pytest.mark.parametrize("num_snps", [1, 3, 10, 100])
+    def test__all_contiguous_doubles__expected_results(self, num_ppl, num_snps):
+        rel_info = [[2*(pnum>>1), 2*(pnum>>1)+1] for pnum in range(num_ppl)]
+        r_matrix = np.zeros((0,0))
+        duplicates = np.full(num_ppl, True)
 
-        phenotypes, genotypes = generate_pheno_geno(num_snps=num_snps, num_ppl=num_ppl,
-                                                    allele_freq=allele_freq)
+        phenotypes, genotypes = generate_pheno_geno(num_snps=num_snps, num_ppl=num_ppl)
+
+        phenotypes = np.zeros((1, num_ppl), dtype=float)
+        phenotypes[:, 1::2] = 1.0
+        genotypes = np.zeros((num_snps, num_ppl), dtype=float)
+        genotypes[:, 1::2] = 1.0
+
         residualized_phenotypes = residualize(rel_info=rel_info, unresidualized=phenotypes)
         residualized_genotypes = residualize(rel_info=rel_info, unresidualized=genotypes)
+
+
+        expected_results = np.reciprocal(np.sqrt((num_ppl - 2.0) / 2.0))
+        actual_results = test_func(R_matrix=sp.csr_matrix(r_matrix), duplicates=duplicates,
+                                   trace_rr=np.trace(r_matrix),
+                                   residualized_genotypes=residualized_genotypes,
+                                   var_y=np.var(residualized_phenotypes), N=num_ppl)
+
+        assert np.allclose(actual_results, expected_results, equal_nan=True)
+
+
+
+    @pytest.mark.parametrize("rel_info, duplicates, r_matrix, genotypes, phenotypes, expected_results",
+                             [(REL_INFO_2, DUPLICATES_2, R_MATRIX_2, GENO_2, PHENO_2, SES_2)])
+    def test__precanned_inputs__expected_results(self, rel_info, duplicates, r_matrix, genotypes, phenotypes, expected_results):
+        num_ppl = len(rel_info)
+        trace_rr = np.trace(r_matrix @ r_matrix.T)
+
+        residualized_phenotypes = residualize(rel_info=rel_info, unresidualized=phenotypes)
+        residualized_genotypes = residualize(rel_info=rel_info, unresidualized=genotypes)
+
+        var_y = np.var(residualized_phenotypes)
+
+        actual_results = test_func(R_matrix=sp.csr_matrix(r_matrix), duplicates=duplicates,
+                                   trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
+                                   var_y=var_y, N=num_ppl)
+
+        assert np.allclose(actual_results, expected_results, equal_nan=True) 
+
+
+
+    @pytest.mark.parametrize("rel_info, duplicates, r_matrix", [(REL_INFO_1, DUPLICATES_1, R_MATRIX_1),
+                                                                (REL_INFO_2, DUPLICATES_2, R_MATRIX_2)])
+    @pytest.mark.parametrize("num_snps", [10, 100, 10000])
+    def test__precanned_rel_info__expected_results(self, rel_info, duplicates, r_matrix, num_snps):
+        num_ppl = len(rel_info)
+        trace_rr = np.trace(r_matrix @ r_matrix.T)
+
+
+        phenotypes, genotypes = generate_pheno_geno(num_snps=num_snps, num_ppl=num_ppl)
+        residualized_phenotypes = residualize(rel_info=rel_info, unresidualized=phenotypes)
+        residualized_genotypes = residualize(rel_info=rel_info, unresidualized=genotypes)
+
+        var_y = np.var(residualized_phenotypes)
 
         expected_results = calculate_expected_ses(rel_info=rel_info,
                                                   residualized_phenotypes=residualized_phenotypes,
                                                   residualized_genotypes=residualized_genotypes)
-        actual_results = test_func(rel_info=rel_info, residualized_genotypes=residualized_genotypes,
-                                   residualized_phenotypes=residualized_phenotypes)
+        actual_results = test_func(R_matrix=sp.csr_matrix(r_matrix), duplicates=duplicates,
+                                   trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
+                                   var_y=var_y, N=num_ppl)
 
-        assert np.allclose(actual_results, expected_results)
+        assert np.allclose(actual_results, expected_results, equal_nan=True)
 
 
-    @pytest.mark.parametrize("num_ppl", [10, 100, 10000])
+
+
+    @pytest.mark.parametrize("rel_info, duplicates, r_matrix", [(REL_INFO_1, DUPLICATES_1, R_MATRIX_1),
+                                                                (REL_INFO_2, DUPLICATES_2, R_MATRIX_2)])
+    @pytest.mark.parametrize("seed", [4, 7832])
+    def test__reshuffle_snps__results_shuffled_similarly(self, rel_info, duplicates, r_matrix, seed):
+        num_snps = 500
+        num_ppl = len(rel_info)
+        trace_rr = np.trace(r_matrix @ r_matrix.T)
+
+        rgen = np.random.default_rng(seed=seed)
+        permutation = rgen.permutation(num_snps)
+
+        phenotypes, genotypes = generate_pheno_geno(num_snps=num_snps, num_ppl=num_ppl)
+        residualized_phenotypes = residualize(rel_info=rel_info, unresidualized=phenotypes)
+        var_y = np.var(residualized_phenotypes)
+        residualized_genotypes = residualize(rel_info=rel_info, unresidualized=genotypes)
+        snpshuffled_genotypes = residualized_genotypes[permutation, :]
+
+        unshuf_results = test_func(R_matrix=sp.csr_matrix(r_matrix), duplicates=duplicates,
+                                   trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
+                                   var_y=var_y, N=num_ppl)
+
+        shuf_results = test_func(R_matrix=sp.csr_matrix(r_matrix), duplicates=duplicates,
+                                   trace_rr=trace_rr, residualized_genotypes=snpshuffled_genotypes,
+                                   var_y=var_y, N=num_ppl)
+
+        assert np.allclose(unshuf_results[permutation], shuf_results, atol=0.00001, equal_nan=True)
+
+
+
+
+    @pytest.mark.parametrize("rel_info, duplicates", [(REL_INFO_1, DUPLICATES_1),
+                                                      (REL_INFO_2, DUPLICATES_2)])
+    @pytest.mark.parametrize("seed", [35, 6537])
+    def test__reshuffle_ppl__results_unchanged(self, rel_info, duplicates, seed):
+        num_snps = 500
+        num_ppl = len(rel_info)
+        r_matrix = convert_rel_info_to_R(rel_info)[:, ~duplicates][~duplicates, :]
+        trace_rr = np.trace(r_matrix @ r_matrix.T)
+
+        rgen = np.random.default_rng(seed=seed)
+        permutation = rgen.permutation(num_ppl)
+
+        phenotypes, genotypes = generate_pheno_geno(num_snps=num_snps, num_ppl=num_ppl)
+        residualized_phenotypes = residualize(rel_info=rel_info, unresidualized=phenotypes)
+        var_y = np.var(residualized_phenotypes)
+        residualized_genotypes = residualize(rel_info=rel_info, unresidualized=genotypes)
+
+
+        pplshuffled_rel_info = [[] for _ in range(num_ppl)]
+        for i, rel_list in enumerate(rel_info):
+            pplshuffled_rel_info[permutation[i]] = sorted([permutation[person] for person in rel_list])
+        pplshuffled_duplicates = duplicates[permutation]
+        pplshuffled_genotypes = residualized_genotypes[:, permutation]
+        pplshuffled_phenotypes = residualized_phenotypes[:, permutation]
+        pplshuffled_r_matrix = convert_rel_info_to_R(pplshuffled_rel_info)[:, ~pplshuffled_duplicates][~pplshuffled_duplicates, :]
+        pplshuffled_trace_rr = np.trace(pplshuffled_r_matrix @ pplshuffled_r_matrix.T)
+
+
+        test_results = calculate_expected_ses(rel_info=pplshuffled_rel_info,
+                                                  residualized_phenotypes=pplshuffled_phenotypes,
+                                                  residualized_genotypes=pplshuffled_genotypes)
+
+        unshuf_results = test_func(R_matrix=sp.csr_matrix(r_matrix), duplicates=duplicates,
+                                   trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
+                                   var_y=var_y, N=num_ppl)
+
+        shuf_results = test_func(R_matrix=sp.csr_matrix(pplshuffled_r_matrix), duplicates=pplshuffled_duplicates,
+                                   trace_rr=pplshuffled_trace_rr, residualized_genotypes=pplshuffled_genotypes,
+                                   var_y=var_y, N=num_ppl)
+
+        assert np.allclose(unshuf_results, shuf_results, atol=0.00001, equal_nan=True)
+
+
+
+
+    # This test makes use of the GRMA calculate_R_matrix function.  That function should be tested
+    # separately (here it is assumed correct / is used for both main code and test inputs)
+    @pytest.mark.parametrize("num_ppl", [10, 100, 500])
     @pytest.mark.parametrize("seed", [1, 135432, 95423, 8465233194])
-    def test__random_rel_info__expected_results(self, seed, num_ppl):
-        num_snps = 5000
+    @pytest.mark.parametrize("p", [0.05, 0.2, 0.5, 0.8])
+    def test__random_rel_info__expected_results(self, seed, num_ppl, p):
+        num_snps = 1000
         rgen = np.random.default_rng(seed=seed)
 
         rel_info = []
-        for person in num_ppl:
-            g = rgen.choice([True, False], size=num_ppl)
+        for person in range(num_ppl):
+            g = rgen.choice([True, False], size=num_ppl, p=[p, 1.0-p])
             g[person] = True
-            rel_info.extend(g.tolist())
+            rel_info.extend([np.nonzero(g)[0].tolist()])
+
+        sp_r_matrix, duplicates, trace_rr = sut.calculate_R_matrix(rel_info)
 
         phenotypes, genotypes = generate_pheno_geno(num_snps=num_snps, num_ppl=num_ppl)
         residualized_phenotypes = residualize(rel_info=rel_info, unresidualized=phenotypes)
+        var_y = np.var(residualized_phenotypes)
         residualized_genotypes = residualize(rel_info=rel_info, unresidualized=genotypes)
 
         expected_results = calculate_expected_ses(rel_info=rel_info,
                                                   residualized_phenotypes=residualized_phenotypes,
                                                   residualized_genotypes=residualized_genotypes)
-        actual_results = test_func(rel_info=rel_info, residualized_genotypes=residualized_genotypes,
-                                   residualized_phenotypes=residualized_phenotypes)
+        actual_results = test_func(R_matrix=sp_r_matrix, duplicates=duplicates,
+                                   trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
+                                   var_y=var_y, N=num_ppl)
 
-        assert np.allclose(actual_results, expected_results)    
-
-
-    @pytest.mark.parametrize("rel_info", [REL_INFO_1])
-    @pytest.mark.parametrize("num_snps", [10, 100, 10000])
-    def test__precanned_rel_info__expected_results(self, rel_info, num_snps):
-        num_ppl = len(rel_info)
-
-        phenotypes, genotypes = generate_pheno_geno(num_snps=num_snps, num_ppl=num_ppl)
-        residualized_phenotypes = residualize(rel_info=rel_info, unresidualized=phenotypes)
-        residualized_genotypes = residualize(rel_info=rel_info, unresidualized=genotypes)
-
-        expected_results = calculate_expected_ses(rel_info=rel_info,
-                                                  residualized_phenotypes=residualized_phenotypes,
-                                                  residualized_genotypes=residualized_genotypes)
-        actual_results = test_func(rel_info=rel_info, residualized_genotypes=residualized_genotypes,
-                                   residualized_phenotypes=residualized_phenotypes)
-
-        assert np.allclose(actual_results, expected_results) 
-
-
-    @pytest.mark.parametrize("rel_info", [REL_INFO_1])
-    @pytest.mark.parametrize("seed", [4, 7832, 5243, 68034211])
-    def test__reshuffle_snps__results_shuffled_similarly(self, rel_info, seed):
-        num_snps = 5000
-        num_ppl = len(rel_info)
-
-        rgen = np.random.default_rng(seed=seed)
-        permutation = rgen.permutation(num_snps)
-
-        phenotypes, genotypes = generate_pheno_geno(num_snps=num_snps, num_ppl=num_ppl,
-                                                    allele_freq=allele_freq)
-        residualized_phenotypes = residualize(rel_info=rel_info, unresidualized=phenotypes)
-        residualized_genotypes = residualize(rel_info=rel_info, unresidualized=genotypes)
-        snpshuffled_genotypes = residualized_genotypes[permutation, :]
-
-        unshuf_results = test_func(rel_info=rel_info, residualized_genotypes=residualized_genotypes,
-                                   residualized_phenotypes=residualized_phenotypes)
-        shuf_results = test_func(rel_info=rel_info, residualized_genotypes=snpshuffled_genotypes,
-                                 residualized_phenotypes=residualized_phenotypes)
-
-        assert np.allclose(unshuf_results[permutation], shuf_results)
-
-
-    @pytest.mark.parametrize("rel_info", [REL_INFO_1])
-    @pytest.mark.parametrize("seed", [4, 7832, 5243, 68034211])
-    def test__reshuffle_snps__results_shuffled_similarly(self, seed):
-        rel_info = REL_INFO_1
-        num_snps = 5000
-        num_ppl = len(rel_info)
-
-        rgen = np.random.default_rng(seed=seed)
-        permutation = rgen.permutation(num_snps)
-
-        phenotypes, genotypes = generate_pheno_geno(num_snps=num_snps, num_ppl=num_ppl,
-                                                    allele_freq=allele_freq)
-        residualized_phenotypes = residualize(rel_info=rel_info, unresidualized=phenotypes)
-        residualized_genotypes = residualize(rel_info=rel_info, unresidualized=genotypes)
-        snpshuffled_genotypes = residualized_genotypes[permutation, :]
-
-        unshuf_results = test_func(rel_info=rel_info, residualized_genotypes=residualized_genotypes,
-                                   residualized_phenotypes=residualized_phenotypes)
-        shuf_results = test_func(rel_info=rel_info, residualized_genotypes=snpshuffled_genotypes,
-                                 residualized_phenotypes=residualized_phenotypes)
-
-        assert np.allclose(unshuf_results[permutation], shuf_results)
+        assert np.allclose(actual_results, expected_results, equal_nan=True)
