@@ -147,7 +147,7 @@ def format_covar_file(covar_filename: Union[str, pd.DataFrame], fam_filename: Un
 
 # -------------------------
 def convert_king_output_to_rel_info(
-    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: str, rel_info_file: str
+    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: str, rel_info_file: str=""
 ) -> tuple[THRESHOLDED_REL_TYPE, np.ndarray]:
     MAX_RELATEDNESS = 4  # Maximum degree of relatedness from king output
 
@@ -272,26 +272,47 @@ def convert_king_output_to_rel_info(
 
 # -------------------------
 
-def calculate_R_matrix(rel_info: THRESHOLDED_REL_TYPE) -> tuple[sp.csr_matrix, np.ndarray, float]:
+def calculate_R_matrix(rel_info: THRESHOLDED_REL_TYPE, rel_set_sizes: np.ndarray = None
+    ) -> tuple[sp.csr_matrix, np.ndarray, float]:
     
-    trace_rr = 0
-    duplicates = np.full(len(rel_info), False, dtype=bool)
-    checked = np.full(len(rel_info), False, dtype=bool)
+    # Determine the number of people / samples
+    N = len(rel_info)
+
+
+    # Calculate the trace
+    rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info],
+                             dtype=float) if rel_set_sizes is None else rel_set_sizes
+    trace_rr = float(N) - np.sum(np.reciprocal(rel_set_sizes))
+    logging.info(f"Trace rr is {trace_rr}")
+
+
+    # Determine individuals in blocks (later processing is simplified for these)
+    duplicates, examined = np.zeros(N, dtype=bool), np.zeros(N, dtype=bool)
     for cur_index, cur_list in enumerate(rel_info):
-        trace_rr += 1 - np.reciprocal(len(cur_list), dtype=float) # 0.1s faster to calculate this in a sep loop of duplicates
-        # If the current index has already been classified a duplicate or checked then skip
-        if duplicates[cur_index] or checked[cur_index]:
-            continue    
-        # if everyone in the curernt list is the same as rel_info[i] for i in cur_list and everyone in cur_list is not in eliminated, then eliminate all of them
-        # if someone is eliminated already but is in the current_list, then dont eliminate cur list and change previous eliminated to False
-        if all(cur_list == rel_info[i] and not (duplicates[i] or checked[i]) for i in cur_list): # Relies on the lists being sorted
-            duplicates[cur_list] = True
-        else:
-            for i in cur_list:
-                change_list = rel_info[i]
-                duplicates[change_list] = False
-        checked[cur_list] = True
- 
+        # If this index has already been examined, we won't get any new information from it here
+        if examined[cur_index]:
+            continue
+
+        # We've found a block if all the lists agree and are all new
+        duplicates[cur_list] = not any(examined[cur_list]) and \
+                               all(rel_info[i] == cur_list for i in cur_list)
+
+        # If it's not a block, check if any previous blocks need to be unmarked
+        if not duplicates[cur_index]:
+            # Any indices in the current (not actual) "block" (as defined by cur_list) that point to
+            # anything marked as a duplicate means that is a block that needs to be unmarked
+            block_indices_to_unmark = {blk_index for index in cur_list
+                                                 for blk_index in rel_info[index]
+                                       if duplicates[blk_index]}
+
+            for block_index in block_indices_to_unmark:
+                duplicates[rel_info[block_index]] = False
+
+        # Finally mark the current list as examined and processed
+        examined[cur_list] = True
+    logging.info(f"There are {np.count_nonzero(duplicates)} individuals in relational blocks")
+
+
     # Make R matrix for the remaining indices 
     remaining_indices = np.argwhere(~duplicates).flatten()
     num_remaining = len(remaining_indices)
@@ -313,17 +334,11 @@ def calculate_R_matrix(rel_info: THRESHOLDED_REL_TYPE) -> tuple[sp.csr_matrix, n
         R_matrix[mat_index, mat_list] -= np.reciprocal(len(cur_list), dtype=float)
     logging.info(f"Time to create R matrix {time.time() - mat_time}")
     
-    # Calculate trace of R matrix
-    # TODO (dhruvaj) could try doing sigma 1-1/N_i though since np.trace is implemented in C, this takes a couple seconds anyway.
-    sparsity = 1.0 - (np.count_nonzero(R_matrix) / float(R_matrix.size) )
-    logging.info(f"Sparsity of R matrix is {sparsity}")
 
-    # convert to sparse format
+    # Convert to sparse format
     mat_time = time.time()
     R_matrix = sp.csr_matrix(R_matrix)
-    print(f"Time to convert to csr {time.time() - mat_time}")
-    
-    logging.info(f"Trace rr is {trace_rr}")
+    logging.info(f"Time to convert to csr {time.time() - mat_time}")
     
     return R_matrix, duplicates, trace_rr
 # -------------------------
@@ -402,8 +417,9 @@ def calculate_ses(R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: flo
     XRRX = block_XRRX + non_block_XRRX
 
     ses = np.sqrt((XRRX * var_y * N) / (np.square(G_sq_sum_per_snp) * (trace_rr - (XRRX / G_sq_sum_per_snp))))
+
     logging.info(f"Time to calculate ses is {time.time() - ses_time}")
-    
+
     return ses
 # -------------------------
 def run_regressions(
@@ -492,7 +508,7 @@ def grma(
     #Calculate the effective N
     logging.debug("Creating R matrix")
     start_time = time.time()
-    R_matrix, duplicates, trace_rr = calculate_R_matrix(rel_info=rel_info)
+    R_matrix, duplicates, trace_rr = calculate_R_matrix(rel_info=rel_info, rel_set_sizes=rel_set_sizes)
     logging.info(f"After returning from calculate R matrix: Duplicates type is {duplicates.dtype}. Duplicates length is {len(duplicates)}. duplicates num of true values is {np.sum(duplicates)}")
     logging.info(f"Processed R matrix in {time.time() - start_time} seconds")
 
