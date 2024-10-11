@@ -66,11 +66,8 @@ BIM_FILE = "Bim file"
 FAM_FILE = "Fam file"
 REL_FILE = "Relatedness File"
 REL_INFO_FILE = "Rel info File"
-N_EFF = "Effective Sample Size"
 PHENO_FILE = "Phenotype File"
-COVAR_FILE = "Covariate File"
 REL_DEG = "Relatedness Degree"
-SNPS_PER_BLOCK = "SNPs Per Block"
 
 
 # Type declaration
@@ -165,6 +162,20 @@ def to_arg(flag_str: str) -> str:
 
 
 #################################
+def glob_path(s_input: str) -> List[str]:
+    """
+    Used for parsing some inputs to this program, namely glob paths (see Python glob module docs).
+
+    :param s_input: String passed in by argparse
+
+    :return: List of file paths
+    """
+    file_path_list = glob.glob(s_input)
+    if not file_path_list:
+        raise RuntimeError(f"Glob string \"{s_input}\" matches with no files.")
+    return sorted(set(os.path.abspath(f) for f in file_path_list))
+
+#################################
 def get_grma_parser(progname: str) -> argp.ArgumentParser:
     """
     Return a parser configured for this command line utility
@@ -184,110 +195,21 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
     in_opt = parser.add_argument_group(title="Main Input Specifications")
     in_opt.add_argument("--bfile", metavar="FILE_PREFIX", type=str,
                          help="Full prefix of bed/bim/fam files")
-    in_opt.add_argument("--bed", metavar="FILE", type=input_file,
-                         help="Full path and filename of input bed file, overrides bfile flag")
-    in_opt.add_argument("--bim", metavar="FILE", type=input_file,
-                         help="Full path and filename of input bim file, overrides bfile flag")
+    
     in_opt.add_argument("--fam", metavar="FILE", type=input_file,
                          help="Full path and filename of input fam file, overrides bfile flag")
 
-    in_opt.add_argument("--relfile", metavar="FILE", type=input_file, required=True,
+    in_opt.add_argument("--rel-file", metavar="FILE", type=input_file, required=True,
                          help=f"File containing relatedness info (in King-like format).  "
                               f"Needs the following columns: {lib.NEEDED_KING_COLS}")
-    in_opt.add_argument("--degree", metavar="DEGREE",
-                         default=DEFAULT_REL_DEG,
-                         choices=lib.REL_DEG_INPUTS,
-                         help=f"Relatedness degree that is one of {lib.REL_DEG_INPUTS}: default = {DEFAULT_REL_DEG}")
-    in_opt.add_argument("--relinfo", metavar="FILE", type = input_file,
-                        help="Optional input to avoid re-computing rel_info (after grma has already computed once)")
-    in_opt.add_argument("--neff", metavar="N_EFF", type=int,
-                         help="Optional input to specify the effective sample size and avoid re-computation")
+    
+    in_opt.add_argument("--rel-thresh", metavar="DEGREE", nargs='+',
+        default=[DEFAULT_REL_DEG], choices=lib.REL_DEG_INPUTS,  
+        help=f"Relatedness degree(s) to filter, one or more of {lib.REL_DEG_INPUTS}. Default = {DEFAULT_REL_DEG}")
 
     in_opt.add_argument("--pheno", metavar="FILE", type=input_file,
                          help="Optional input to specify a (Plink-style) phenotype file: "
                               "https://www.cog-genomics.org/plink/1.9/input#pheno")
-    in_opt.add_argument("--covar", metavar="FILE", type=input_file,
-                         help="Optional input to specify a (Plink-style) covariates file: "
-                              "https://www.cog-genomics.org/plink/2.0/input#covar")
-
-    # The following flags are some of the filters that Patrick had originally wanted to include.
-    # They mimic Plink filters of the same names, but after discussion, it made sense to at least
-    # not add them now.  We can either add them in later or just ask users to pre-filter their data
-    # either using Plink or another tool.  (if we opt not to add them, delete these commented lines)
-    # Input Filtering Options
-    # infilt_opt = parser.add_argument_group(title="Input Filtering Options")
-
-    # samp_opt = infilt_opt.add_mutually_exclusive_group()
-    # samp_opt.add_argument("--keep", metavar="FILE", type=input_file,
-    #                       help="Optional input to specify a whitespace-delimited sample ID file of "
-    #                            "sample IDs to include")
-    # samp_opt.add_argument("--remove", metavar="FILE", type=input_file,
-    #                       help="Optional input to specify a whitespace-delimited sample ID file of "
-    #                            "sample IDs to remove")
-
-    # var_opt = infilt_opt.add_mutually_exclusive_group()
-    # var_opt.add_argument("--extract", metavar="FILE", type=input_file,
-    #                      help="Optional input to specify a whitespace-delimited variant ID file of "
-    #                           "variant IDs to include")
-    # var_opt.add_argument("--exclude", metavar="FILE", type=input_file,
-    #                      help="Optional input to specify a whitespace-delimited variant ID file of "
-    #                           "variant IDs to remove")
-
-    # chr_opt = infilt_opt.add_mutually_exclusive_group()
-    # chr_opt.add_argument("--chr", metavar="CHR", type=chromosome, nargs="+",
-    #                      help="Optional input to specify chromosomes (1-22, X, Y) separated by "
-    #                           "spaces that should be included")
-    # chr_opt.add_argument("--not-chr", metavar="CHR", type=chromosome, nargs="+",
-    #                      help="Optional input to specify chromosomes (1-22, X, Y) separated by "
-    #                           "spaces that should be omitted")
-
-    # from_opt = infilt_opt.add_mutually_exclusive_group()
-    # from_opt.add_argument("--from", metavar="VAR_ID", type=str,
-    #                       help="Only include variants on the same chromosome as and a BP "
-    #                            "position >= the indicated variant")
-    # from_opt.add_argument("--from-bp", metavar="BP_POS", type=str,
-    #                       help="Only include variants with a BP position >= "
-    #                            "the indicated position.  Must specify a single chromosome.")
-    # from_opt.add_argument("--from-kb", metavar="KB_POS", type=str,
-    #                       help="Only include variants with a kilo-BP position >= "
-    #                            "the indicated position.  Must specify a single chromosome.")
-    # from_opt.add_argument("--from-mb", metavar="MB_POS", type=str,
-    #                       help="Only include variants with an mega-BP position >= "
-    #                            "the indicated position.  Must specify a single chromosome.")
-
-    # to_opt = infilt_opt.add_mutually_exclusive_group()
-    # to_opt.add_argument("--to", metavar="VAR_ID", type=str,
-    #                       help="Only include variants on the same chromosome as and a BP "
-    #                            "position <= the indicated variant")
-    # to_opt.add_argument("--to-bp", metavar="BP_POS", type=str,
-    #                       help="Only include variants with a BP position <= "
-    #                            "the indicated position.  Must specify a single chromosome.")
-    # to_opt.add_argument("--to-kb", metavar="KB_POS", type=str,
-    #                       help="Only include variants with a kilo-BP position <= "
-    #                            "the indicated position.  Must specify a single chromosome.")
-    # to_opt.add_argument("--to-mb", metavar="MB_POS", type=str,
-    #                       help="Only include variants with an mega-BP position <= "
-    #                            "the indicated position.  Must specify a single chromosome.")
-
-
-    # infilt_opt.add_argument("--geno", metavar="CALL_RATE", type=float, # TODO (jonbjala) Create func to check between 0 and 1
-    #                         help="Excludes variants with missing call rates exceeding the "
-    #                              "indicated value.")
-    # infilt_opt.add_argument("--mind", metavar="CALL_RATE", type=float,
-    #                         help="Excludes samples with missing call rates exceeding the "
-    #                              "indicated value.")
-
-    # infilt_opt.add_argument("--maf", metavar="FREQ", type=float,
-    #                         help="Excludes variants with allele frequencies strictly less than the "
-    #                              "indicated value.")
-
-    # infilt_opt.add_argument("--hwe", metavar="P-VALUE", type=float,
-    #                         help="Excludes variants with Hardy-Weinberg equilibrium exact test "
-    #                              "p-value below the provided threshold.")
-
-    # infilt_opt.add_argument("--hwe", metavar="P-VALUE", type=float,
-    #                         help="Excludes variants with Hardy-Weinberg equilibrium exact test "
-    #                              "p-value below the provided threshold.")
 
     
     # Output Options
@@ -302,10 +224,6 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
 
     # General Options
     gen_opt = parser.add_argument_group(title="General Options")
-    gen_opt.add_argument("--snps-per-block", metavar="SNPS_PER_BLOCK", type=int,
-                         default=lib.DEFAULT_SNPS_PER_BLOCK,
-                         help=f"Number of SNPs to process at a time.  Default is "
-                              f"{lib.DEFAULT_SNPS_PER_BLOCK}")
 
     #   Logging options (subgroup)
     log_opt = gen_opt.add_mutually_exclusive_group()
@@ -452,8 +370,11 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     # Log user-specified arguments
     logging.debug("\nProgram was called with the following arguments:\n%s", user_args)
 
-    # Make sure bed/bim/fam files are specified
-    logging.debug("Checking whether bed/bim/fam files were specified.")
+    # Make sure either --bfile or --fam or --pheno is specified.
+    if not (pargs.bfile or pargs.fam or pargs.pheno):
+        raise ValueError("You must specify at least one of --bfile, --fam, or --pheno.")
+
+    # Make sure bed/bim/fam files are specified if needed
     unspecified_bedbimfam = []
     for suffix, argflag in [(BED_SUFFIX, 'bed'), (BIM_SUFFIX, 'bim'), (FAM_SUFFIX, 'fam')]:
         if not pargs.bfile and not getattr(pargs, argflag):
@@ -470,12 +391,8 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         BIM_FILE : pargs.bim if pargs.bim else f"{pargs.bfile}{BIM_SUFFIX}",
         FAM_FILE : pargs.fam if pargs.fam else f"{pargs.bfile}{FAM_SUFFIX}",
         REL_FILE : pargs.relfile,
-        REL_INFO_FILE : pargs.relinfo,
-        N_EFF : pargs.neff,
         PHENO_FILE : pargs.pheno,
-        COVAR_FILE : pargs.covar,
         REL_DEG : pargs.degree,
-        SNPS_PER_BLOCK : pargs.snps_per_block
     }
 
     # Make sure bed/bim/fam files exist (if specified with bedbimfam flag, hasn't been checked yet)
@@ -530,9 +447,9 @@ def main_func(argv: List[str]):
         # Run the GRMA pipeline
         logging.info("Calling main GRMA function")
         results = lib.grma(
-            rel_input=iargs[REL_FILE], rel_info_file=iargs[REL_INFO_FILE], N_eff=iargs[N_EFF], bed_file=iargs[BED_FILE], bim_file=iargs[BIM_FILE],
-            fam_file=iargs[FAM_FILE], pheno_file=iargs[PHENO_FILE], covar_file=iargs[COVAR_FILE],
-            rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK]
+            rel_input=iargs[REL_FILE], bed_file=iargs[BED_FILE], bim_file=iargs[BIM_FILE],
+            fam_file=iargs[FAM_FILE], pheno_file=iargs[PHENO_FILE], 
+            rel_degree=iargs[REL_DEG]
         )
 
         # Write out the results to disk

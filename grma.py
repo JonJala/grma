@@ -14,6 +14,7 @@ import re
 import sys
 from typing import Any, Callable, Dict, List, Tuple
 import time
+import glob
 
 import numpy as np
 import pandas as pd
@@ -60,9 +61,9 @@ DEFAULT_FULL_OUT_PREFIX = os.path.join(os.getcwd(), DEFAULT_SHORT_PREFIX)
 # Dictionary keys for internal usage
 OUT_DIR = "Output Directory"
 OUT_PREFIX = "Output Prefix"
-BED_FILE = "Bed file"
-BIM_FILE = "Bim file"
-FAM_FILE = "Fam file"
+BED_FILES = "Bed file"
+BIM_FILES = "Bim file"
+FAM_FILES = "Fam file"
 REL_FILE = "Relatedness File"
 REL_INFO_FILE = "Rel info File"
 PHENO_FILE = "Phenotype File"
@@ -134,6 +135,32 @@ def output_prefix(s_input: str) -> str:
 
     return stripped_p
 
+#################################
+def rel_thresh_type(s_input: str) -> float:
+    """
+    Used for parsing some inputs to this program, namely relatedness thresholds.
+    Whitespace is removed, but no case-changing occurs.
+
+    :param s_input: String passed in by argparse
+
+    :return float: The relatedness threshold
+    """
+
+    stripped_thresh = s_input.strip()
+    try:
+        # Attempt to convert the value to float
+        float_thresh = float(stripped_thresh)
+        if not (0.0 < float_thresh < 0.0625):
+            raise argp.ArgumentTypeError(f"Value must be greater than 0.0 and less than 0.0625. Invalid value: {float_thresh}")
+        return float_thresh  # Return the valid float value
+    except ValueError:
+        # If conversion to float fails, check if it is in the valid list
+        if stripped_thresh in lib.REL_DEG_INPUTS:
+            return stripped_thresh  # Return the valid string value
+        else:
+            raise argp.ArgumentTypeError(
+                f"Invalid value for --rel-thresh: {stripped_thresh}. "
+                f"Expected one of {lib.REL_DEG_INPUTS} or a float > 0.0 and < 0.0625.")
 
 #################################
 def to_flag(arg_str: str) -> str:
@@ -161,6 +188,19 @@ def to_arg(flag_str: str) -> str:
 
     return flag_str.replace("-", "_")
 
+#################################
+def glob_path(s_input: str) -> List[str]:
+    """
+    Used for parsing some inputs to this program, namely glob paths (see Python glob module docs).
+
+    :param s_input: String passed in by argparse
+
+    :return: List of file paths
+    """
+    file_path_list = glob.glob(s_input)
+    if not file_path_list:
+        raise RuntimeError(f"Glob string \"{s_input}\" matches with no files.")
+    return set(os.path.abspath(f) for f in file_path_list)
 
 #################################
 def get_grma_parser(progname: str) -> argp.ArgumentParser:
@@ -180,30 +220,41 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
 
     # Main Input Options
     in_opt = parser.add_argument_group(title="Main Input Specifications")
-    in_opt.add_argument("--bfile", metavar="FILE_PREFIX", type=str,
-                         help="Full prefix of bed/bim/fam files")
-    in_opt.add_argument("--bed", metavar="FILE", type=input_file,
-                         help="Full path and filename of input bed file, overrides bfile flag")
-    in_opt.add_argument("--bim", metavar="FILE", type=input_file,
-                         help="Full path and filename of input bim file, overrides bfile flag")
+    in_opt.add_argument("--bfile", type=glob_path, required=True, metavar="GLOB_PATH",
+                    help="Paths to PLINK 1 binary files.  See python glob module for documentation "
+                            "on the string to be provided here (full path with support for \"*\", "
+                            "\"?\", and \"[]\").  This string should be encased in quotes.  ")
+
     in_opt.add_argument("--fam", metavar="FILE", type=input_file,
                          help="Full path and filename of input fam file, overrides bfile flag")
 
-    in_opt.add_argument("--relfile", metavar="FILE", type=input_file, required=True,
-                         help=f"File containing relatedness info (in King-like format).  "
-                              f"Needs the following columns: {lib.NEEDED_KING_COLS}")
-    in_opt.add_argument("--degree", metavar="DEGREE",
-                         default=DEFAULT_REL_DEG,
-                         choices=lib.REL_DEG_INPUTS,
-                         help=f"Relatedness degree that is one of {lib.REL_DEG_INPUTS}: default = {DEFAULT_REL_DEG}")
-    in_opt.add_argument("--relinfo", metavar="FILE", type = input_file,
-                        help="Optional input to avoid re-computing rel_info (after grma has already computed once)")
+    in_opt.add_argument("--rel-thresh", metavar="THRESHOLD",
+                         default=DEFAULT_REL_DEG, type=rel_thresh_type,
+    help=f"Relatedness threshold. Can be one of {lib.REL_DEG_INPUTS} or a number between 0.0 and 0.0625.")
+
     in_opt.add_argument("--pheno", metavar="FILE", type=input_file,
                          help="Optional input to specify a (Plink-style) phenotype file: "
                               "https://www.cog-genomics.org/plink/1.9/input#pheno")
     in_opt.add_argument("--covar", metavar="FILE", type=input_file,
                          help="Optional input to specify a (Plink-style) covariates file: "
                               "https://www.cog-genomics.org/plink/2.0/input#covar")
+        
+    rel_opt = parser.add_mutually_exclusive_group(required=True)
+    rel_opt.add_argument("--rel-grma", metavar="FILE", type = input_file,
+                        help="Mutually exclusive with --rel-pedigree.  Required.  "
+                        "Path to serialized relatedness information that has been pre-processed by GRMA.")
+    
+    rel_opt.add_argument("--rel-pedigree", metavar="FILE", type=input_file,
+                         help=f"Mutually exclusive with --rel-grma.  Required.  Path to KING-formatted relatedness file (ASCII). "
+                              f"Needs the following columns: {lib.NEEDED_KING_COLS}")
+    
+    infilt_opt = parser.add_argument_group(title="Input Filtering Options")
+    infilt_opt.add_argument("--id-list", metavar="FILE", type=input_file,
+                            help="Optional input to specify a whitespace-delimited sample ID file of "
+                                 "sample IDs to include")
+    infilt_opt.add_argument("--extract", metavar="FILE", type=input_file,
+                          help="Optional input to specify a whitespace-delimited variant ID file of "
+                               "variant IDs to include")
 
     # The following flags are some of the filters that Patrick had originally wanted to include.
     # They mimic Plink filters of the same names, but after discussion, it made sense to at least
@@ -461,22 +512,23 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     internal_values = {
         OUT_PREFIX : pargs.out,
         OUT_DIR : os.path.dirname(pargs.out),
-        BED_FILE : pargs.bed if pargs.bed else f"{pargs.bfile}{BED_SUFFIX}",
-        BIM_FILE : pargs.bim if pargs.bim else f"{pargs.bfile}{BIM_SUFFIX}",
-        FAM_FILE : pargs.fam if pargs.fam else f"{pargs.bfile}{FAM_SUFFIX}",
-        REL_FILE : pargs.relfile,
-        REL_INFO_FILE : pargs.relinfo,
+        BED_FILES : glob_path(f"{pargs.bfile}.bed"),
+        BIM_FILES : glob_path(f"{pargs.bfile}.bim"),
+        FAM_FILES : glob_path(f"{pargs.bfile}.fam"),
+        REL_FILE : pargs.rel_pedigree,
+        REL_INFO_FILE : pargs.rel_grma,
         PHENO_FILE : pargs.pheno,
         COVAR_FILE : pargs.covar,
-        REL_DEG : pargs.degree,
+        REL_DEG : pargs.rel_thresh,
         SNPS_PER_BLOCK : pargs.snps_per_block
     }
 
     # Make sure bed/bim/fam files exist (if specified with bedbimfam flag, hasn't been checked yet)
     logging.debug("Checking whether bed/bim/fam files exist.")
-    for file in (BED_FILE, BIM_FILE, FAM_FILE):
-        if not os.path.exists(internal_values[file]):
-            raise FileNotFoundError(f"{file} ({internal_values[file]}) does not exist.")
+    for bed_file, bim_file, fam_file in zip(BED_FILES, BIM_FILES, FAM_FILES):
+        for file in (bed_file, bim_file, fam_file):
+            if not os.path.exists(file):
+                raise FileNotFoundError(f"{file} does not exist.")
 
     return internal_values
 
@@ -523,17 +575,18 @@ def main_func(argv: List[str]):
 
         # Run the GRMA pipeline
         logging.info("Calling main GRMA function")
-        results = lib.grma(
-            rel_input=iargs[REL_FILE], rel_info_file=iargs[REL_INFO_FILE], bed_file=iargs[BED_FILE], bim_file=iargs[BIM_FILE],
-            fam_file=iargs[FAM_FILE], pheno_file=iargs[PHENO_FILE], covar_file=iargs[COVAR_FILE],
-            rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK]
-        )
+        for bed_file, bim_file, fam_file in zip(iargs[BED_FILES], iargs[BIM_FILES], iargs[FAM_FILES]):
+            results = lib.grma(
+                rel_input=iargs[REL_FILE], rel_info_file=iargs[REL_INFO_FILE], bed_file=bed_file, bim_file=bim_file,
+                fam_file=fam_file, pheno_file=iargs[PHENO_FILE], covar_file=iargs[COVAR_FILE],
+                rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK]
+            )
 
-        # Write out the results to disk
-        logging.info("Writing results to disk.")
-        filename = f"{iargs[OUT_PREFIX]}.res" # TODO(jonbjala)
-        logging.debug(f"\t{filename}")
-        write_results_to_file(filename, results)
+            # Write out the results to disk per chromosome
+            logging.info("Writing results to disk.")
+            filename = f"{iargs[OUT_PREFIX]}.res" # TODO(jonbjala)
+            logging.debug(f"\t{filename}")
+            write_results_to_file(filename, results)
 
         # Log any remaining information TODO(jonbjala) Timing info?
         logging.info("\nExecution complete.\n")
