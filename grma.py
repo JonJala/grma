@@ -584,7 +584,7 @@ def main_func(argv: List[str]):
 
             # Write out the results to disk per chromosome
             logging.info("Writing results to disk.")
-            filename = f"{iargs[OUT_PREFIX]}.res" # TODO(jonbjala)
+            filename = f"{iargs[OUT_PREFIX]}_{bed_file[:-4]}.res" # TODO(jonbjala)
             logging.debug(f"\t{filename}")
             write_results_to_file(filename, results)
 
