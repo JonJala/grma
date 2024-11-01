@@ -468,6 +468,9 @@ def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np
     return results_df
 
 # -------------------------
+def rel_preprocess():
+    pass
+# -------------------------
 def grma(
     *,
     rel_input: Union[str, pd.DataFrame, np.ndarray],

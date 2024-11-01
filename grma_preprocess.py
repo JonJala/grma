@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Python tool for TODO
+Python tool for producing relationship groups to be used in GRMA analysis. 
 """
 
 import argparse as argp
@@ -22,6 +22,7 @@ import pandas as pd
 pd.options.mode.copy_on_write = True
 
 from bedbimfam import (BED_SUFFIX, BIM_SUFFIX, FAM_SUFFIX)
+from grma import (rel_thresh_type, MIN_KINSHIP_THRESH, MAX_KINSHIP_THRESH)
 import grma_lib as lib
 
 
@@ -36,7 +37,7 @@ OTHER_CORRESPONDENCE_EMAIL = "paturley@broadinstitute.org" # TODO(jonbjala) Chan
 HEADER = f"""
 <><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><><>
 <>
-<> GRMA: Genetic-Relatedness Matched Association
+<> GRMA: Genetic-Relatedness Matched Association Preprocessing
 <> Version: {__version__}
 <> (C) 2023 Social Science Genetic Association Consortium (SSGAC)
 <> MIT License
@@ -53,7 +54,7 @@ MAX_RELATEDNESS = 4 # This is the max degree that King outputs
 DEFAULT_REL_DEG = 1
 
 # The default short file prefix to use for output and logs
-DEFAULT_SHORT_PREFIX = "grma"
+DEFAULT_SHORT_PREFIX = "grma_rel"
 
 # Default prefix to use for output when not specified
 DEFAULT_FULL_OUT_PREFIX = os.path.join(os.getcwd(), DEFAULT_SHORT_PREFIX)
@@ -61,8 +62,6 @@ DEFAULT_FULL_OUT_PREFIX = os.path.join(os.getcwd(), DEFAULT_SHORT_PREFIX)
 # Dictionary keys for internal usage
 OUT_DIR = "Output Directory"
 OUT_PREFIX = "Output Prefix"
-BED_FILE = "Bed file"
-BIM_FILE = "Bim file"
 FAM_FILE = "Fam file"
 REL_FILE = "Relatedness File"
 REL_INFO_FILE = "Rel info File"
@@ -193,23 +192,27 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
 
     # Main Input Options
     in_opt = parser.add_argument_group(title="Main Input Specifications")
-    in_opt.add_argument("--bfile", metavar="FILE_PREFIX", type=str,
+    
+    sample_info = in_opt.add_mutually_exclusive_group(required=True)
+    sample_info.add_argument("--bfile", metavar="FILE_PREFIX", type=str,
                          help="Full prefix of bed/bim/fam files")
     
-    in_opt.add_argument("--fam", metavar="FILE", type=input_file,
+    sample_info.add_argument("--fam", metavar="FILE", type=input_file,
                          help="Full path and filename of input fam file, overrides bfile flag")
+    
+    sample_info.add_argument("--pheno", metavar="FILE", type=input_file,
+                         help="Optional input to specify a (Plink-style) phenotype file: "
+                              "https://www.cog-genomics.org/plink/1.9/input#pheno")
+
 
     in_opt.add_argument("--rel-file", metavar="FILE", type=input_file, required=True,
                          help=f"File containing relatedness info (in King-like format).  "
                               f"Needs the following columns: {lib.NEEDED_KING_COLS}")
     
-    in_opt.add_argument("--rel-thresh", metavar="DEGREE", nargs='+',
-        default=[DEFAULT_REL_DEG], choices=lib.REL_DEG_INPUTS,  
-        help=f"Relatedness degree(s) to filter, one or more of {lib.REL_DEG_INPUTS}. Default = {DEFAULT_REL_DEG}")
+    in_opt.add_argument("--rel-thresh", metavar="THRESHOLD", nargs='+',
+                         default=DEFAULT_REL_DEG, type=rel_thresh_type,
+    help=f"Relatedness threshold. Can be one of {lib.REL_DEG_INPUTS} or a number in [{MIN_KINSHIP_THRESH}, {MAX_KINSHIP_THRESH}].")
 
-    in_opt.add_argument("--pheno", metavar="FILE", type=input_file,
-                         help="Optional input to specify a (Plink-style) phenotype file: "
-                              "https://www.cog-genomics.org/plink/1.9/input#pheno")
 
     
     # Output Options
@@ -374,32 +377,27 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     if not (pargs.bfile or pargs.fam or pargs.pheno):
         raise ValueError("You must specify at least one of --bfile, --fam, or --pheno.")
 
-    # Make sure bed/bim/fam files are specified if needed
-    unspecified_bedbimfam = []
-    for suffix, argflag in [(BED_SUFFIX, 'bed'), (BIM_SUFFIX, 'bim'), (FAM_SUFFIX, 'fam')]:
-        if not pargs.bfile and not getattr(pargs, argflag):
-            unspecified_bedbimfam.append(suffix)
-    if unspecified_bedbimfam:
-        raise ValueError(f"Unspecified input file types: {unspecified_bedbimfam}")
+    # Check that file with IDs exists
+    if pargs.bfile:
+        if not os.path.exists(f"{pargs.bfile}{FAM_SUFFIX}"):
+            raise FileNotFoundError(f"File {pargs.bfile}{FAM_SUFFIX} does not exist.")
+    elif pargs.fam:
+        if not os.path.exists(pargs.fam):
+            raise FileNotFoundError(f"File {pargs.fam} does not exist.")
+    elif pargs.pheno:
+        if not os.path.exists(pargs.pheno):
+            raise FileNotFoundError(f"File {pargs.pheno} does not exist.")
 
     # Prepare dictionary that will hold internal values for this program
     logging.debug("Constructing dictionary of values from flags passed in.")
     internal_values = {
         OUT_PREFIX : pargs.out,
         OUT_DIR : os.path.dirname(pargs.out),
-        BED_FILE : pargs.bed if pargs.bed else f"{pargs.bfile}{BED_SUFFIX}",
-        BIM_FILE : pargs.bim if pargs.bim else f"{pargs.bfile}{BIM_SUFFIX}",
-        FAM_FILE : pargs.fam if pargs.fam else f"{pargs.bfile}{FAM_SUFFIX}",
-        REL_FILE : pargs.relfile,
+        FAM_FILE : f"{pargs.bfile}{FAM_SUFFIX}" if not pargs.fam else pargs.fam,
         PHENO_FILE : pargs.pheno,
+        REL_FILE : pargs.relfile,
         REL_DEG : pargs.degree,
     }
-
-    # Make sure bed/bim/fam files exist (if specified with bedbimfam flag, hasn't been checked yet)
-    logging.debug("Checking whether bed/bim/fam files exist.")
-    for file in (BED_FILE, BIM_FILE, FAM_FILE):
-        if not os.path.exists(internal_values[file]):
-            raise FileNotFoundError(f"{file} ({internal_values[file]}) does not exist.")
 
     return internal_values
 
@@ -446,13 +444,13 @@ def main_func(argv: List[str]):
 
         # Run the GRMA pipeline
         logging.info("Calling main GRMA function")
-        results = lib.grma(
-            rel_input=iargs[REL_FILE], bed_file=iargs[BED_FILE], bim_file=iargs[BIM_FILE],
-            fam_file=iargs[FAM_FILE], pheno_file=iargs[PHENO_FILE], 
-            rel_degree=iargs[REL_DEG]
+        results = lib.rel_preprocess(
+            rel_input=iargs[REL_FILE], fam_file=iargs[FAM_FILE],
+            pheno_file=iargs[PHENO_FILE], rel_degree=iargs[REL_DEG]
         )
 
         # Write out the results to disk
+        # May not need if we write out results directly in grma_preprocess function
         logging.info("Writing results to disk.")
         filename = f"{iargs[OUT_PREFIX]}.res" # TODO(jonbjala)
         logging.debug(f"\t{filename}")
@@ -471,3 +469,4 @@ if __name__ == "__main__":
 
     # Call the main function
     main_func(sys.argv)
+    

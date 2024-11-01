@@ -52,6 +52,10 @@ MIN_RELATEDNESS = 1
 MAX_RELATEDNESS = 4 # This is the max degree that King outputs 
 DEFAULT_REL_DEG = 1
 
+# Kinship thresholds
+MIN_KINSHIP_THRESH = 0.0
+MAX_KINSHIP_THRESH = 0.0625
+
 # The default short file prefix to use for output and logs
 DEFAULT_SHORT_PREFIX = "grma"
 
@@ -61,9 +65,9 @@ DEFAULT_FULL_OUT_PREFIX = os.path.join(os.getcwd(), DEFAULT_SHORT_PREFIX)
 # Dictionary keys for internal usage
 OUT_DIR = "Output Directory"
 OUT_PREFIX = "Output Prefix"
-BED_FILES = "Bed file"
-BIM_FILES = "Bim file"
-FAM_FILES = "Fam file"
+BED_FILES = "Bed files"
+BIM_FILES = "Bim files"
+FAM_FILES = "Fam files"
 REL_FILE = "Relatedness File"
 REL_INFO_FILE = "Rel info File"
 PHENO_FILE = "Phenotype File"
@@ -150,8 +154,10 @@ def rel_thresh_type(s_input: str) -> float:
     try:
         # Attempt to convert the value to float
         float_thresh = float(stripped_thresh)
-        if not (0.0 < float_thresh < 0.0625):
-            raise argp.ArgumentTypeError(f"Value must be greater than 0.0 and less than 0.0625. Invalid value: {float_thresh}")
+        if not (MIN_KINSHIP_THRESH <= float_thresh <= MIN_KINSHIP_THRESH):
+            raise argp.ArgumentTypeError(
+                f"Invalid value for --rel-thresh: {stripped_thresh}. "
+                f"Expected one of {lib.REL_DEG_INPUTS} or a float in [{MIN_KINSHIP_THRESH}, {MAX_KINSHIP_THRESH}].")
         return float_thresh  # Return the valid float value
     except ValueError:
         # If conversion to float fails, check if it is in the valid list
@@ -160,7 +166,7 @@ def rel_thresh_type(s_input: str) -> float:
         else:
             raise argp.ArgumentTypeError(
                 f"Invalid value for --rel-thresh: {stripped_thresh}. "
-                f"Expected one of {lib.REL_DEG_INPUTS} or a float > 0.0 and < 0.0625.")
+                f"Expected one of {lib.REL_DEG_INPUTS} or a float in [{MIN_KINSHIP_THRESH}, {MAX_KINSHIP_THRESH}].")
 
 #################################
 def to_flag(arg_str: str) -> str:
@@ -189,7 +195,7 @@ def to_arg(flag_str: str) -> str:
     return flag_str.replace("-", "_")
 
 #################################
-def glob_path(s_input: str) -> List[str]:
+def glob_path(s_inputs: List[str]) -> List[str]:
     """
     Used for parsing some inputs to this program, namely glob paths (see Python glob module docs).
 
@@ -197,10 +203,16 @@ def glob_path(s_input: str) -> List[str]:
 
     :return: List of file paths
     """
-    file_path_list = glob.glob(s_input)
-    if not file_path_list:
-        raise RuntimeError(f"Glob string \"{s_input}\" matches with no files.")
-    return set(os.path.abspath(f) for f in file_path_list)
+    final_file_paths = set()
+    for s_input in s_inputs:
+        file_path_list = glob.glob(s_input)
+    
+        if not file_path_list:
+            raise ValueError(f"Glob string \"{s_input}\" matches with no files.")
+        
+        final_file_paths.update(os.path.abspath(f) for f in file_path_list) 
+       
+    return list(final_file_paths)
 
 #################################
 def get_grma_parser(progname: str) -> argp.ArgumentParser:
@@ -220,7 +232,7 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
 
     # Main Input Options
     in_opt = parser.add_argument_group(title="Main Input Specifications")
-    in_opt.add_argument("--bfile", type=glob_path, required=True, metavar="GLOB_PATH",
+    in_opt.add_argument("--bfile", type=glob_path, required=True, metavar="GLOB_PATH", nargs="+",
                     help="Paths to PLINK 1 binary files.  See python glob module for documentation "
                             "on the string to be provided here (full path with support for \"*\", "
                             "\"?\", and \"[]\").  This string should be encased in quotes.  ")
@@ -230,7 +242,7 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
 
     in_opt.add_argument("--rel-thresh", metavar="THRESHOLD",
                          default=DEFAULT_REL_DEG, type=rel_thresh_type,
-    help=f"Relatedness threshold. Can be one of {lib.REL_DEG_INPUTS} or a number between 0.0 and 0.0625.")
+    help=f"Relatedness threshold. Can be one of {lib.REL_DEG_INPUTS} or a number in [{MIN_KINSHIP_THRESH}, {MAX_KINSHIP_THRESH}].")
 
     in_opt.add_argument("--pheno", metavar="FILE", type=input_file,
                          help="Optional input to specify a (Plink-style) phenotype file: "
@@ -252,7 +264,7 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
     infilt_opt.add_argument("--id-list", metavar="FILE", type=input_file,
                             help="Optional input to specify a whitespace-delimited sample ID file of "
                                  "sample IDs to include")
-    infilt_opt.add_argument("--extract", metavar="FILE", type=input_file,
+    infilt_opt.add_argument("--snp-list", metavar="FILE", type=input_file,
                           help="Optional input to specify a whitespace-delimited variant ID file of "
                                "variant IDs to include")
 
@@ -500,21 +512,28 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
 
     # Make sure bed/bim/fam files are specified
     logging.debug("Checking whether bed/bim/fam files were specified.")
-    unspecified_bedbimfam = []
-    for suffix, argflag in [(BED_SUFFIX, 'bed'), (BIM_SUFFIX, 'bim'), (FAM_SUFFIX, 'fam')]:
-        if not pargs.bfile and not getattr(pargs, argflag):
-            unspecified_bedbimfam.append(suffix)
-    if unspecified_bedbimfam:
-        raise ValueError(f"Unspecified input file types: {unspecified_bedbimfam}")
+    missing_files = []
+    for bfile in pargs.bfile:
+        bed_file = f"{bfile}{BED_SUFFIX}"
+        bim_file = f"{bfile}{BIM_SUFFIX}"
+        fam_file = f"{bfile}{FAM_SUFFIX}"
+        
+        required_files = [bed_file, bim_file] if pargs.fam else [bed_file, bim_file, fam_file]
+        for file in required_files:
+            if not os.path.exists(file):
+                missing_files.append(file)
+    
+    if missing_files:
+        raise FileNotFoundError(f"Missing the following files: {missing_files}")
 
     # Prepare dictionary that will hold internal values for this program
     logging.debug("Constructing dictionary of values from flags passed in.")
     internal_values = {
         OUT_PREFIX : pargs.out,
         OUT_DIR : os.path.dirname(pargs.out),
-        BED_FILES : glob_path(f"{pargs.bfile}.bed"),
-        BIM_FILES : glob_path(f"{pargs.bfile}.bim"),
-        FAM_FILES : glob_path(f"{pargs.bfile}.fam"),
+        BED_FILES : [f"{bfile}{BED_SUFFIX}" for bfile in pargs.bfile],
+        BIM_FILES : [f"{bfile}{BIM_SUFFIX}" for bfile in pargs.bfile],
+        FAM_FILES : [f"{bfile}{FAM_SUFFIX}" for bfile in pargs.bfile] if not pargs.fam else [pargs.fam],
         REL_FILE : pargs.rel_pedigree,
         REL_INFO_FILE : pargs.rel_grma,
         PHENO_FILE : pargs.pheno,
@@ -523,12 +542,6 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         SNPS_PER_BLOCK : pargs.snps_per_block
     }
 
-    # Make sure bed/bim/fam files exist (if specified with bedbimfam flag, hasn't been checked yet)
-    logging.debug("Checking whether bed/bim/fam files exist.")
-    for bed_file, bim_file, fam_file in zip(BED_FILES, BIM_FILES, FAM_FILES):
-        for file in (bed_file, bim_file, fam_file):
-            if not os.path.exists(file):
-                raise FileNotFoundError(f"{file} does not exist.")
 
     return internal_values
 
