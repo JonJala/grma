@@ -263,7 +263,7 @@ def convert_king_output_to_rel_info(
     rel_info_str = str(rel_info)
     with open(file_path, "w") as f:
         f.write(rel_info_str)"""
-    file_name = f'rel_info_deg{rel_degree}_BMI_all_anc.pkl'
+    file_name = f'rel_info_deg{rel_degree}_EA_all_anc.pkl'
     with open(file_name, 'wb') as f:
         pickle.dump(rel_info, f)
     logging.info(f"Saved rel_info to {file_name}")
@@ -445,7 +445,7 @@ def get_var_y(residualized_phenotypes: np.ndarray) -> float:
 def calculate_Zstats_and_pvals(betas: np.ndarray, ses: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     # Creates z-statistics and p-values from a 2-tailed test from betas and ses
     zstats = betas / ses
-    pvals = 2 * (1 - norm.cdf(np.abs(zstats)))
+    pvals = 2 * (norm.sf(np.abs(zstats)))
     
     return zstats, pvals
 
