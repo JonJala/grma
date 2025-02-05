@@ -16,7 +16,9 @@ import bitarray.util as baut
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
+import scipy.sparse as sp
 from ast import literal_eval
+import pickle
 
 # Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to increase clarity about whether objects are views or copies (https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#)
 pd.options.mode.copy_on_write = True
@@ -145,15 +147,14 @@ def format_covar_file(covar_filename: Union[str, pd.DataFrame], fam_filename: Un
 
 # -------------------------
 def convert_king_output_to_rel_info(
-    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: str, rel_info_file: str
+    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: str, rel_info_file: str=""
 ) -> tuple[THRESHOLDED_REL_TYPE, np.ndarray]:
     MAX_RELATEDNESS = 4  # Maximum degree of relatedness from king output
 
     if rel_info_file:
-        with open(rel_info_file, 'r') as f:
-            list_str = f.read()
-        # Convert the string back to a list of lists
-        rel_info = literal_eval(list_str)
+        with open(rel_info_file, 'rb') as f:
+            rel_info = pickle.load(f)
+        # Store rel_set_sizes
         rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info], dtype=float)
         return rel_info, rel_set_sizes
     
@@ -166,6 +167,10 @@ def convert_king_output_to_rel_info(
     else:
         raise TypeError(f"Type of parameter king_output ({type(king_output)}) is not supported.")
     logging.info(f"Reading in king output takes {time.time() - king_time} seconds")
+    
+    # If kinship threshold specified, subset to acceptable kinships coeff
+    #if kinship:
+    #    king_df = king_df[king_df[KING_KINSHIP_COL] >= kinship]
 
     # Convert InfTypes using INF_TO_DEG_MAP and filter out weak relations using REL_TO_DEG_MAP
     king_df[KING_REL_COL] = king_df[KING_REL_COL].map(INF_TO_DEG_MAP)
@@ -235,73 +240,107 @@ def convert_king_output_to_rel_info(
     ]
     # Update rel_lists for those individuals whose lowest degree is UN if running Pop GRMA
     if rel_degree == "Pop":
+        logging.info(f"Constructed rel_info and starting to update rel_lists for UN in {time.time() - king_time} seconds")
+        unrel_list = list(unrel_indices[0])
         for index in unrel_indices[0]:
-            rel_info[index] = list(unrel_indices[0])
+            rel_info[index] = unrel_list
+        logging.info(f"Len of unrel_indices is {len(unrel_list)}")
         
     logging.info(f"Making rel_lists takes {time.time() - king_time} seconds.")
     rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info], dtype=float)
-    print(f"Max of rel set sizes is {max(rel_set_sizes)}")
-    print(f"Min of rel set sizes is {min(rel_set_sizes)}")
+    logging.info(f"Max of rel set sizes is {max(rel_set_sizes)}")
+    logging.info(f"Min of rel set sizes is {min(rel_set_sizes)}")
+    
+    counter = 0
+    for inner_list in rel_info:
+        if len(inner_list) > 1:
+            counter += 1
+    print(f"Num non-singletons is {counter}")
+    print(f"Len of rel_info is {len(rel_info)}")
     
     # TODO(dhruvaj) Make this a save_rel_info function
-    file_path = f'/disk/genetics3/data_dirs/ukb/private/v3/processed/user/dhruvaj/grma_ukb_testing/rel_info_deg{rel_degree}_Height_all_ancestry.txt'
+    """file_path = f'/disk/genetics3/data_dirs/ukb/private/v3/processed/user/dhruvaj/grma_ukb_testing/rel_info_deg{rel_degree}_EA_all_ancestry.txt'
     rel_info_str = str(rel_info)
     with open(file_path, "w") as f:
-        f.write(rel_info_str)
+        f.write(rel_info_str)"""
+    file_name = f'rel_info_deg{rel_degree}_EA_all_anc.pkl'
+    with open(file_name, 'wb') as f:
+        pickle.dump(rel_info, f)
+    logging.info(f"Saved rel_info to {file_name}")
             
     return rel_info, rel_set_sizes
 
 # -------------------------
 
-def calculate_neff(rel_info: THRESHOLDED_REL_TYPE, N_eff: int) -> int:
+def calculate_R_matrix(rel_info: THRESHOLDED_REL_TYPE, rel_set_sizes: np.ndarray = None
+    ) -> tuple[sp.csr_matrix, np.ndarray, float]:
     
-    if N_eff:
-        return N_eff
-    
-    eliminated = np.full(len(rel_info), False, dtype=bool)
-    rank_of_eliminated = 0
+    # Determine the number of people / samples
+    N = len(rel_info)
+
+
+    # Calculate the trace
+    rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info],
+                             dtype=float) if rel_set_sizes is None else rel_set_sizes
+    trace_rr = float(N) - np.sum(np.reciprocal(rel_set_sizes))
+    logging.info(f"Trace rr is {trace_rr}")
+
+
+    # Determine individuals in blocks (later processing is simplified for these)
+    duplicates, examined = np.zeros(N, dtype=bool), np.zeros(N, dtype=bool)
     for cur_index, cur_list in enumerate(rel_info):
-        # If the current index has already been previously eliminated, no need to check again
-        if eliminated[cur_index]:
-            continue    
-        # Check if all people in this relationship list have the same list, and if so, eliminate them all
-        if all(cur_list == rel_info[i] for i in cur_list if i != cur_index): # Relies on the lists being sorted
-            rank_of_eliminated += (len(cur_list) - 1)
-            eliminated[cur_list] = True
-            
-    remaining_indices = np.argwhere(~eliminated).flatten()
+        # If this index has already been examined, we won't get any new information from it here
+        if examined[cur_index]:
+            continue
+
+        # We've found a block if all the lists agree and are all new
+        duplicates[cur_list] = not any(examined[cur_list]) and \
+                               all(rel_info[i] == cur_list for i in cur_list)
+
+        # If it's not a block, check if any previous blocks need to be unmarked
+        if not duplicates[cur_index]:
+            # Any indices in the current (not actual) "block" (as defined by cur_list) that point to
+            # anything marked as a duplicate means that is a block that needs to be unmarked
+            block_indices_to_unmark = {blk_index for index in cur_list
+                                                 for blk_index in rel_info[index]
+                                       if duplicates[blk_index]}
+
+            for block_index in block_indices_to_unmark:
+                duplicates[rel_info[block_index]] = False
+
+        # Finally mark the current list as examined and processed
+        examined[cur_list] = True
+    logging.info(f"There are {np.count_nonzero(duplicates)} individuals in relational blocks")
+
+
+    # Make R matrix for the remaining indices 
+    remaining_indices = np.argwhere(~duplicates).flatten()
     num_remaining = len(remaining_indices)
+
     # Construct reverse lookup to map from remaining indices to matrix indices
     reverse_indices = np.zeros(len(rel_info), dtype=int)
     reverse_indices[remaining_indices] = np.arange(num_remaining)
         
-    neff_time = time.time()
-    N_matrix = np.identity(num_remaining , dtype=float)
+    mat_time = time.time()
+    R_matrix = np.identity(num_remaining,  dtype=float)
     for mat_index, old_p_index in enumerate(remaining_indices):
         # Get the relational list that corresponds to the current matrix row
         cur_list = rel_info[old_p_index]
         
-        # Get the corresponding entries in the current row of the N matrix, taking care to
-        # not include any that have been eliminated
-        mat_list = [reverse_indices[p_index] for p_index in cur_list if not eliminated[p_index]]
+        # Get the corresponding entries in the current row of the R matrix
+        mat_list = [reverse_indices[p_index] for p_index in cur_list]
         
         # Subtract off the inverse of the relational list size from the correct elements
-        N_matrix[mat_index, mat_list] -= np.reciprocal(len(cur_list), dtype=float)
-    logging.info(f"Time to create matrix {time.time() - neff_time}")
-    
-    # Calculating the rank of the smaller submatrix
-    start_time = time.time()
-    logging.info("Calculating rank of subset matrix")
-    subset_rank = np.linalg.matrix_rank(N_matrix)
-    logging.info(f"Num duplicates of any group size = {rank_of_eliminated}")
-    logging.info(f"subset rank is {subset_rank}")
-    N_eff = rank_of_eliminated + subset_rank
-    logging.info(f"N_eff is {N_eff}")
-    logging.info(f"total time taken to calculate smaller subset is {time.time() - start_time}")
+        R_matrix[mat_index, mat_list] -= np.reciprocal(len(cur_list), dtype=float)
+    logging.info(f"Time to create R matrix {time.time() - mat_time}")
     
 
-    return N_eff
-
+    # Convert to sparse format
+    mat_time = time.time()
+    R_matrix = sp.csr_matrix(R_matrix)
+    logging.info(f"Time to convert to csr {time.time() - mat_time}")
+    
+    return R_matrix, duplicates, trace_rr
 # -------------------------
 def demean_phenotypes(
     phenotypes: np.ndarray,
@@ -359,12 +398,33 @@ def residualize_genotypes(
     logging.info(f"Residualizing genotypes takes {time.time() - geno_time} seconds")
     return genotypes - mean_genos
 
+def calculate_ses(R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float, residualized_genotypes: np.ndarray, var_y: float, N: int) -> np.ndarray:
+    # TODO (dhruvaj) Pass residualized phenotypes in, instead of var_y and N? - there may be small changes from rounding if divide and multiply by N after passing var_y around
+    ses_time = time.time()
+    block_indices = np.argwhere(duplicates).flatten() # len b
+    remaining_indices = np.argwhere(~duplicates).flatten() # len nb
+    G_sq_sum_per_snp = np.nansum(np.square(residualized_genotypes), axis=1) # This is X'X = M x 1
+    
+    # Calculate X'RR'X for block indices. X is M x b, R doesn't matter
+    block_XRRX = np.nansum(np.square(residualized_genotypes[:, block_indices]), axis=1) # This is X_b'X_b and is M x 1
 
+    # Calculating X'RR'X for reamining indices. X is M x nb, R is nb x nb
+    X = residualized_genotypes[:, remaining_indices]
+    logging.info(f"X shape is {X.shape}")
+    logging.info(f"R matrix shape is {R_matrix.shape}")
+    XR = X @ R_matrix
+    non_block_XRRX = np.nansum(np.square(XR), axis=1) # This is X'RR'X and is M x 1
+    XRRX = block_XRRX + non_block_XRRX
+
+    ses = np.sqrt((XRRX * var_y * N) / (np.square(G_sq_sum_per_snp) * (trace_rr - (XRRX / G_sq_sum_per_snp))))
+
+    logging.info(f"Time to calculate ses is {time.time() - ses_time}")
+
+    return ses
 # -------------------------
 def run_regressions(
-    residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray, N_eff: int
+    residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray, N: int, R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float, var_y: float
 ) -> tuple[np.ndarray, np.ndarray]:
-     
     reg_time = time.time()
     G_sq_sum_per_snp = np.nansum(np.square(residualized_genotypes), axis=1)
 
@@ -372,26 +432,33 @@ def run_regressions(
         np.nansum(residualized_genotypes * residualized_phenotypes, axis=1)
         / G_sq_sum_per_snp
     )
-    ses = np.sqrt(np.dot(residualized_phenotypes, residualized_phenotypes) / (G_sq_sum_per_snp * N_eff))
+    ses = calculate_ses(R_matrix=R_matrix, duplicates=duplicates, trace_rr=trace_rr, residualized_genotypes=residualized_genotypes, var_y=var_y, N=N)
+    var_x = G_sq_sum_per_snp / N
     logging.info(f"Running regressions takes {time.time() - reg_time}")
-    return betas, ses
+    return betas, ses, var_x
+# -------------------------
+def get_var_y(residualized_phenotypes: np.ndarray) -> float:
+    N = len(residualized_phenotypes)
+    return np.dot(residualized_phenotypes, residualized_phenotypes) / N
 
 # -------------------------
 def calculate_Zstats_and_pvals(betas: np.ndarray, ses: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     # Creates z-statistics and p-values from a 2-tailed test from betas and ses
     zstats = betas / ses
-    pvals = 2 * (1 - norm.cdf(np.abs(zstats)))
+    pvals = 2 * (norm.sf(np.abs(zstats)))
     
     return zstats, pvals
 
 # -------------------------
-def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np.ndarray, pvals: np.ndarray, bim_filename: str) -> pd.DataFrame:
+def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np.ndarray, pvals: np.ndarray, var_x: np.ndarray, var_y: float, bim_filename: str) -> pd.DataFrame:
     
     combined_df = pd.DataFrame({
         'Beta': betas,
         'SE': ses,
         'Z': zstats,
-        'Pval': pvals
+        'Pval': pvals, 
+        'Var_X': var_x,
+        'Var_Y': var_y
         })
     
     bim_df = pd.read_csv(bim_filename, sep='\t', header=None, names=['chr', 'id', 'pos', 'bpcoord', 'A1', 'A2'])
@@ -408,7 +475,6 @@ def grma(
     bim_file: str,
     fam_file: str,
     rel_info_file: str = "",
-    N_eff: int = None,
     pheno_file: str = "",
     covar_file: str = "",
     rel_degree: str = "1",
@@ -429,6 +495,7 @@ def grma(
     # Construct the vector to hold the results
     betas = np.zeros(M)
     ses = np.zeros(M)
+    var_x = np.zeros(M)
 
     # Construct the relatedness object
     logging.debug("Converting King output to actionable relatedness info...")
@@ -439,12 +506,13 @@ def grma(
     logging.info(f"Processed King output in {time.time() - start_time} seconds")
 
     #Calculate the effective N
-    logging.debug("Calculating effective N...")
+    logging.debug("Creating R matrix")
     start_time = time.time()
-    N_eff = calculate_neff(rel_info=rel_info, N_eff=N_eff)
-    logging.info(f"Calculated effective N in {time.time() - start_time} seconds")
+    R_matrix, duplicates, trace_rr = calculate_R_matrix(rel_info=rel_info, rel_set_sizes=rel_set_sizes)
+    logging.info(f"After returning from calculate R matrix: Duplicates type is {duplicates.dtype}. Duplicates length is {len(duplicates)}. duplicates num of true values is {np.sum(duplicates)}")
+    logging.info(f"Processed R matrix in {time.time() - start_time} seconds")
 
- # Retrieve raw phenotypes from the file
+    # Retrieve raw phenotypes from the file
     p_not_demeaned = get_phenotypes_from_file(pheno_filename=pheno_file, fam_filename=fam_file)
                
     # Incorporate / residualize on covariates if they exist
@@ -464,8 +532,8 @@ def grma(
                 rel_info=rel_info,
                 rel_set_sizes=rel_set_sizes,
         )
-    logging.info(f"Demeaned the phenotypes in {time.time() - start_time} seconds")      
-   
+    logging.info(f"Demeaned the phenotypes in {time.time() - start_time} seconds")  
+    var_y = get_var_y(P)
     # Residualize the genotypes and run the regressions for each block of SNPs
     logging.debug("Residualizing genotypes and running regressions...")
     start_time = time.time()
@@ -477,7 +545,7 @@ def grma(
         M_start = block_num * snps_per_block
         num_snps_in_block = min(M - M_start, snps_per_block)
 
-        block_betas, block_ses = run_regressions(
+        block_betas, block_ses, block_var_x = run_regressions(
             residualized_genotypes=residualize_genotypes(
                 genotypes=read_bed_file(
                     bed_filename=bed_file,
@@ -490,17 +558,24 @@ def grma(
                 rel_set_sizes=rel_set_sizes,
             ),
             residualized_phenotypes=P,
-            N_eff=N_eff,
+            N=len(P),
+            R_matrix=R_matrix,
+            duplicates=duplicates,
+            trace_rr=trace_rr,
+            var_y=var_y,
         )
-
-        betas[M_start : M_start + len(block_betas)] = block_betas
-        ses[M_start : M_start + len(block_ses)] = block_ses
+        betas[M_start: M_start + len(block_betas)] = block_betas
+        ses[M_start: M_start + len(block_ses)] = block_ses
+        var_x[M_start : M_start + len(block_var_x)] = block_var_x
+    
         
     logging.info(f"Residualized genotypes and ran regressions in {time.time() - start_time} seconds")
+    logging.info(f"Var_y for rel_degree {rel_degree} is {var_y} ")
     
     zstats, pvals = calculate_Zstats_and_pvals(betas=betas, ses=ses)
-    results = combine_results_with_bim_file(betas=betas, ses=ses, zstats=zstats, pvals=pvals, bim_filename=bim_file)
-
+    results = combine_results_with_bim_file(betas=betas, ses=ses, zstats=zstats, pvals=pvals, var_x=var_x, var_y=var_y, bim_filename=bim_file)
+    
+    
     return results
 
 

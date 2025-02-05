@@ -41,7 +41,7 @@ def base_king_output():
 
 @pytest.fixture
 def king_output_disconnected_rels():
-    KING_DF_LENGTH = 6
+    KING_DF_LENGTH = len(ALLOWED_INFTYPES)
     
     king_output = {
         "ID1": [i for i in range(1, 2 * KING_DF_LENGTH, 2)],
@@ -49,7 +49,7 @@ def king_output_disconnected_rels():
         "FID1": [1] * KING_DF_LENGTH,
         "FID2": [1] * KING_DF_LENGTH,
         "Kinship": [0.50] * KING_DF_LENGTH,
-        "InfType": ["Dup/MZTwin", "FS", "PO", "2nd", "3rd", "4th"],
+        "InfType": ALLOWED_INFTYPES,
     }
     df = pd.DataFrame(king_output)
     return df
