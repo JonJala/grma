@@ -154,11 +154,8 @@ def rel_thresh_type(s_input: str) -> float:
     try:
         # Attempt to convert the value to float
         float_thresh = float(stripped_thresh)
-        if not (MIN_KINSHIP_THRESH <= float_thresh <= MIN_KINSHIP_THRESH):
-            raise argp.ArgumentTypeError(
-                f"Invalid value for --rel-thresh: {stripped_thresh}. "
-                f"Expected one of {lib.REL_DEG_INPUTS} or a float in [{MIN_KINSHIP_THRESH}, {MAX_KINSHIP_THRESH}].")
-        return float_thresh  # Return the valid float value
+        if (MIN_KINSHIP_THRESH <= float_thresh <= MAX_KINSHIP_THRESH):
+            return float_thresh  # Return the valid float value
     except ValueError:
         # If conversion to float fails, check if it is in the valid list
         if stripped_thresh in lib.REL_DEG_INPUTS:
@@ -195,24 +192,28 @@ def to_arg(flag_str: str) -> str:
     return flag_str.replace("-", "_")
 
 #################################
-def glob_path(s_inputs: List[str]) -> List[str]:
-    """
+"""def glob_path(s_inputs: str) -> List[str]:
+    
     Used for parsing some inputs to this program, namely glob paths (see Python glob module docs).
 
     :param s_input: String passed in by argparse
 
-    :return: List of file paths
-    """
-    final_file_paths = set()
-    for s_input in s_inputs:
-        file_path_list = glob.glob(s_input)
+    :return: List of file paths"""
+
+def glob_path(s_input: str) -> List[str]:
+    logging.info(f"Received input pattern: {s_input}") 
+    files_to_find = f"{s_input}{BED_SUFFIX}"
+    file_path_list = glob.glob(files_to_find)  
+    logging.info(f"Files found: {file_path_list}")  
     
-        if not file_path_list:
-            raise ValueError(f"Glob string \"{s_input}\" matches with no files.")
-        
-        final_file_paths.update(os.path.abspath(f) for f in file_path_list) 
-       
-    return list(final_file_paths)
+    if not file_path_list:
+        raise ValueError(f"Invalid glob pattern, no files found for: {s_input}")
+    
+    file_path_prefixes = set()
+    file_path_prefixes.update(os.path.splitext(f)[0] for f in file_path_list)
+    logging.info(f"Final file path prefixes are {file_path_prefixes}")
+    
+    return file_path_prefixes
 
 #################################
 def get_grma_parser(progname: str) -> argp.ArgumentParser:
@@ -232,8 +233,8 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
 
     # Main Input Options
     in_opt = parser.add_argument_group(title="Main Input Specifications")
-    in_opt.add_argument("--bfile", type=glob_path, required=True, metavar="GLOB_PATH", nargs="+",
-                    help="Paths to PLINK 1 binary files.  See python glob module for documentation "
+    in_opt.add_argument("--bfile", type=glob_path, required=True, metavar="GLOB_PATH",
+                    help="Paths to PLINK 1 binary files. See python glob module for documentation "
                             "on the string to be provided here (full path with support for \"*\", "
                             "\"?\", and \"[]\").  This string should be encased in quotes.  ")
 
@@ -471,6 +472,7 @@ def setup_func(argv: List[str], get_parser: ParserFunc,
     # Parse the input flags using argparse
     parser = get_parser(argv[0])
     parsed_args = parser.parse_args(argv[1:])
+    print("Received bfile argument:", parsed_args.bfile)
 
     # Break down inputs to keep track of arguments and values specified directly by the user
     user_args = get_user_inputs(argv, parsed_args)
@@ -516,7 +518,7 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     for bfile in pargs.bfile:
         bed_file = f"{bfile}{BED_SUFFIX}"
         bim_file = f"{bfile}{BIM_SUFFIX}"
-        fam_file = f"{bfile}{FAM_SUFFIX}"
+        fam_file = f"{bfile}{FAM_SUFFIX}" if not pargs.fam else pargs.fam
         
         required_files = [bed_file, bim_file] if pargs.fam else [bed_file, bim_file, fam_file]
         for file in required_files:
@@ -597,7 +599,7 @@ def main_func(argv: List[str]):
 
             # Write out the results to disk per chromosome
             logging.info("Writing results to disk.")
-            filename = f"{iargs[OUT_PREFIX]}_{bed_file[:-4]}.res" # TODO(jonbjala)
+            filename = f"{iargs[OUT_PREFIX]}_{bed_file[:-4]}.res"
             logging.debug(f"\t{filename}")
             write_results_to_file(filename, results)
 
