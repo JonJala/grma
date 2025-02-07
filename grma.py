@@ -151,11 +151,14 @@ def rel_thresh_type(s_input: str) -> float:
     """
 
     stripped_thresh = s_input.strip()
+
     try:
         # Attempt to convert the value to float
         float_thresh = float(stripped_thresh)
         if (MIN_KINSHIP_THRESH <= float_thresh <= MAX_KINSHIP_THRESH):
             return float_thresh  # Return the valid float value
+        else:
+            raise ValueError
     except ValueError:
         # If conversion to float fails, check if it is in the valid list
         if stripped_thresh in lib.REL_DEG_INPUTS:
@@ -201,17 +204,14 @@ def to_arg(flag_str: str) -> str:
     :return: List of file paths"""
 
 def glob_path(s_input: str) -> List[str]:
-    logging.info(f"Received input pattern: {s_input}") 
     files_to_find = f"{s_input}{BED_SUFFIX}"
     file_path_list = glob.glob(files_to_find)  
-    logging.info(f"Files found: {file_path_list}")  
     
     if not file_path_list:
         raise ValueError(f"Invalid glob pattern, no files found for: {s_input}")
     
     file_path_prefixes = set()
     file_path_prefixes.update(os.path.splitext(f)[0] for f in file_path_list)
-    logging.info(f"Final file path prefixes are {file_path_prefixes}")
     
     return file_path_prefixes
 
@@ -452,7 +452,7 @@ def set_up_logger(log_file: str, log_level: int):
     log_handlers.append(file_handler)
 
     # Set logging handlers and level for root logger
-    logging.basicConfig(handlers=log_handlers, level=log_level, datefmt='%I:%M:%S %p')
+    logging.basicConfig(handlers=log_handlers, level=log_level, datefmt='%I:%M:%S %p', force=True)
 
 
 #################################
@@ -472,7 +472,6 @@ def setup_func(argv: List[str], get_parser: ParserFunc,
     # Parse the input flags using argparse
     parser = get_parser(argv[0])
     parsed_args = parser.parse_args(argv[1:])
-    print("Received bfile argument:", parsed_args.bfile)
 
     # Break down inputs to keep track of arguments and values specified directly by the user
     user_args = get_user_inputs(argv, parsed_args)
@@ -535,7 +534,7 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         OUT_DIR : os.path.dirname(pargs.out),
         BED_FILES : [f"{bfile}{BED_SUFFIX}" for bfile in pargs.bfile],
         BIM_FILES : [f"{bfile}{BIM_SUFFIX}" for bfile in pargs.bfile],
-        FAM_FILES : [f"{bfile}{FAM_SUFFIX}" for bfile in pargs.bfile] if not pargs.fam else [pargs.fam],
+        FAM_FILES : [f"{bfile}{FAM_SUFFIX}" for bfile in pargs.bfile] if not pargs.fam else [pargs.fam]*len(pargs.bfile),
         REL_FILE : pargs.rel_pedigree,
         REL_INFO_FILE : pargs.rel_grma,
         PHENO_FILE : pargs.pheno,
@@ -599,7 +598,8 @@ def main_func(argv: List[str]):
 
             # Write out the results to disk per chromosome
             logging.info("Writing results to disk.")
-            filename = f"{iargs[OUT_PREFIX]}_{bed_file[:-4]}.res"
+            bfile_basename = os.path.splitext(os.path.basename(bed_file))[0]
+            filename = f"{iargs[OUT_PREFIX]}_{bfile_basename}.res"
             logging.debug(f"\t{filename}")
             write_results_to_file(filename, results)
 
