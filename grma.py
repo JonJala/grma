@@ -210,9 +210,7 @@ def glob_path(s_input: str) -> List[str]:
     if not file_path_list:
         raise ValueError(f"Invalid glob pattern, no files found for: {s_input}")
     
-    file_path_prefixes = set()
-    file_path_prefixes.update(os.path.splitext(f)[0] for f in file_path_list)
-    
+    file_path_prefixes = {os.path.splitext(f)[0] for f in file_path_list}
     return file_path_prefixes
 
 #################################
@@ -233,7 +231,7 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
 
     # Main Input Options
     in_opt = parser.add_argument_group(title="Main Input Specifications")
-    in_opt.add_argument("--bfile", type=glob_path, required=True, metavar="GLOB_PATH",
+    in_opt.add_argument("--bfile", type=glob_path, required=True, metavar="GLOB_PATH", nargs="+",
                     help="Paths to PLINK 1 binary files. See python glob module for documentation "
                             "on the string to be provided here (full path with support for \"*\", "
                             "\"?\", and \"[]\").  This string should be encased in quotes.  ")
@@ -513,8 +511,9 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
 
     # Make sure bed/bim/fam files are specified
     logging.debug("Checking whether bed/bim/fam files were specified.")
+    bfile_prefixes = set.union(*pargs.bfile)
     missing_files = []
-    for bfile in pargs.bfile:
+    for bfile in bfile_prefixes:
         bed_file = f"{bfile}{BED_SUFFIX}"
         bim_file = f"{bfile}{BIM_SUFFIX}"
         fam_file = f"{bfile}{FAM_SUFFIX}" if not pargs.fam else pargs.fam
@@ -532,9 +531,9 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     internal_values = {
         OUT_PREFIX : pargs.out,
         OUT_DIR : os.path.dirname(pargs.out),
-        BED_FILES : [f"{bfile}{BED_SUFFIX}" for bfile in pargs.bfile],
-        BIM_FILES : [f"{bfile}{BIM_SUFFIX}" for bfile in pargs.bfile],
-        FAM_FILES : [f"{bfile}{FAM_SUFFIX}" for bfile in pargs.bfile] if not pargs.fam else [pargs.fam]*len(pargs.bfile),
+        BED_FILES : [f"{bfile}{BED_SUFFIX}" for bfile in bfile_prefixes],
+        BIM_FILES : [f"{bfile}{BIM_SUFFIX}" for bfile in bfile_prefixes],
+        FAM_FILES : [f"{bfile}{FAM_SUFFIX}" for bfile in bfile_prefixes] if not pargs.fam else [pargs.fam]*len(bfile_prefixes),
         REL_FILE : pargs.rel_pedigree,
         REL_INFO_FILE : pargs.rel_grma,
         PHENO_FILE : pargs.pheno,
