@@ -468,6 +468,9 @@ def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np
     return results_df
 
 # -------------------------
+def rel_preprocess():
+    pass
+# -------------------------
 def grma(
     *,
     rel_input: Union[str, pd.DataFrame, np.ndarray],
@@ -482,7 +485,7 @@ def grma(
 ) -> pd.DataFrame:
     # TODO(jonbjala) Need to add the extra covariates at all levels of the software (covar_file)
 
-    logging.info("Beginning grma()...")
+    logging.info(f"\nBeginning grma() for {bed_file}")
     logging.debug(
         f"\t{rel_input=}\n\t{bed_file=}\n\t{bim_file=}\n\t{fam_file=}\n\t{pheno_file=}"
         f"\n\t{covar_file=}\n\t{rel_degree=}\n\t{snps_per_block=}"
