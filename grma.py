@@ -74,6 +74,8 @@ PHENO_FILE = "Phenotype File"
 COVAR_FILE = "Covariate File"
 REL_DEG = "Relatedness Degree"
 SNPS_PER_BLOCK = "SNPs Per Block"
+ID_LIST = "ID List"
+SNP_LIST = "SNP List"
 
 
 # Type declaration
@@ -261,10 +263,10 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
     infilt_opt = parser.add_argument_group(title="Input Filtering Options")
     infilt_opt.add_argument("--id-list", metavar="FILE", type=input_file,
                             help="Optional input to specify a whitespace-delimited sample ID file of "
-                                 "sample IDs to include")
+                                 "sample FIDs and IIDs to include. No header allowed.")
     infilt_opt.add_argument("--snp-list", metavar="FILE", type=input_file,
                           help="Optional input to specify a whitespace-delimited variant ID file of "
-                               "variant IDs to include")
+                               "variant IDs to include. No header allowed.")
     
     # Output Options
     out_opt = parser.add_argument_group(title="Output Specifications")
@@ -453,7 +455,9 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         PHENO_FILE : pargs.pheno,
         COVAR_FILE : pargs.covar,
         REL_DEG : pargs.rel_thresh,
-        SNPS_PER_BLOCK : pargs.snps_per_block
+        SNPS_PER_BLOCK : pargs.snps_per_block,
+        ID_LIST : pargs.id_list,
+        SNP_LIST : pargs.snp_list
     }
 
 
@@ -506,7 +510,7 @@ def main_func(argv: List[str]):
             results = lib.grma(
                 rel_input=iargs[REL_FILE], rel_info_file=iargs[REL_INFO_FILE], bed_file=bed_file, bim_file=bim_file,
                 fam_file=fam_file, pheno_file=iargs[PHENO_FILE], covar_file=iargs[COVAR_FILE],
-                rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK]
+                rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK], id_list=iargs[ID_LIST], snp_list=iargs[SNP_LIST]
             )
 
             # Write out the results to disk per chromosome
