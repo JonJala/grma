@@ -35,6 +35,7 @@ from bedbimfam import (
     FAM_PHENO_COL,
     FAM_SUFFIX,
     get_num_snps_from_bim_file,
+    get_sample_size_from_fam_file,
     read_bed_file,
 )
 
@@ -84,18 +85,40 @@ INF_TO_DEG_MAP = {"Dup/MZTwin": 0, "FS": 0, "PO": 1, "2nd": 2, "3rd": 3, "4th": 
 # Default number of SNPs to process at a time
 DEFAULT_SNPS_PER_BLOCK = 100
 
+# -------------------------
+def get_sample_indices_to_keep(id_list: str, fam_filename: str) -> pd.DataFrame:
+    # Load id_list and get the indices in the fam_file of the individuals to keep
+    ids_to_keep = pd.read_csv(id_list, sep=r"\s+", usecols=(0, 1), names=[FID_COL, IID_COL], header=None, index_col=False)
+    fam_df = pd.read_csv(fam_filename, sep=r"\s+", usecols=(0, 1), names=[FID_COL, IID_COL], index_col=False)
+    fam_df[INDEX_COL] = range(len(fam_df))
+    
+    merged_df = pd.merge(ids_to_keep, fam_df, on=[FID_COL, IID_COL], how="inner", copy=False)
+    
+    return merged_df[INDEX_COL].tolist()
 
 # -------------------------
-def get_phenotypes_from_file(pheno_filename: str, fam_filename: str):
+def get_snp_indices_to_keep(snp_list: str, bim_filename: str) -> pd.DataFrame:
+    # Load snp_list and get the indices in the bim_file of the SNPs to keep
+    snps_to_keep = pd.read_csv(snp_list, sep=r"\s+", usecols=[0], names=["rsid"], header=None, index_col=False)
+    bim_df = pd.read_csv(bim_filename, sep=r"\s+", usecols=[1], names=["rsid"], index_col=False)
+    indices = bim_df.index[bim_df["rsid"].isin(snps_to_keep["rsid"])].tolist()
+    
+    return indices
+    
+# -------------------------
+def get_phenotypes_from_file(pheno_filename: str, fam_filename: str, sample_indices_to_keep: str) -> np.ndarray:
     # TODO(jonbjala)  Handle missing phenotype values?  Have support for case/control?  https://www.cog-genomics.org/plink/1.9/formats#fam
-    # Drop phenotype values that are missing - not so simple as corresponding portions of bed/bim files should also be cut
 
     fam_df = pd.read_csv(fam_filename, sep=r"\s+", names=FAM_COLS, index_col=False)
     pheno_col = FAM_PHENO_COL
 
+    # If id_list is specified, then filter fam_df to include those individuals
+    if sample_indices_to_keep:
+        fam_df = fam_df.iloc[sample_indices_to_keep]
+
     if pheno_filename:
         phen = pd.read_csv(pheno_filename, sep=r"\s+", names=[FAM_FID_COL, FAM_IID_COL, PHENOFILE_PHENO_COL], index_col=False,)
-        fam_df = fam_df.merge(phen, on=[FAM_FID_COL, FAM_IID_COL], copy=False)
+        fam_df = fam_df.merge(phen, on=[FAM_FID_COL, FAM_IID_COL], how = "inner", copy=False)
         pheno_col = PHENOFILE_PHENO_COL
 
     return fam_df[pheno_col].to_numpy()
@@ -105,7 +128,7 @@ def get_phenotypes_from_file(pheno_filename: str, fam_filename: str):
 
 
 # Creates a dataframe of FID, IID and Index number (from 0) from the .fam file or a .fam df
-def _get_id_df_from_fam_file(fam_filename: Union[str, pd.DataFrame]) -> pd.DataFrame:
+def _get_id_df_from_fam_file(fam_filename: Union[str, pd.DataFrame], sample_indices_to_keep: str) -> pd.DataFrame:
     
     # Make id_df using either a fam file or a fam dataframe
     if isinstance(fam_filename, str):
@@ -114,7 +137,12 @@ def _get_id_df_from_fam_file(fam_filename: Union[str, pd.DataFrame]) -> pd.DataF
     elif isinstance(fam_filename, pd.DataFrame):
         id_df = fam_filename[[FID_COL, IID_COL]]
     else:
-        raise TypeError(f"Type of parameter fam_file ({type(fam_filename)}) is not supported.")    
+        raise TypeError(f"Type of parameter fam_file ({type(fam_filename)}) is not supported.")  
+    
+    # If id_list is specified, then filter id_df to include those individuals
+    if sample_indices_to_keep:
+        id_df = id_df.iloc[sample_indices_to_keep]
+          
 
     # Create an index col 
     id_df[INDEX_COL] = range(len(id_df))
@@ -125,7 +153,7 @@ def _get_id_df_from_fam_file(fam_filename: Union[str, pd.DataFrame]) -> pd.DataF
 
 
 # Creates a dataframe of covariates that is filled to the size of the fam file 
-def format_covar_file(covar_filename: Union[str, pd.DataFrame], fam_filename: Union[str, pd.DataFrame]) -> np.ndarray:
+def format_covar_file(covar_filename: Union[str, pd.DataFrame], fam_filename: Union[str, pd.DataFrame], sample_indices_to_keep: List[int]) -> np.ndarray:
     
     # Make id_df using either a fam file or a fam dataframe (NEEDS HEADER IN FILE)
    # TODO(dhruvaj) If multiple covar files, then merge them into 1 file
@@ -138,7 +166,7 @@ def format_covar_file(covar_filename: Union[str, pd.DataFrame], fam_filename: Un
         raise TypeError(f"Type of parameter fam_file ({type(covar_filename)}) is not supported.")    
     
     # Get id_df to merge FID and IID and set any missing covariates to NA
-    id_df = _get_id_df_from_fam_file(fam_filename)
+    id_df = _get_id_df_from_fam_file(fam_filename, sample_indices_to_keep)
     
     covar_df = id_df.merge(covar_df, on=[FID_COL, IID_COL], copy = False, how = "left")
     covar_df = covar_df.drop(columns=[FID_COL, IID_COL, INDEX_COL])
@@ -147,7 +175,7 @@ def format_covar_file(covar_filename: Union[str, pd.DataFrame], fam_filename: Un
 
 # -------------------------
 def convert_king_output_to_rel_info(
-    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: str, rel_info_file: str=""
+    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: str, sample_indices_to_keep: List[int], rel_info_file: str = "" 
 ) -> tuple[THRESHOLDED_REL_TYPE, np.ndarray]:
     MAX_RELATEDNESS = 4  # Maximum degree of relatedness from king output
 
@@ -177,7 +205,7 @@ def convert_king_output_to_rel_info(
     king_df = king_df[king_df[KING_REL_COL] <= REL_TO_DEG_MAP[rel_degree]]
         
     # Use the .fam file to get FID/IID mapping to person number
-    id_df = _get_id_df_from_fam_file(fam_filename)
+    id_df = _get_id_df_from_fam_file(fam_filename, sample_indices_to_keep)
     N = len(id_df)
 
     # Construct DataFrame that contains person number (INDEX) pairs that are related along with their degree of relation (from king output)
@@ -198,6 +226,7 @@ def convert_king_output_to_rel_info(
     king_df = king_df.merge(id_df, on=[KING_FID2_COL, KING_IID2_COL], copy=False)
     print(f"Len of king_df is {len(king_df)}")
     print(f"Length of ID df is {N}")
+    print(f"rel degree is {rel_degree}")
     # Find the minimum value of KING_REL_COL given groups of indices in index cols. Then combine index, degree pairs into a single lowest_degree series.
     king_time = time.time()
     # Pandas Series are 1 dimensional so each element contains a group (index and min rel degree). However, the index is based on by=INDEX_COL so you can access 
@@ -213,7 +242,7 @@ def convert_king_output_to_rel_info(
     # Since, it's a Pandas series, the order of the indices doesn't matter (though indices are usually sorted by default). lowest_degree[person_num] will give the lowest degree for that person regardless of the positional index value.
     lowest_degree = ind1_mins.combine(ind2_mins, min, MAX_RELATEDNESS + 1)
     # Store the indices of individuals whose lowest degree is UN
-    unrel_indices = np.nonzero(lowest_degree == MAX_RELATEDNESS + 1)
+    unrel_indices = np.nonzero(lowest_degree.to_numpy() == MAX_RELATEDNESS + 1)
     lowest_degree = lowest_degree.combine(max_degree_series, min, MAX_RELATEDNESS + 1)
     logging.info(f"Finding the lowest value of relation for all people and combining into series takes {time.time() - king_time} seconds")
     # Store a list of lists that contains groups of individuals who are closely related
@@ -263,7 +292,7 @@ def convert_king_output_to_rel_info(
     rel_info_str = str(rel_info)
     with open(file_path, "w") as f:
         f.write(rel_info_str)"""
-    file_name = f'rel_info_deg{rel_degree}_EA_all_anc.pkl'
+    file_name = f'rel_info_deg{rel_degree}_BMI_test.pkl'
     with open(file_name, 'wb') as f:
         pickle.dump(rel_info, f)
     logging.info(f"Saved rel_info to {file_name}")
@@ -394,7 +423,7 @@ def residualize_genotypes(
     # Subtract row mean value from each snp for the row composed of the related group individuals. 
     # np.nanmean throws a warning because there are some rows that are all NaNs. It's still correct.
     mean_genos = np.vstack([np.nanmean(genotypes[:, rel_list], axis=1) for rel_list in rel_info]).T
-    #empty_slices = sum(1 for rel_list in rel_info if np.isnan(genotypes[:, rel_list], axis = 1).all())
+    
     logging.info(f"Residualizing genotypes takes {time.time() - geno_time} seconds")
     return genotypes - mean_genos
 
@@ -450,7 +479,7 @@ def calculate_Zstats_and_pvals(betas: np.ndarray, ses: np.ndarray) -> tuple[np.n
     return zstats, pvals
 
 # -------------------------
-def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np.ndarray, pvals: np.ndarray, var_x: np.ndarray, var_y: float, bim_filename: str) -> pd.DataFrame:
+def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np.ndarray, pvals: np.ndarray, var_x: np.ndarray, var_y: float, bim_filename: str, snp_indices_to_keep: List[int]) -> pd.DataFrame:
     
     combined_df = pd.DataFrame({
         'Beta': betas,
@@ -462,10 +491,30 @@ def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np
         })
     
     bim_df = pd.read_csv(bim_filename, sep='\t', header=None, names=['chr', 'id', 'pos', 'bpcoord', 'A1', 'A2'])
+    if snp_indices_to_keep:
+        bim_df = bim_df.iloc[snp_indices_to_keep]
     # Append bim file
     results_df = pd.concat([combined_df, bim_df], axis=1)
 
     return results_df
+
+# -------------------------
+def subset_genotypes(
+    genotypes: np.ndarray,
+    sample_indices_to_keep: List[int],
+    snp_indices_to_keep: List[int], 
+    M_start: int, 
+    snps_per_block: int
+) -> np.ndarray:
+    # Subset genotypes to only include individuals and SNPs of interest
+    if sample_indices_to_keep:
+        genotypes = genotypes[:, sample_indices_to_keep]
+    # Get the correct indices of the SNPs to keep
+    if snp_indices_to_keep:
+        snps = [id % snps_per_block for id in snp_indices_to_keep if M_start <= id < M_start + snps_per_block]
+        genotypes = genotypes[snps, :]
+        
+    return genotypes
 
 # -------------------------
 def rel_preprocess():
@@ -482,6 +531,8 @@ def grma(
     covar_file: str = "",
     rel_degree: str = "1",
     snps_per_block: int = DEFAULT_SNPS_PER_BLOCK,
+    id_list: str = "",
+    snp_list: str = ""
 ) -> pd.DataFrame:
     # TODO(jonbjala) Need to add the extra covariates at all levels of the software (covar_file)
 
@@ -494,17 +545,26 @@ def grma(
     # Get basic information like number of SNPs
     M = get_num_snps_from_bim_file(bim_file)
     logging.debug(f"\t{M=}")
-
-    # Construct the vector to hold the results
-    betas = np.zeros(M)
-    ses = np.zeros(M)
-    var_x = np.zeros(M)
+    
+    # Get number of individuals
+    N = get_sample_size_from_fam_file(fam_file)
+    logging.debug(f"\t{N=}")
+    
+    # Get the indices of the SNPs to keep
+    snp_indices_to_keep = get_snp_indices_to_keep(snp_list, bim_file) if snp_list else None
+    num_snps = len(snp_indices_to_keep) if snp_indices_to_keep else M
+    betas = np.zeros(num_snps)
+    ses = np.zeros(num_snps)
+    var_x = np.zeros(num_snps)
+    
+    # Get the indices of the individuals to keep
+    sample_indices_to_keep = get_sample_indices_to_keep(id_list, fam_file) if id_list else None
 
     # Construct the relatedness object
     logging.debug("Converting King output to actionable relatedness info...")
     start_time = time.time()
     rel_info, rel_set_sizes = convert_king_output_to_rel_info(
-        king_output=rel_input, fam_filename=fam_file, rel_degree=rel_degree, rel_info_file=rel_info_file
+        king_output=rel_input, fam_filename=fam_file, rel_degree=rel_degree, rel_info_file=rel_info_file, sample_indices_to_keep=sample_indices_to_keep
     )
     logging.info(f"Processed King output in {time.time() - start_time} seconds")
 
@@ -516,7 +576,7 @@ def grma(
     logging.info(f"Processed R matrix in {time.time() - start_time} seconds")
 
     # Retrieve raw phenotypes from the file
-    p_not_demeaned = get_phenotypes_from_file(pheno_filename=pheno_file, fam_filename=fam_file)
+    p_not_demeaned = get_phenotypes_from_file(pheno_filename=pheno_file, fam_filename=fam_file, sample_indices_to_keep=sample_indices_to_keep)
                
     # Incorporate / residualize on covariates if they exist
     if covar_file:
@@ -524,7 +584,7 @@ def grma(
         start_time = time.time()
         p_not_demeaned = residualize_phenotypes_on_covars(
             phenotypes=p_not_demeaned ,
-            covars=format_covar_file(covar_file, fam_file))
+            covars=format_covar_file(covar_file, fam_file, id_list))
         logging.info(f"Residualized phenotypes on covariates in {time.time() - start_time} seconds")
   
     # Demean the phenotypes
@@ -550,13 +610,17 @@ def grma(
 
         block_betas, block_ses, block_var_x = run_regressions(
             residualized_genotypes=residualize_genotypes(
-                genotypes=read_bed_file(
-                    bed_filename=bed_file,
-                    N=len(P),
-                    M=M,
-                    M_start=M_start,
-                    num_snps=num_snps_in_block,
-                ),
+                genotypes=subset_genotypes(
+                    genotypes=read_bed_file(
+                        bed_filename=bed_file,
+                        N=N,
+                        M=M,
+                        M_start=M_start,
+                        num_snps=num_snps_in_block), 
+                    sample_indices_to_keep=sample_indices_to_keep, 
+                    snp_indices_to_keep=snp_indices_to_keep, 
+                    M_start=M_start, 
+                    snps_per_block=snps_per_block),
                 rel_info=rel_info,
                 rel_set_sizes=rel_set_sizes,
             ),
@@ -576,7 +640,8 @@ def grma(
     logging.info(f"Var_y for rel_degree {rel_degree} is {var_y} ")
     
     zstats, pvals = calculate_Zstats_and_pvals(betas=betas, ses=ses)
-    results = combine_results_with_bim_file(betas=betas, ses=ses, zstats=zstats, pvals=pvals, var_x=var_x, var_y=var_y, bim_filename=bim_file)
+    results = combine_results_with_bim_file(betas=betas, ses=ses, zstats=zstats, pvals=pvals, var_x=var_x, var_y=var_y, bim_filename=bim_file, snp_indices_to_keep=snp_indices_to_keep)
+    
     
     
     return results
