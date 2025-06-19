@@ -55,12 +55,13 @@ INDEX2_COL = "INDEX2"
 
 
 # Columns used from the King output (this will need to be adjusted if King output is changed)
-KING_REL_COL = "InfType"
 KING_FID1_COL = "FID1"
 KING_IID1_COL = "ID1"
 KING_FID2_COL = "FID2"
 KING_IID2_COL = "ID2"
 KING_KINSHIP_COL = "Kinship"
+KING_REL_COL = "InfType"
+
 NEEDED_KING_COLS = [
     KING_FID1_COL,
     KING_IID1_COL,
@@ -70,17 +71,37 @@ NEEDED_KING_COLS = [
     KING_REL_COL,
 ]
 
+# Values seen in KING file as InfTypes
+INF_DUP_MZTWIN = "Dup/MZTwin"
+INF_FULLSIB = "FS"
+INF_PARENT_OFFSPRING = "PO"
+INF_2ND = "2nd"
+INF_3RD = "3rd"
+INF_4TH = "4th"
+INF_UNRELATED = "UN"
+
 # Column name used to label phenotype when pulled in from separate phenotype file
 PHENOFILE_PHENO_COL = "Phenofile_Phenotype"
 
-# List of inputs to accept as flags to specify degree of relation allowed
-REL_DEG_INPUTS = ["FS", "1", "2", "3", "4", "Pop"]
+# # List of inputs to accept as flags to specify degree of relation allowed
+# REL_DEG_INPUTS = ["FS", "1", "2", "3", "4", "Pop"]
 
 # Map of rel degree to numeric value to subset king output
 REL_TO_DEG_MAP = {"FS": 0, "1": 1, "2": 2, "3": 3, "4": 4, "Pop": 5}
 
+# List of inputs to accept as flags to specify degree of relation allowed
+REL_DEG_INPUTS = list(REL_TO_DEG_MAP.keys())
+
 # Map of possible InfTypes in a King output file. 
-INF_TO_DEG_MAP = {"Dup/MZTwin": 0, "FS": 0, "PO": 1, "2nd": 2, "3rd": 3, "4th": 4, "UN": 5,}
+INF_TO_DEG_MAP = {
+    INF_DUP_MZTWIN: 0,
+    INF_FULLSIB: 0,
+    INF_PARENT_OFFSPRING: 1,
+    INF_2ND: 2,
+    INF_3RD: 3,
+    INF_4TH: 4,
+    INF_UNRELATED: 5
+    }
 
 # Default number of SNPs to process at a time
 DEFAULT_SNPS_PER_BLOCK = 100
@@ -153,7 +174,9 @@ def _get_id_df_from_fam_file(fam_filename: Union[str, pd.DataFrame], sample_indi
 
 
 # Creates a dataframe of covariates that is filled to the size of the fam file 
-def format_covar_file(covar_filename: Union[str, pd.DataFrame], fam_filename: Union[str, pd.DataFrame], sample_indices_to_keep: List[int]) -> np.ndarray:
+def format_covar_file(covar_filename: Union[str, pd.DataFrame],
+                      fam_filename: Union[str, pd.DataFrame],
+                      sample_indices_to_keep: List[int]) -> np.ndarray:
     
     # Make id_df using either a fam file or a fam dataframe (NEEDS HEADER IN FILE)
    # TODO(dhruvaj) If multiple covar files, then merge them into 1 file
@@ -175,7 +198,8 @@ def format_covar_file(covar_filename: Union[str, pd.DataFrame], fam_filename: Un
 
 # -------------------------
 def convert_king_output_to_rel_info(
-    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: str, sample_indices_to_keep: List[int], rel_info_file: str = "" 
+    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: str,
+    sample_indices_to_keep: List[int]=None, rel_info_file: str = ""
 ) -> tuple[THRESHOLDED_REL_TYPE, np.ndarray]:
     MAX_RELATEDNESS = 4  # Maximum degree of relatedness from king output
 
@@ -203,7 +227,7 @@ def convert_king_output_to_rel_info(
     # Convert InfTypes using INF_TO_DEG_MAP and filter out weak relations using REL_TO_DEG_MAP
     king_df[KING_REL_COL] = king_df[KING_REL_COL].map(INF_TO_DEG_MAP)
     king_df = king_df[king_df[KING_REL_COL] <= REL_TO_DEG_MAP[rel_degree]]
-        
+
     # Use the .fam file to get FID/IID mapping to person number
     id_df = _get_id_df_from_fam_file(fam_filename, sample_indices_to_keep)
     N = len(id_df)
@@ -224,6 +248,7 @@ def convert_king_output_to_rel_info(
         },
     )
     king_df = king_df.merge(id_df, on=[KING_FID2_COL, KING_IID2_COL], copy=False)
+
     print(f"Len of king_df is {len(king_df)}")
     print(f"Length of ID df is {N}")
     print(f"rel degree is {rel_degree}")
@@ -267,6 +292,8 @@ def convert_king_output_to_rel_info(
         )
         for person_num in range(N)
     ]
+
+
     # Update rel_lists for those individuals whose lowest degree is UN if running Pop GRMA
     if rel_degree == "Pop":
         logging.info(f"Constructed rel_info and starting to update rel_lists for UN in {time.time() - king_time} seconds")
@@ -287,15 +314,15 @@ def convert_king_output_to_rel_info(
     print(f"Num non-singletons is {counter}")
     print(f"Len of rel_info is {len(rel_info)}")
     
-    # TODO(dhruvaj) Make this a save_rel_info function
-    """file_path = f'/disk/genetics3/data_dirs/ukb/private/v3/processed/user/dhruvaj/grma_ukb_testing/rel_info_deg{rel_degree}_EA_all_ancestry.txt'
-    rel_info_str = str(rel_info)
-    with open(file_path, "w") as f:
-        f.write(rel_info_str)"""
-    file_name = f'rel_info_deg{rel_degree}_BMI_test.pkl'
-    with open(file_name, 'wb') as f:
-        pickle.dump(rel_info, f)
-    logging.info(f"Saved rel_info to {file_name}")
+    # # TODO(dhruvaj) Make this a save_rel_info function
+    # """file_path = f'/disk/genetics3/data_dirs/ukb/private/v3/processed/user/dhruvaj/grma_ukb_testing/rel_info_deg{rel_degree}_EA_all_ancestry.txt'
+    # rel_info_str = str(rel_info)
+    # with open(file_path, "w") as f:
+    #     f.write(rel_info_str)"""
+    # file_name = f'rel_info_deg{rel_degree}_BMI_test.pkl'
+    # with open(file_name, 'wb') as f:
+    #     pickle.dump(rel_info, f)
+    # logging.info(f"Saved rel_info to {file_name}")
             
     return rel_info, rel_set_sizes
 
@@ -423,7 +450,6 @@ def residualize_genotypes(
     # Subtract row mean value from each snp for the row composed of the related group individuals. 
     # np.nanmean throws a warning because there are some rows that are all NaNs. It's still correct.
     mean_genos = np.vstack([np.nanmean(genotypes[:, rel_list], axis=1) for rel_list in rel_info]).T
-    
     logging.info(f"Residualizing genotypes takes {time.time() - geno_time} seconds")
     return genotypes - mean_genos
 
@@ -433,6 +459,7 @@ def calculate_ses(R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: flo
     block_indices = np.argwhere(duplicates).flatten() # len b
     remaining_indices = np.argwhere(~duplicates).flatten() # len nb
     G_sq_sum_per_snp = np.nansum(np.square(residualized_genotypes), axis=1) # This is X'X = M x 1
+    print(f"{G_sq_sum_per_snp=}")
     
     # Calculate X'RR'X for block indices. X is M x b, R doesn't matter
     block_XRRX = np.nansum(np.square(residualized_genotypes[:, block_indices]), axis=1) # This is X_b'X_b and is M x 1
