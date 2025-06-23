@@ -14,15 +14,6 @@ examples.
 
 '''
 
-
-# KING_REL_COL = "InfType"
-# KING_FID1_COL = "FID1"
-# KING_IID1_COL = "ID1"
-# KING_FID2_COL = "FID2"
-# KING_IID2_COL = "ID2"
-# KING_KINSHIP_COL = "Kinship"
-# REL_TO_DEG_MAP = {"FS": 0, "1": 1, "2": 2, "3": 3, "4": 4, "Pop": 5}
-# rel_thresh = ["FS, "1", "2", "3", "4"] or TODO - a number > 0.0 and < 0.0625
 # Assumes IDs are integers in the range of 0 to N (and that FID is unused)
 def mock_create_rel_info(king_df: pd.DataFrame, rel_thresh: str):
     ids = sorted(set(king_df[grma_lib.KING_IID1_COL].tolist()).union(
