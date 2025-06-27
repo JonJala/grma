@@ -12,17 +12,21 @@ import logging
 import os
 import re
 import sys
-from typing import Any, Callable, Dict, List, Tuple, Set
 import time
+from typing import Any, Callable, Dict, List, Set, Tuple, Union
 import glob
 
 import numpy as np
 import pandas as pd
-# Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to increase clarity about whether objects are views or copies (https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#)
-pd.options.mode.copy_on_write = True
 
 from bedbimfam import (BED_SUFFIX, BIM_SUFFIX, FAM_SUFFIX)
 import grma_lib as lib
+
+
+# Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to
+# increase clarity about whether objects are views or copies
+# (https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#)
+pd.options.mode.copy_on_write = True
 
 
 # Software version
@@ -51,10 +55,6 @@ HEADER = f"""
 MIN_RELATEDNESS = 1
 MAX_RELATEDNESS = 4 # This is the max degree that King outputs 
 DEFAULT_REL_DEG = 1
-
-# Kinship thresholds
-MIN_KINSHIP_THRESH = 0.0
-MAX_KINSHIP_THRESH = 0.0625
 
 # The default short file prefix to use for output and logs
 DEFAULT_SHORT_PREFIX = "grma"
@@ -142,7 +142,7 @@ def output_prefix(s_input: str) -> str:
     return stripped_p
 
 #################################
-def rel_thresh_type(s_input: str) -> float:
+def rel_thresh_type(s_input: str) -> Union[str, float]:
     """
     Used for parsing some inputs to this program, namely relatedness thresholds.
     Whitespace is removed, but no case-changing occurs.
@@ -152,23 +152,23 @@ def rel_thresh_type(s_input: str) -> float:
     :return float: The relatedness threshold
     """
 
-    stripped_thresh = s_input.strip()
+    stripped_thresh = s_input.strip().upper()
 
-    try:
-        # Attempt to convert the value to float
-        float_thresh = float(stripped_thresh)
-        if (MIN_KINSHIP_THRESH <= float_thresh <= MAX_KINSHIP_THRESH):
-            return float_thresh
-        else:
-            raise ValueError
-    except ValueError:
-        # If conversion to float fails, check if it is in the valid list
-        if stripped_thresh in lib.REL_DEG_INPUTS:
-            return stripped_thresh
-        else:
-            raise ValueError(
-                f"Invalid value for --rel-thresh: {stripped_thresh}. "
-                f"Expected one of {lib.REL_DEG_INPUTS} or a float in [{MIN_KINSHIP_THRESH}, {MAX_KINSHIP_THRESH}].")
+    if stripped_thresh in lib.REL_DEG_INPUTS:
+        return stripped_thresh
+
+
+    # Kinship value currently not supported.  TODO(jonbjala) Implement that in GRMA lib and then
+    # remove this exception
+    raise ValueError("Specifying kinship value for relatedness threshold not supported yet.")
+
+    float_thresh = float(stripped_thresh)
+    if not (lib.MIN_KINSHIP_THRESH <= float_thresh <= lib.MAX_KINSHIP_THRESH):
+        raise ValueError(f"Expected threshold value of {lib.REL_DEG_INPUTS} or "
+                         f"float between {lib.MIN_KINSHIP_THRESH} and {lib.MAX_KINSHIP_THRESH}")
+
+    return float_thresh
+
 
 #################################
 def to_flag(arg_str: str) -> str:
@@ -231,42 +231,55 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
     # Now, add argument groups and options:
 
     # Main Input Options
-    in_opt = parser.add_argument_group(title="Main Input Specifications")
-    in_opt.add_argument("--bfile", type=bfile_glob_path, required=True, metavar="GLOB_PATH", nargs="+",
-                    help="Paths to PLINK 1 binary files. See python glob module for documentation "
-                            "on the string to be provided here (full path with support for \"*\", "
-                            "\"?\", and \"[]\").  This string should be encased in quotes.  ")
+    infile_opt = parser.add_argument_group(title="Input Specifications")
+    infile_opt.add_argument("--bfile", type=bfile_glob_path, required=True,
+                            metavar="GLOB_PATH", nargs="+",
+                            help="Paths to PLINK 1 binary files. See python glob module for "
+                                 "documentation on the string(s) to be provided here "
+                                 "(full path with support for \"*\", \"?\", and \"[]\").  "
+                                 "These strings should be encased in quotes.  ")
 
-    in_opt.add_argument("--fam", metavar="FILE", type=input_file,
-                         help="Full path and filename of input fam file, overrides bfile flag")
+    infile_opt.add_argument("--fam", metavar="FILE", type=input_file, required=False,
+                            help="Optional input to specify full path and filename of "
+                                 "input fam file.  Overrides --bfile flag if specified")
 
-    in_opt.add_argument("--rel-thresh", metavar="THRESHOLD",
-                         default=DEFAULT_REL_DEG, type=rel_thresh_type,
-    help=f"Relatedness threshold (required with --rel-pedigree). Ignored if --rel-grma is specified. Can be one of {lib.REL_DEG_INPUTS} or a number in [{MIN_KINSHIP_THRESH}, {MAX_KINSHIP_THRESH}].")
+    infile_opt.add_argument("--pheno", metavar="FILE", type=input_file, required=False,
+                            help="Optional input to specify a (Plink-style) phenotype file: "
+                                 "https://www.cog-genomics.org/plink/1.9/input#pheno")
 
-    in_opt.add_argument("--pheno", metavar="FILE", type=input_file,
-                         help="Optional input to specify a (Plink-style) phenotype file: "
-                              "https://www.cog-genomics.org/plink/1.9/input#pheno")
-    in_opt.add_argument("--covar", metavar="FILE", type=input_file,
-                         help="Optional input to specify a (Plink-style) covariates file: "
-                              "https://www.cog-genomics.org/plink/2.0/input#covar")
-        
-    rel_opt = parser.add_mutually_exclusive_group(required=True)
-    rel_opt.add_argument("--rel-grma", metavar="FILE", type = input_file,
-                        help="Mutually exclusive with --rel-pedigree.  Required.  "
-                        "Path to serialized relatedness information that has been pre-processed by GRMA.")
+    infile_opt.add_argument("--covar", metavar="FILE", type=input_file,
+                            help="Optional input to specify a (Plink-style) covariates file: "
+                                 "https://www.cog-genomics.org/plink/2.0/input#covar")
+
+    rel_opt = infile_opt.add_mutually_exclusive_group(required=True)
+    rel_opt.add_argument("--rel-grma", metavar="FILE", type=input_file,
+                         help="Mutually exclusive with --rel-pedigree.  Required.  "
+                              "Path to serialized relatedness information that has been "
+                              "pre-processed by GRMA.")
     
     rel_opt.add_argument("--rel-pedigree", metavar="FILE", type=input_file,
-                         help=f"Mutually exclusive with --rel-grma.  Required.  Path to KING-formatted relatedness file (ASCII). "
+                         help=f"Mutually exclusive with --rel-grma.  Required.  "
+                              f"Path to KING-formatted relatedness file (ASCII). "
                               f"Needs the following columns: {lib.NEEDED_KING_COLS}")
+
+
+    a_opt = parser.add_argument_group(title="Analysis Options")
+    a_opt.add_argument("--rel-thresh", metavar="THRESHOLD",
+                       default=DEFAULT_REL_DEG, type=rel_thresh_type,
+                       help=f"Relatedness threshold (required with --rel-pedigree). Ignored if "
+                            f"--rel-grma is specified. Can be one of {lib.REL_DEG_INPUTS} or a "
+                            f"number in [{lib.MIN_KINSHIP_THRESH}, {lib.MAX_KINSHIP_THRESH}].")
+
     
     infilt_opt = parser.add_argument_group(title="Input Filtering Options")
     infilt_opt.add_argument("--id-list", metavar="FILE", type=input_file,
-                            help="Optional input to specify a whitespace-delimited sample ID file of "
-                                 "sample FIDs and IIDs to include. No header allowed.")
+                            help="Optional input to specify a whitespace-delimited sample ID file "
+                                 "of sample FIDs and IIDs to include.  No header allowed.  "
+                                 "See Plink flag --keep.")
     infilt_opt.add_argument("--snp-list", metavar="FILE", type=input_file,
-                          help="Optional input to specify a whitespace-delimited variant ID file of "
-                               "variant IDs to include. No header allowed.")
+                            help="Optional input to specify a whitespace-delimited variant ID file "
+                                 "of variant IDs to include.  No header allowed.  "
+                                 "See Plink flag --extract.")
     
     # Output Options
     out_opt = parser.add_argument_group(title="Output Specifications")
@@ -285,13 +298,14 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
                          help=f"Number of SNPs to process at a time.  Default is "
                               f"{lib.DEFAULT_SNPS_PER_BLOCK}")
 
+
     #   Logging options (subgroup)
     log_opt = gen_opt.add_mutually_exclusive_group()
     log_opt.add_argument("--quiet", action="store_true",
                          help="This option will cause the program to limit logging and terminal "
-                              "output to warnings and errors, reducing output compared to "
+                              "output to warnings and errors and reduce output compared to "
                               "the default/standard logging mode.  It is mutually "
-                              "exclusive with the --verbose/--debug option.")
+                              "exclusive with the --verbose option.")
     log_opt.add_argument("--verbose", action="store_true",
                          help="This option will greatly increase the logging and terminal output "
                               "of the program compared to the default/standard logging mode.  "
@@ -437,7 +451,8 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     bim_files = [f"{bfile}{BIM_SUFFIX}" for bfile in bfiles]
     fam_files = [pargs.fam] if pargs.fam else [f"{bfile}{FAM_SUFFIX}" for bfile in bfiles]
     
-    missing_files = [file for file in (bed_files + bim_files + fam_files) if not os.path.exists(file)]
+    missing_files = [file for file in (bed_files + bim_files + fam_files)
+                     if not os.path.exists(file)]
     
     if missing_files:
         raise FileNotFoundError(f"Missing the following files: {missing_files}")
@@ -449,7 +464,8 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         OUT_DIR : os.path.dirname(pargs.out),
         BED_FILES : bed_files,
         BIM_FILES : bim_files,
-        FAM_FILES : [pargs.fam]*len(bfiles) if pargs.fam else [f"{bfile}{FAM_SUFFIX}" for bfile in bfiles],
+        FAM_FILES : [pargs.fam]*len(bfiles) if pargs.fam else [f"{bfile}{FAM_SUFFIX}"
+                                                               for bfile in bfiles],
         REL_FILE : pargs.rel_pedigree,
         REL_INFO_FILE : pargs.rel_grma,
         PHENO_FILE : pargs.pheno,
@@ -508,9 +524,11 @@ def main_func(argv: List[str]):
         logging.info("Calling main GRMA function")
         for bed_file, bim_file, fam_file in zip(iargs[BED_FILES], iargs[BIM_FILES], iargs[FAM_FILES]):
             results = lib.grma(
-                rel_input=iargs[REL_FILE], rel_info_file=iargs[REL_INFO_FILE], bed_file=bed_file, bim_file=bim_file,
+                rel_input=iargs[REL_FILE], rel_info_file=iargs[REL_INFO_FILE],
+                bed_file=bed_file, bim_file=bim_file,
                 fam_file=fam_file, pheno_file=iargs[PHENO_FILE], covar_file=iargs[COVAR_FILE],
-                rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK], id_list=iargs[ID_LIST], snp_list=iargs[SNP_LIST]
+                rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK],
+                id_list=iargs[ID_LIST], snp_list=iargs[SNP_LIST]
             )
 
             # Write out the results to disk per chromosome

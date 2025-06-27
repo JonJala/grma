@@ -40,6 +40,15 @@ BED_SUFFIX = ".bed"
 # BIM file suffix
 BIM_SUFFIX = ".bim"
 
+BIM_CHR_COL = "CHR"
+BIM_RSID_COL = "RSID"
+BIM_CM_COL = "CM"
+BIM_BP_COL = "BP"
+BIM_A1_COL = "A1"
+BIM_A2_COL = "A2"
+
+BIM_COLS = (BIM_CHR_COL, BIM_RSID_COL, BIM_CM_COL, BIM_BP_COL, BIM_A1_COL, BIM_A2_COL)
+
 
 # Fam-specific -------
 
@@ -209,6 +218,43 @@ write_bed_file._BED_VALARR_TO_BYTE_MAP = {
         for element in reversed(tup)), base=2)
             for tup in it.product(write_bed_file._BED_VALUE_TO_BINARY_MAP.keys(),
                                   repeat=_BED_SAMPLES_PER_BYTE)}
+
+
+# -------------------------
+def write_fam_file(fam_filename: str, fid: np.ndarray, iid: np.ndarray, iidf: np.ndarray = None,
+                   iidm: np.ndarray = None, sex: np.ndarray = None, pheno: np.ndarray = None):
+    # TODO(jonbjala) Validate anything?
+    N = len(fid)
+    fam_dict = {
+        FAM_FID_COL : fid,
+        FAM_IID_COL : iid,
+        FAM_IIDF_COL : iidf if iidf is not None else np.zeros(N),
+        FAM_IIDM_COL : iidm if iidm is not None else np.zeros(N),
+        FAM_SEX_COL : sex if sex is not None else np.zeros(N),
+        FAM_PHENO_COL : pheno if pheno is not None else np.zeros(N)
+    }
+    fam_df=pd.DataFrame(data=fam_dict, columns=FAM_COLS)
+
+    fam_df.to_csv(fam_filename, sep="\t", header=False, index=False)
+
+
+# -------------------------
+def write_bim_file(bim_filename: str, chrs: np.ndarray, rsid: np.ndarray, bp: np.ndarray,
+                   a1: np.ndarray, a2: np.ndarray, cm: np.ndarray = None):
+    # TODO(jonbjala) Validate anything?
+    M = len(rsid)
+    bim_dict = {
+        BIM_CHR_COL : chrs,
+        BIM_RSID_COL : rsid,
+        BIM_CM_COL : cm if cm is not None else np.zeros(M),
+        BIM_BP_COL : bp,
+        BIM_A1_COL : a1,
+        BIM_A2_COL : a2
+    }
+    bim_df=pd.DataFrame(data=bim_dict, columns=BIM_COLS)
+
+    bim_df.to_csv(bim_filename, sep="\t", header=False, index=False)
+
 
 #################################
 if __name__ == "__main__":

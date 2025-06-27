@@ -2,29 +2,56 @@
 Testing of grma_lib.py
 """
 
+import itertools as it
 import os
 import sys
-
-main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(main_directory)
 
 import numpy as np
 import pytest
 import pandas as pd
-pd.options.mode.copy_on_write = True #https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#
-import itertools as it
 
-import grma_lib as sut
-
-
-# rng = np.random.default_rng(seed=0)
+main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 test_directory = os.path.abspath(os.path.join(main_directory, "test"))
 data_directory = os.path.abspath(os.path.join(test_directory, "data"))
-testcase_name = "toy_example_1"
-testcase_dir = os.path.join(data_directory, testcase_name)
-fam_file = os.path.join(testcase_dir, f"{testcase_name}.fam")
+sys.path.append(main_directory)
+pd.options.mode.copy_on_write = True #https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#
+
+import bedbimfam
+import grma_lib as sut
+
+import helper
+import tcs
+
+##############
+
+# rng = np.random.default_rng(seed=0)
+
+
+# testcase_name = "toy_example_1"
+# testcase_dir = os.path.join(data_directory, testcase_name)
+# fam_file = os.path.join(testcase_dir, f"{testcase_name}.fam")
 
 # TODO(jonbjala) Many more tests will need to be written
+
+
+def make_bim(bim_filename: str, M: int):
+    rs_width = len(str(M))
+
+    bedbimfam.write_bim_file(bim_filename=bim_filename, chrs=np.ones(M),
+                             rsid=np.array([f'RS{snp_id:0{rs_width}d}' for snp_id in range(M)]),
+                             bp=np.array([10*snp_id for snp_id in range(M)]),
+                             a1=['G'] * M,
+                             a2=['A'] * M)
+
+
+def make_fam(fam_filename: str, N: int, pheno: np.ndarray=None):
+    iids=np.array([i for i in range(N)])
+    fids=np.zeros(N, dtype=int)
+    bedbimfam.write_fam_file(fam_filename=fam_filename, fid=fids, iid=iids, pheno=pheno.ravel())
+
+
+make_bed=bedbimfam.write_bed_file
+
 
 @pytest.fixture
 def base_king_output():
@@ -70,6 +97,7 @@ def generate_king_output_same_degree(inftype: str):
     df = df.loc[df["ID1"] != df["ID2"]]
     return df    
 
+
 @pytest.fixture()
 def king_output_same_degree(request):
     # Allowed InfTypes are ["Dup/MZTwin", "FS", "PO" "1", "2", "3", "4", "UN"]
@@ -105,7 +133,7 @@ DF2 = generate_king_output_same_degree(inftype="Dup/MZTwin") # InfType doesn't m
 DF2_MAX_ID = max(DF2['ID1'].max(), DF2['ID2'].max())
 
 class TestKingOutputtoRelInfo:
-    def test__FS(self, base_king_output, short_fam_file):    
+    def test__FS(self, base_king_output, short_fam_file):
         # Checking rel degree = FS protocol works as expected.
         rel_degree = "FS"
         df = base_king_output
@@ -167,7 +195,7 @@ class TestKingOutputtoRelInfo:
 
     @pytest.mark.parametrize("king_output_same_degree", ALLOWED_INFTYPES, indirect=True)
     @pytest.mark.parametrize("rel_index", range(len(sut.REL_DEG_INPUTS)))
-    def test__varying_threshold_within_every_degree(self, king_output_same_degree, long_fam_file, rel_index):
+    def test__varying_threshold_within_every_degree__expected_results(self, king_output_same_degree, long_fam_file, rel_index):
         fam_df = long_fam_file
         king_df = king_output_same_degree
         inftype = king_df["InfType"][1]
@@ -182,3 +210,46 @@ class TestKingOutputtoRelInfo:
         actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=sut.REL_DEG_INPUTS[rel_index])
         assert len(list(it.chain(*actual_rel_info))) == expected_size
     
+
+
+class TestGRMA:
+
+    @pytest.mark.parametrize("tc", tcs.TC_DATA)
+    def test__end_to_end__expected_results(self, tmp_path, tc):
+        M,N = tc[tcs.G].shape
+
+        # Create bed/bim/fam files
+        bed_filename = os.path.join(tmp_path, "temp.bed")
+        bim_filename = os.path.join(tmp_path, "temp.bim")
+        fam_filename = os.path.join(tmp_path, "temp.fam")
+        make_bed(bed_filename=bed_filename, G=tc[tcs.G])
+        make_bim(bim_filename=bim_filename, M=M)
+        make_fam(fam_filename=fam_filename, N=N, pheno=tc[tcs.P])
+
+        # Get rel_info and check against expected if that is specified
+        rel_info = helper.mock_create_rel_info(king_df=tc[tcs.KING_DF],
+                                               rel_thresh=tc[tcs.REL_THRESH])
+        if tc.get(tcs.REL_INFO) is not None:
+            expected_rel_info = tc[tcs.REL_INFO]
+            assert rel_info == expected_rel_info
+
+
+        # Get expected results
+        expected_betas, expected_ses = tc[tcs.OUTPUT] if tc.get(tcs.OUTPUT) is not None else \
+                                       helper.mock_grma(rel_input=tc[tcs.REL_INFO],
+                                                        G=tc[tcs.G], pheno=tc[tcs.P])
+
+        # Get actual results
+        result_df = sut.grma(rel_input=tc[tcs.KING_DF],
+                             bed_file=bed_filename,
+                             bim_file=bim_filename,
+                             fam_file=fam_filename,
+                             rel_degree=tc[tcs.REL_THRESH])
+
+        actual_betas = result_df['Beta'].to_numpy()
+        actual_ses = result_df['SE'].to_numpy()
+
+
+        # Compare
+        assert np.allclose(actual_betas, expected_betas)
+        assert np.allclose(actual_ses, expected_ses)
