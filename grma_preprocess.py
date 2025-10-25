@@ -23,7 +23,7 @@ import pandas as pd
 pd.options.mode.copy_on_write = True
 
 from bedbimfam import (BED_SUFFIX, BIM_SUFFIX, FAM_SUFFIX)
-from grma import (rel_thresh_type, MIN_KINSHIP_THRESH, MAX_KINSHIP_THRESH)
+from grma import rel_thresh_type
 import grma_lib as lib
 
 
@@ -212,7 +212,7 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
     
     in_opt.add_argument("--rel-thresh", metavar="THRESHOLD", nargs='+',
                          default=DEFAULT_REL_DEG, type=rel_thresh_type,
-    help=f"Relatedness threshold. Can be one of {lib.REL_DEG_INPUTS} or a number in [{MIN_KINSHIP_THRESH}, {MAX_KINSHIP_THRESH}].")
+    help=f"Relatedness threshold. Can be one of {lib.REL_DEG_INPUTS} or a number in [{lib.MIN_KINSHIP_THRESH}, {lib.MAX_KINSHIP_THRESH}].")
     
     infilt_opt = parser.add_argument_group(title="Input Filtering Options")
     infilt_opt.add_argument("--id-list", metavar="FILE", type=input_file,
