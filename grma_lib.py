@@ -213,6 +213,7 @@ def convert_king_output_to_rel_info(
         return rel_info, rel_set_sizes
     
     king_time = time.time()
+    logging.info(f'Relationship degree is {rel_degree}.')
     # Read in King output and filter out unneeded rows (where relatedness is too weak)
     if isinstance(king_output, str):
         king_df = pd.read_csv(king_output, sep=r"\s+")[NEEDED_KING_COLS]
