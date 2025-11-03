@@ -446,7 +446,7 @@ def main_func(argv: List[str]):
             # Run the GRMA pipeline
             logging.info("Calling main GRMA function")
             results, _ = lib.convert_king_output_to_rel_info(
-                king_ouput=iargs[REL_FILE], fam_filename=iargs[ID_FILE], rel_degree=degree, sample_indices_to_keep=iargs[ID_LIST]
+                king_output=iargs[REL_FILE], fam_filename=iargs[ID_FILE], rel_degree=degree, sample_indices_to_keep=iargs[ID_LIST]
             )
 
             # Write out the results to disk
