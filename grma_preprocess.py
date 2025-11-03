@@ -445,8 +445,8 @@ def main_func(argv: List[str]):
         for degree in iargs[REL_DEG]:    
             # Run the GRMA pipeline
             logging.info("Calling main GRMA function")
-            results = lib.rel_preprocess(
-                rel_input=iargs[REL_FILE], id_filename=iargs[ID_FILE], rel_degree=degree, sample_indices_to_keep=iargs[ID_LIST]
+            results, _ = lib.convert_king_output_to_rel_info(
+                king_ouput=iargs[REL_FILE], fam_filename=iargs[ID_FILE], rel_degree=degree, sample_indices_to_keep=iargs[ID_LIST]
             )
 
             # Write out the results to disk
