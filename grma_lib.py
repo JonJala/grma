@@ -229,6 +229,7 @@ def convert_king_output_to_rel_info(
     # Use the .fam file to get FID/IID mapping to person number
     id_df = _get_id_df_from_fam_file(fam_filename, sample_indices_to_keep)
     N = len(id_df)
+    logging.info(f'Number of individuals to group is {N}')
 
     # Construct DataFrame that contains person number (INDEX) pairs that are related along with
     # their degree of relation (from king output)
@@ -302,10 +303,14 @@ def convert_king_output_to_rel_info(
     logging.info(f"Making rel_lists takes {time.time() - king_time} seconds.")
 
     rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info], dtype=float)
-    if logging.root.level <= logging.DEBUG:
-        logging.debug(f"Max of rel set sizes is {max(rel_set_sizes)}")
-        logging.debug(f"Min of rel set sizes is {min(rel_set_sizes)}")
-            
+    logging.info(f"Max of rel set sizes is {max(rel_set_sizes)}")
+    logging.info(f"Min of rel set sizes is {min(rel_set_sizes)}")
+    
+    counter = sum(len(inner_list) > 1 for inner_list in rel_info)
+    logging.info(f'Num focal individuals is {counter}')
+    
+    
+        
     return rel_info, rel_set_sizes
 
 # -------------------------
