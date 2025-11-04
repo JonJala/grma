@@ -484,9 +484,9 @@ def run_regressions(
         / G_sq_sum_per_snp
     )
     ses = calculate_ses(R_matrix=R_matrix, duplicates=duplicates, trace_rr=trace_rr, residualized_genotypes=residualized_genotypes, var_y=var_y, N=N)
-    var_x = G_sq_sum_per_snp
+
     logging.info(f"Running regressions takes {time.time() - reg_time}")
-    return -betas, ses, var_x
+    return -betas, ses, G_sq_sum_per_snp
 # -------------------------
 def get_var_y(residualized_phenotypes: np.ndarray) -> float:
     N = len(residualized_phenotypes)
@@ -502,7 +502,7 @@ def calculate_Zstats_and_pvals(betas: np.ndarray, ses: np.ndarray) -> tuple[np.n
 
 # -------------------------
 def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np.ndarray,
-                                  pvals: np.ndarray, var_x: np.ndarray, var_y: float,
+                                  pvals: np.ndarray, sum_sq_x: np.ndarray, var_y: float,
                                   bim_filename: str, snp_indices_to_keep: List[int]
                                   ) -> pd.DataFrame:
     
@@ -510,7 +510,7 @@ def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np
         'BETA': betas,
         'SE': ses,
         'P': pvals, 
-        'VAR_X': var_x,
+        'SUM_SQ_X': sum_sq_x,
         })
     
     bim_df = pd.read_csv(bim_filename, sep='\t', header=None, names=['CHR', 'SNP', 'CM', 'BP', 'A1', 'A2'])
@@ -577,7 +577,7 @@ def grma(
     num_snps = len(snp_indices_to_keep) if snp_indices_to_keep else M
     betas = np.zeros(num_snps)
     ses = np.zeros(num_snps)
-    var_x = np.zeros(num_snps)
+    sum_sq_x = np.zeros(num_snps)
     
     # Get the indices of the individuals to keep
     sample_indices_to_keep = get_sample_indices_to_keep(id_list, fam_file) if id_list else None
@@ -636,7 +636,7 @@ def grma(
         M_start = block_num * snps_per_block
         num_snps_in_block = min(M - M_start, snps_per_block)
 
-        block_betas, block_ses, block_var_x = run_regressions(
+        block_betas, block_ses, block_sum_sq_x = run_regressions(
             residualized_genotypes=residualize_genotypes(
                 genotypes=subset_genotypes(
                     genotypes=read_bed_file(
@@ -661,7 +661,7 @@ def grma(
         )
         betas[M_start: M_start + len(block_betas)] = block_betas
         ses[M_start: M_start + len(block_ses)] = block_ses
-        var_x[M_start : M_start + len(block_var_x)] = block_var_x
+        sum_sq_x[M_start : M_start + len(block_sum_sq_x)] = block_sum_sq_x
     
         
     logging.info(f"Residualized genotypes and ran regressions in "
@@ -670,7 +670,7 @@ def grma(
     
     zstats, pvals = calculate_Zstats_and_pvals(betas=betas, ses=ses)
     results = combine_results_with_bim_file(betas=betas, ses=ses, zstats=zstats, pvals=pvals,
-                                            var_x=var_x, var_y=var_y, bim_filename=bim_file,
+                                            sum_sq_x=sum_sq_x, var_y=var_y, bim_filename=bim_file,
                                             snp_indices_to_keep=snp_indices_to_keep)
     
     return results
