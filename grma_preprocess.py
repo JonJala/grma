@@ -210,7 +210,7 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
                          help=f"File containing relatedness info (in King-like format).  "
                               f"Needs the following columns: {lib.NEEDED_KING_COLS}")
     
-    in_opt.add_argument("--rel-thresh", metavar="THRESHOLD", nargs='+',
+    in_opt.add_argument("--rel-thresh", metavar="THRESHOLD",
                          default=DEFAULT_REL_DEG, type=rel_thresh_type,
     help=f"Relatedness threshold. Can be one of {lib.REL_DEG_INPUTS} or a number in [{lib.MIN_KINSHIP_THRESH}, {lib.MAX_KINSHIP_THRESH}].")
     
@@ -442,19 +442,19 @@ def main_func(argv: List[str]):
         # Validate user inputs and create internal dictionary
         logging.info("Performing additional validation of inputs.")
         iargs = validate_inputs(parsed_args, user_args)
-        for degree in iargs[REL_DEG]:    
-            # Run the GRMA pipeline
-            logging.info("Calling main GRMA function")
-            results, _ = lib.convert_king_output_to_rel_info(
-                king_output=iargs[REL_FILE], fam_filename=iargs[ID_FILE], rel_degree=degree, sample_indices_to_keep=iargs[ID_LIST]
-            )
 
-            # Write out the results to disk
-            # May not need if we write out results directly in grma_preprocess function
-            logging.info("Writing results to disk.")
-            filename = f"{iargs[OUT_PREFIX]}.pkl"
-            logging.debug(f"\t{filename}")
-            write_results_to_file(filename, results)
+        # Run the GRMA pipeline
+        logging.info("Calling main GRMA function")
+        results, _ = lib.convert_king_output_to_rel_info(
+            king_output=iargs[REL_FILE], fam_filename=iargs[ID_FILE], rel_degree=iargs[REL_DEG], sample_indices_to_keep=iargs[ID_LIST]
+        )
+
+        # Write out the results to disk
+        # May not need if we write out results directly in grma_preprocess function
+        logging.info("Writing results to disk.")
+        filename = f"{iargs[OUT_PREFIX]}.pkl"
+        logging.debug(f"\t{filename}")
+        write_results_to_file(filename, results)
 
         # Log any remaining information TODO(jonbjala) Timing info?
         logging.info("\nExecution complete.\n")

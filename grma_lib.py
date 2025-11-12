@@ -449,7 +449,7 @@ def residualize_genotypes(
 # TODO (dhruvaj) Pass residualized phenotypes in, instead of var_y and N?
 #    - there may be small changes from rounding if divide and multiply by N after passing var_y around
 def calculate_ses(R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float,
-                  residualized_genotypes: np.ndarray, var_y: float, N: int) -> np.ndarray:
+                  residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray) -> np.ndarray:
     ses_time = time.time()
 
     block_indices = np.argwhere(duplicates).flatten() # len b
@@ -465,7 +465,7 @@ def calculate_ses(R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: flo
     non_block_XRRX = np.nansum(np.square(XR), axis=1) # This is X'RR'X and is M x 1
     XRRX = block_XRRX + non_block_XRRX
 
-    ses = np.sqrt((XRRX * var_y * N) / (np.square(G_sq_sum_per_snp) * (trace_rr - (XRRX / G_sq_sum_per_snp))))
+    ses = np.sqrt((XRRX * np.dot(residualized_phenotypes, residualized_phenotypes)) / (np.square(G_sq_sum_per_snp) * (trace_rr - (XRRX / G_sq_sum_per_snp))))
 
     logging.info(f"Time to calculate ses is {time.time() - ses_time}")
 
@@ -473,7 +473,7 @@ def calculate_ses(R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: flo
 
 # -------------------------
 def run_regressions(
-    residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray, N: int, R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float, var_y: float
+    residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray, R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     reg_time = time.time()
 
@@ -483,7 +483,7 @@ def run_regressions(
         np.nansum(residualized_genotypes * residualized_phenotypes, axis=1)
         / G_sq_sum_per_snp
     )
-    ses = calculate_ses(R_matrix=R_matrix, duplicates=duplicates, trace_rr=trace_rr, residualized_genotypes=residualized_genotypes, var_y=var_y, N=N)
+    ses = calculate_ses(R_matrix=R_matrix, duplicates=duplicates, trace_rr=trace_rr, residualized_genotypes=residualized_genotypes, residualized_phenotypes=residualized_phenotypes)
 
     logging.info(f"Running regressions takes {time.time() - reg_time}")
     return -betas, ses, G_sq_sum_per_snp
@@ -493,16 +493,16 @@ def get_var_y(residualized_phenotypes: np.ndarray) -> float:
     return np.dot(residualized_phenotypes, residualized_phenotypes) / N
 
 # -------------------------
-def calculate_Zstats_and_pvals(betas: np.ndarray, ses: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def calculate_pvals(betas: np.ndarray, ses: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     # Creates z-statistics and p-values from a 2-tailed test from betas and ses
     zstats = betas / ses
     pvals = 2 * (norm.sf(np.abs(zstats)))
     
-    return zstats, pvals
+    return pvals
 
 # -------------------------
-def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray, zstats: np.ndarray,
-                                  pvals: np.ndarray, sum_sq_x: np.ndarray, var_y: float,
+def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray,
+                                  pvals: np.ndarray, sum_sq_x: np.ndarray,
                                   bim_filename: str, snp_indices_to_keep: List[int]
                                   ) -> pd.DataFrame:
     
@@ -623,7 +623,6 @@ def grma(
                 rel_set_sizes=rel_set_sizes,
         )
     logging.info(f"Demeaned the phenotypes in {time.time() - start_time} seconds")  
-    var_y = get_var_y(P)
 
     # Residualize the genotypes and run the regressions for each block of SNPs
     logging.debug("Residualizing genotypes and running regressions...")
@@ -653,24 +652,21 @@ def grma(
                 rel_set_sizes=rel_set_sizes,
             ),
             residualized_phenotypes=P,
-            N=len(P),
             R_matrix=R_matrix,
             duplicates=duplicates,
             trace_rr=trace_rr,
-            var_y=var_y,
         )
         betas[M_start: M_start + len(block_betas)] = block_betas
         ses[M_start: M_start + len(block_ses)] = block_ses
         sum_sq_x[M_start : M_start + len(block_sum_sq_x)] = block_sum_sq_x
     
         
-    logging.info(f"Residualized genotypes and ran regressions in "
-                 f"{time.time() - start_time} seconds")
-    logging.info(f"Var_y for rel_degree {rel_degree} is {var_y} ")
+    logging.info(f"Residualized genotypes and ran regressions in {time.time() - start_time} seconds")
+    logging.info(f"Var_y for rel_degree {rel_degree} is {get_var_y(P)} ")
     
-    zstats, pvals = calculate_Zstats_and_pvals(betas=betas, ses=ses)
-    results = combine_results_with_bim_file(betas=betas, ses=ses, zstats=zstats, pvals=pvals,
-                                            sum_sq_x=sum_sq_x, var_y=var_y, bim_filename=bim_file,
+    pvals = calculate_pvals(betas=betas, ses=ses)
+    results = combine_results_with_bim_file(betas=betas, ses=ses, pvals=pvals,
+                                            sum_sq_x=sum_sq_x, bim_filename=bim_file,
                                             snp_indices_to_keep=snp_indices_to_keep)
     
     return results
