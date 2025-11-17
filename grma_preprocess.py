@@ -15,6 +15,7 @@ import sys
 from typing import Any, Callable, Dict, List, Tuple
 import time
 import glob
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -22,7 +23,7 @@ import pandas as pd
 pd.options.mode.copy_on_write = True
 
 from bedbimfam import (BED_SUFFIX, BIM_SUFFIX, FAM_SUFFIX)
-from grma import (rel_thresh_type, MIN_KINSHIP_THRESH, MAX_KINSHIP_THRESH)
+from grma import rel_thresh_type
 import grma_lib as lib
 
 
@@ -62,11 +63,11 @@ DEFAULT_FULL_OUT_PREFIX = os.path.join(os.getcwd(), DEFAULT_SHORT_PREFIX)
 # Dictionary keys for internal usage
 OUT_DIR = "Output Directory"
 OUT_PREFIX = "Output Prefix"
-FAM_FILE = "Fam file"
+ID_FILE = "ID File"
 REL_FILE = "Relatedness File"
 REL_INFO_FILE = "Rel info File"
-PHENO_FILE = "Phenotype File"
 REL_DEG = "Relatedness Degree"
+ID_LIST = "ID List"
 
 
 # Type declaration
@@ -209,12 +210,15 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
                          help=f"File containing relatedness info (in King-like format).  "
                               f"Needs the following columns: {lib.NEEDED_KING_COLS}")
     
-    in_opt.add_argument("--rel-thresh", metavar="THRESHOLD", nargs='+',
+    in_opt.add_argument("--rel-thresh", metavar="THRESHOLD",
                          default=DEFAULT_REL_DEG, type=rel_thresh_type,
-    help=f"Relatedness threshold. Can be one of {lib.REL_DEG_INPUTS} or a number in [{MIN_KINSHIP_THRESH}, {MAX_KINSHIP_THRESH}].")
-
-
+    help=f"Relatedness threshold. Can be one of {lib.REL_DEG_INPUTS} or a number in [{lib.MIN_KINSHIP_THRESH}, {lib.MAX_KINSHIP_THRESH}].")
     
+    infilt_opt = parser.add_argument_group(title="Input Filtering Options")
+    infilt_opt.add_argument("--id-list", metavar="FILE", type=input_file,
+                            help="Optional input to specify a whitespace-delimited sample ID file of "
+                                 "sample FIDs and IIDs to include. No header allowed.")
+
     # Output Options
     out_opt = parser.add_argument_group(title="Output Specifications")
     out_opt.add_argument("--out", metavar="FILE_PREFIX", type=output_prefix,
@@ -374,42 +378,39 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     logging.debug("\nProgram was called with the following arguments:\n%s", user_args)
 
     # Make sure either --bfile or --fam or --pheno is specified.
-    if not (pargs.bfile or pargs.fam or pargs.pheno):
-        raise ValueError("You must specify at least one of --bfile, --fam, or --pheno.")
-
-    # Check that file with IDs exists
     if pargs.bfile:
-        if not os.path.exists(f"{pargs.bfile}{FAM_SUFFIX}"):
-            raise FileNotFoundError(f"File {pargs.bfile}{FAM_SUFFIX} does not exist.")
+        id_file = f"{pargs.bfile}{FAM_SUFFIX}"
     elif pargs.fam:
-        if not os.path.exists(pargs.fam):
-            raise FileNotFoundError(f"File {pargs.fam} does not exist.")
+        id_file = pargs.fam
     elif pargs.pheno:
-        if not os.path.exists(pargs.pheno):
-            raise FileNotFoundError(f"File {pargs.pheno} does not exist.")
+        id_file = pargs.pheno
+    else:
+        raise ValueError("One of --bfile, --fam, or --pheno must be specified.")
+
+    if not os.path.exists(id_file):
+        raise FileNotFoundError(f"File {id_file} does not exist.")
 
     # Prepare dictionary that will hold internal values for this program
     logging.debug("Constructing dictionary of values from flags passed in.")
     internal_values = {
         OUT_PREFIX : pargs.out,
         OUT_DIR : os.path.dirname(pargs.out),
-        FAM_FILE : f"{pargs.bfile}{FAM_SUFFIX}" if not pargs.fam else pargs.fam,
-        PHENO_FILE : pargs.pheno,
-        REL_FILE : pargs.relfile,
-        REL_DEG : pargs.degree,
+        ID_FILE: id_file,
+        REL_FILE : pargs.rel_file,
+        REL_DEG : pargs.rel_thresh,
+        ID_LIST: pargs.id_list
     }
 
     return internal_values
 
 
 #################################
-def write_results_to_file(filename: str, results: pd.DataFrame):
+def write_results_to_file(filename: str, rel_info: pd.DataFrame):
+    
+    with open(filename, 'wb') as f:
+        pickle.dump(rel_info, f)
+    logging.info(f"Saved rel_info to {filename}")
 
-    res_start_time = time.time()
-
-    results.to_csv(filename, index = False, header=True, sep='\t')
-    logging.info(f"Time taken to write results is {time.time() - res_start_time}")
-    return results
     
 
 
@@ -444,15 +445,14 @@ def main_func(argv: List[str]):
 
         # Run the GRMA pipeline
         logging.info("Calling main GRMA function")
-        results = lib.rel_preprocess(
-            rel_input=iargs[REL_FILE], fam_file=iargs[FAM_FILE],
-            pheno_file=iargs[PHENO_FILE], rel_degree=iargs[REL_DEG]
+        results, _ = lib.convert_king_output_to_rel_info(
+            king_output=iargs[REL_FILE], fam_filename=iargs[ID_FILE], rel_degree=iargs[REL_DEG], sample_indices_to_keep=iargs[ID_LIST]
         )
 
         # Write out the results to disk
         # May not need if we write out results directly in grma_preprocess function
         logging.info("Writing results to disk.")
-        filename = f"{iargs[OUT_PREFIX]}.res" # TODO(jonbjala)
+        filename = f"{iargs[OUT_PREFIX]}.pkl"
         logging.debug(f"\t{filename}")
         write_results_to_file(filename, results)
 
