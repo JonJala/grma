@@ -246,8 +246,8 @@ class TestGRMA:
                              fam_file=fam_filename,
                              rel_degree=tc[tcs.REL_THRESH])
 
-        actual_betas = result_df['Beta'].to_numpy()
-        actual_ses = result_df['SE'].to_numpy()
+        actual_betas = result_df[sut.OUTPUT_BETA_COL].to_numpy()
+        actual_ses = result_df[sut.OUTPUT_SE_COL].to_numpy()
 
 
         # Compare

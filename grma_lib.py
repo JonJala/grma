@@ -107,6 +107,13 @@ INF_TO_DEG_MAP = {
 # Default number of SNPs to process at a time
 DEFAULT_SNPS_PER_BLOCK = 100
 
+
+# Output columns
+OUTPUT_BETA_COL = 'BETA'
+OUTPUT_SE_COL = 'SE'
+OUTPUT_P_COL = 'P'
+OUTPUT_SUMSQX_COL = 'SUM_SQ_X'
+
 # -------------------------
 def get_sample_indices_to_keep(id_list: str, fam_filename: str) -> pd.DataFrame:
     # Load id_list and get the indices in the fam_file of the individuals to keep
@@ -486,7 +493,7 @@ def run_regressions(
     ses = calculate_ses(R_matrix=R_matrix, duplicates=duplicates, trace_rr=trace_rr, residualized_genotypes=residualized_genotypes, residualized_phenotypes=residualized_phenotypes)
 
     logging.info(f"Running regressions takes {time.time() - reg_time}")
-    return -betas, ses, G_sq_sum_per_snp
+    return betas, ses, G_sq_sum_per_snp
 # -------------------------
 def get_var_y(residualized_phenotypes: np.ndarray) -> float:
     N = len(residualized_phenotypes)
@@ -507,12 +514,12 @@ def combine_results_with_bim_file(betas: np.ndarray, ses: np.ndarray,
                                   ) -> pd.DataFrame:
     
     combined_df = pd.DataFrame({
-        'BETA': betas,
-        'SE': ses,
-        'P': pvals, 
-        'SUM_SQ_X': sum_sq_x,
+        OUTPUT_BETA_COL: betas,
+        OUTPUT_SE_COL: ses,
+        OUTPUT_P_COL: pvals, 
+        OUTPUT_SUMSQX_COL: sum_sq_x,
         })
-    
+
     bim_df = pd.read_csv(bim_filename, sep='\t', header=None, names=['CHR', 'SNP', 'CM', 'BP', 'A1', 'A2'])
     if snp_indices_to_keep:
         bim_df = bim_df.iloc[snp_indices_to_keep]

@@ -168,7 +168,8 @@ SES_2 = np.array(
 )
 
 
-
+#R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float,
+#                  residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray
 
 
 class TestCalculateSes:
@@ -188,7 +189,7 @@ class TestCalculateSes:
         actual_results = the_func(R_matrix=sp.csr_matrix(r_matrix), duplicates=duplicates,
                                    trace_rr=np.trace(r_matrix),
                                    residualized_genotypes=residualized_genotypes,
-                                   var_y=var_y, N=num_ppl)
+                                   residualized_phenotypes=residualized_phenotypes.ravel())
 
         assert np.all(np.isnan(actual_results) | np.isinf(actual_results))
 
@@ -217,7 +218,7 @@ class TestCalculateSes:
         actual_results = the_func(R_matrix=sp.csr_matrix(r_matrix), duplicates=duplicates,
                                    trace_rr=trace_rr,
                                    residualized_genotypes=residualized_genotypes,
-                                   var_y=var_y, N=num_ppl)
+                                   residualized_phenotypes=residualized_phenotypes.ravel())
 
         test_results = calculate_expected_ses(rel_info=rel_info,
                                                   residualized_phenotypes=residualized_phenotypes,
@@ -239,8 +240,8 @@ class TestCalculateSes:
         var_y = np.sum(np.square(residualized_phenotypes)) / num_ppl
 
         actual_results = the_func(R_matrix=sp_r_matrix, duplicates=duplicates,
-                                   trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
-                                   var_y=var_y, N=num_ppl)
+                                  trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
+                                  residualized_phenotypes=residualized_phenotypes.ravel())
 
         assert np.allclose(actual_results, expected_results, atol=0.0001, equal_nan=True)
 
@@ -263,8 +264,8 @@ class TestCalculateSes:
                                                   residualized_phenotypes=residualized_phenotypes,
                                                   residualized_genotypes=residualized_genotypes)
         actual_results = the_func(R_matrix=sp_r_matrix, duplicates=duplicates,
-                                   trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
-                                   var_y=var_y, N=num_ppl)
+                                  trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
+                                  residualized_phenotypes=residualized_phenotypes.ravel())
 
         assert np.allclose(actual_results, expected_results, atol=0.00001, equal_nan=True)
 
@@ -289,12 +290,12 @@ class TestCalculateSes:
         snpshuffled_genotypes = residualized_genotypes[permutation, :]
 
         unshuf_results = the_func(R_matrix=sp_r_matrix, duplicates=duplicates,
-                                   trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
-                                   var_y=var_y, N=num_ppl)
+                                  trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
+                                  residualized_phenotypes=residualized_phenotypes.ravel())
 
         shuf_results = the_func(R_matrix=sp_r_matrix, duplicates=duplicates,
-                                   trace_rr=trace_rr, residualized_genotypes=snpshuffled_genotypes,
-                                   var_y=var_y, N=num_ppl)
+                                trace_rr=trace_rr, residualized_genotypes=snpshuffled_genotypes,
+                                residualized_phenotypes=residualized_phenotypes.ravel())
 
         assert np.allclose(unshuf_results[permutation], shuf_results, atol=0.00001, equal_nan=True)
 
@@ -329,12 +330,12 @@ class TestCalculateSes:
 
 
         unshuf_results = the_func(R_matrix=sp_r_matrix, duplicates=duplicates,
-                                   trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
-                                   var_y=var_y, N=num_ppl)
+                                  trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
+                                  residualized_phenotypes=residualized_phenotypes.ravel())
 
         shuf_results = the_func(R_matrix=shuf_sp_r_matrix, duplicates=shuf_duplicates,
-                                   trace_rr=shuf_trace_rr, residualized_genotypes=pplshuffled_genotypes,
-                                   var_y=shuf_var_y, N=num_ppl)
+                                trace_rr=shuf_trace_rr, residualized_genotypes=pplshuffled_genotypes,
+                                residualized_phenotypes=residualized_phenotypes.ravel())
 
 
         assert np.isclose(trace_rr, shuf_trace_rr, atol=0.00001, equal_nan=True)
@@ -369,7 +370,7 @@ class TestCalculateSes:
                                                   residualized_phenotypes=residualized_phenotypes,
                                                   residualized_genotypes=residualized_genotypes)
         actual_results = the_func(R_matrix=sp_r_matrix, duplicates=duplicates,
-                                   trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
-                                   var_y=var_y, N=num_ppl)
+                                  trace_rr=trace_rr, residualized_genotypes=residualized_genotypes,
+                                  residualized_phenotypes=residualized_phenotypes.ravel())
 
         assert np.allclose(actual_results, expected_results, atol=0.00001, equal_nan=True)
