@@ -70,6 +70,8 @@ BIM_FILES = "Bim files"
 FAM_FILES = "Fam files"
 REL_FILE = "Relatedness File"
 REL_INFO_FILE = "Rel info File"
+REL_ONLY = "Rel processing only"
+SE_INFO_FILE = "SE info NPZ File"
 PHENO_FILE = "Phenotype File"
 COVAR_FILE = "Covariate File"
 REL_DEG = "Relatedness Degree"
@@ -252,23 +254,30 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
                                  "https://www.cog-genomics.org/plink/2.0/input#covar")
 
     rel_opt = infile_opt.add_mutually_exclusive_group(required=True)
-    rel_opt.add_argument("--rel-grma", metavar="FILE", type=input_file,
-                         help="Mutually exclusive with --rel-pedigree.  Required.  "
+    rel_opt.add_argument("--rel-grma", metavar="PKL_FILE NPZ_FILE", type=input_file, nargs=2,
+                         help="Mutually exclusive with other --rel options.  Required.  "
                               "Path to serialized relatedness information that has been "
                               "pre-processed by GRMA.")
     
     rel_opt.add_argument("--rel-pedigree", metavar="FILE", type=input_file,
-                         help=f"Mutually exclusive with --rel-grma.  Required.  "
+                         help=f"Mutually exclusive with other --rel options.  Required.  "
                               f"Path to KING-formatted relatedness file (ASCII). "
                               f"Needs the following columns: {lib.NEEDED_KING_COLS}")
+
+    rel_opt.add_argument("--rel-only", metavar="FILE", type=input_file,
+                         help=f"Mutually exclusive with other --rel options.  Required.  "
+                              f"Path to KING-formatted relatedness file (ASCII). "
+                              f"Needs the following columns: {lib.NEEDED_KING_COLS}.  "
+                              f"Use to process KING relatedness file and produce serialized "
+                              f"relatedness files \"[--out]_grma.pkl\" and \"[--out]_se.npz\" "
+                              f"for --rel-grma calls.")
 
 
     a_opt = parser.add_argument_group(title="Analysis Options")
     a_opt.add_argument("--rel-thresh", metavar="THRESHOLD",
                        default=DEFAULT_REL_DEG, type=rel_thresh_type,
                        help=f"Relatedness threshold (required with --rel-pedigree). Ignored if "
-                            f"--rel-grma is specified. Can be one of {lib.REL_DEG_INPUTS} or a "
-                            f"number in [{lib.MIN_KINSHIP_THRESH}, {lib.MAX_KINSHIP_THRESH}].")
+                            f"--rel-grma is specified. Can be one of {lib.REL_DEG_INPUTS}.")
 
     
     infilt_opt = parser.add_argument_group(title="Input Filtering Options")
@@ -450,9 +459,9 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     bed_files = [f"{bfile}{BED_SUFFIX}" for bfile in bfiles]
     bim_files = [f"{bfile}{BIM_SUFFIX}" for bfile in bfiles]
     fam_files = [pargs.fam] if pargs.fam else [f"{bfile}{FAM_SUFFIX}" for bfile in bfiles]
+    file_list = fam_files if pargs.rel_only else bed_files + bim_files + fam_files
     
-    missing_files = [file for file in (bed_files + bim_files + fam_files)
-                     if not os.path.exists(file)]
+    missing_files = [file for file in file_list if not os.path.exists(file)]
     
     if missing_files:
         raise FileNotFoundError(f"Missing the following files: {missing_files}")
@@ -467,7 +476,9 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         FAM_FILES : [pargs.fam]*len(bfiles) if pargs.fam else [f"{bfile}{FAM_SUFFIX}"
                                                                for bfile in bfiles],
         REL_FILE : pargs.rel_pedigree,
-        REL_INFO_FILE : pargs.rel_grma,
+        REL_INFO_FILE : pargs.rel_grma[0] if pargs.rel_grma else None,
+        SE_INFO_FILE : pargs.rel_grma[1] if pargs.rel_grma else None,
+        REL_ONLY : getattr(pargs, "rel_only", False),
         PHENO_FILE : pargs.pheno,
         COVAR_FILE : pargs.covar,
         REL_DEG : pargs.rel_thresh,
@@ -519,6 +530,24 @@ def main_func(argv: List[str]):
         # Validate user inputs and create internal dictionary
         logging.info("Performing additional validation of inputs.")
         iargs = validate_inputs(parsed_args, user_args)
+
+        # If only the relatedness processing step is required, do that, pickle the results, and exit
+        if iargs[REL_ONLY]:
+            rel_info, _, se_info = lib.convert_king_output_to_rel_info(
+                king_output=iargs[REL_FILE],
+                fam_filename=iargs[FAM_FILES][0], # TODO(jonbjala): Will there ever be a use case where multiple (different) fam files are needed?
+                rel_degree=iargs[REL_DEG],
+                sample_indices_to_keep=iargs[ID_LIST])
+
+            grma_filename = f"{iargs[OUT_PREFIX]}_grma.pkl"
+            se_filename = f"{iargs[OUT_PREFIX]}_se.npz"
+
+            logging.info(f"Writing relatedness results ({grma_filename}, {se_filename}) to disk.")
+            with open(grma_filename, 'wb') as f:
+                pickle.dump(rel_info, f)
+            sp.save_npz(se_filename, se_info)        
+            return
+
 
         # Run the GRMA pipeline
         logging.info("Calling main GRMA function")

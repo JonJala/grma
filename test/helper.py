@@ -34,8 +34,9 @@ def mock_create_rel_info(king_df: pd.DataFrame, rel_thresh: str):
             lowest_rel[id2] = cur_rel
 
 
-    # Construct the rel_info object
+    # Construct the rel_info object and se_info objects
     rel_info = [[i] for i in range(N)]
+    se_info = np.identity(N, dtype=np.int8)
     for index, row in king_df.iterrows():
         cur_rel = grma_lib.INF_TO_DEG_MAP[row[grma_lib.KING_REL_COL]]
         id1 = row[grma_lib.KING_IID1_COL]
@@ -48,13 +49,17 @@ def mock_create_rel_info(king_df: pd.DataFrame, rel_thresh: str):
         if cur_rel == lowest_rel[id2] and cur_rel <= rel_thresh_val:
             rel_info[id2].append(id1)
 
+        if cur_rel <= grma_lib.SE_RELATEDNESS:
+            se_info[id1, id2] = 1
+            se_info[id2, id1] = 1
+
 
     # Sort the rel_info entries
     for i, rel in enumerate(rel_info):
         rel_info[i] = sorted(rel)
 
 
-    return rel_info
+    return rel_info, se_info
 
 
 
@@ -108,12 +113,9 @@ def mock_run_regressions(demeaned_G: np.ndarray, demeaned_P: np.ndarray):
     return betas
 
 
-def mock_calc_se(demeaned_G: np.ndarray, demeaned_P: np.ndarray, R: np.ndarray):
+def mock_calc_ses(demeaned_G: np.ndarray, demeaned_P: np.ndarray, R: np.ndarray,
+                  residuals: np.ndarray, se_info: np.ndarray):
     M, N = demeaned_G.shape
-
-    RR = R @ R.T
-    tRR = np.trace(RR)
-    ESSR = np.sum(np.square(demeaned_P))
 
     ses = np.zeros(M, dtype=float)
 
@@ -121,15 +123,29 @@ def mock_calc_se(demeaned_G: np.ndarray, demeaned_P: np.ndarray, R: np.ndarray):
         X = demeaned_G[snp].T
         XXinv = np.reciprocal(np.dot(X, X))
 
-        XRRX = X.T @ RR @ X
+        snp_residuals = residuals[snp].reshape((N, 1))
 
-        ses[snp] = np.sqrt(ESSR * XXinv * XRRX * XXinv / (tRR - XRRX * XXinv))
+        omega = snp_residuals.T * se_info * snp_residuals
+
+        RtX = R.T @ X
+
+        central_value = RtX.T @ omega @ RtX
+
+        ses[snp] = XXinv * np.sqrt(central_value)
 
     return ses
 
 
+def mock_calc_residuals(betas: np.ndarray, G: np.ndarray, pheno: np.ndarray) -> np.ndarray:
+    M, N = G.shape
+    residuals = np.zeros(N)
 
-def mock_grma(rel_input: list, G: np.ndarray, pheno: np.ndarray):
+    residuals = -((G * betas.reshape((M, 1))) - pheno)
+
+    return residuals
+
+
+def mock_grma(rel_input: list, se_info: np.ndarray, G: np.ndarray, pheno: np.ndarray):
 
     R = mock_construct_R(rel_input)
 
@@ -137,9 +153,11 @@ def mock_grma(rel_input: list, G: np.ndarray, pheno: np.ndarray):
     demeaned_pheno = mock_demean(rel_input, pheno)
 
     betas = mock_run_regressions(demeaned_G=demeaned_geno, demeaned_P=demeaned_pheno)
-    ses = mock_calc_se(demeaned_G=demeaned_geno, demeaned_P=demeaned_pheno, R=R)
+    residuals = mock_calc_residuals(betas=betas, G=G, pheno=pheno)
+    ses = mock_calc_ses(demeaned_G=demeaned_geno, demeaned_P=demeaned_pheno, R=R,
+                       residuals=residuals, se_info=se_info)
 
-    return betas, ses
+    return -betas, ses
 
 
 

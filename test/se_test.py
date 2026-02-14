@@ -168,9 +168,6 @@ SES_2 = np.array(
 )
 
 
-#R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float,
-#                  residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray
-
 
 class TestCalculateSes:
 

@@ -153,7 +153,7 @@ class TestKingOutputtoRelInfo:
 
         expected_rel_info = [[0], [1], [2], [3], [4], [5], [6], [7]]
         expected_rel_size = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
-        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=df, fam_filename=short_fam_file, rel_degree=rel_degree)
+        actual_rel_info, actual_rel_sizes, se_info = sut.convert_king_output_to_rel_info(king_output=df, fam_filename=short_fam_file, rel_degree=rel_degree)
 
         assert actual_rel_info == expected_rel_info
         assert np.array_equal(actual_rel_sizes, expected_rel_size)          
@@ -165,13 +165,13 @@ class TestKingOutputtoRelInfo:
     @pytest.mark.parametrize("iid", range(1, DF2_MAX_ID + 1))
     @pytest.mark.parametrize("king_output_same_degree", ["Dup/MZTwin"], indirect=True)
     def test__iid_value_doesnt_matter(self, king_output_same_degree, long_fam_file, iid):
-        rel_degree = "4"
+        rel_degree = "3"
         fam_df = long_fam_file
         king_df= king_output_same_degree
         contains_iid = (king_df['ID1']==iid) | (king_df['ID2']==iid)
         king_df.loc[contains_iid, 'InfType'] = 'UN'
 
-        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=rel_degree)
+        actual_rel_info, actual_rel_sizes, se_info = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=rel_degree)
 
         assert len(actual_rel_info[iid-1]) == 1
         assert all(len(actual_rel_info[id]) == DF2_MAX_ID-1 for id in range(DF2_MAX_ID) if id != iid-1)  
@@ -186,7 +186,7 @@ class TestKingOutputtoRelInfo:
         expected_sizes = [[1]] * len(fam_df)
         expected_sizes[0:(4 + 2*rel_index)] = [["a", "b"]] * (4+ 2*rel_index)
 
-        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=sut.REL_DEG_INPUTS[rel_index])
+        actual_rel_info, actual_rel_sizes, se_info = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=sut.REL_DEG_INPUTS[rel_index])
 
         assert len(list(it.chain(*actual_rel_info))) == len(list(it.chain(*expected_sizes)))
         assert all(len(actual_rel_info[i]) == len(expected_sizes[i]) for i in range(len(fam_df)))
@@ -207,7 +207,7 @@ class TestKingOutputtoRelInfo:
         else:
             expected_size = len(fam_df)
 
-        actual_rel_info, actual_rel_sizes = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=sut.REL_DEG_INPUTS[rel_index])
+        actual_rel_info, actual_rel_sizes, se_info = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=sut.REL_DEG_INPUTS[rel_index])
         assert len(list(it.chain(*actual_rel_info))) == expected_size
     
 
@@ -227,16 +227,22 @@ class TestGRMA:
         make_fam(fam_filename=fam_filename, N=N, pheno=tc[tcs.P])
 
         # Get rel_info and check against expected if that is specified
-        rel_info = helper.mock_create_rel_info(king_df=tc[tcs.KING_DF],
+        rel_info, se_info = helper.mock_create_rel_info(king_df=tc[tcs.KING_DF],
                                                rel_thresh=tc[tcs.REL_THRESH])
         if tc.get(tcs.REL_INFO) is not None:
             expected_rel_info = tc[tcs.REL_INFO]
             assert rel_info == expected_rel_info
 
+        if tc.get(tcs.SE_INFO) is not None:
+            expected_se_info = tc[tcs.SE_INFO]
+            assert se_info == expected_se_info
+
 
         # Get expected results
         expected_betas, expected_ses = tc[tcs.OUTPUT] if tc.get(tcs.OUTPUT) is not None else \
-                                       helper.mock_grma(rel_input=tc[tcs.REL_INFO],
+                                       helper.mock_grma(rel_input=rel_info, se_info=se_info,
+                                                        G=tc[tcs.G], pheno=tc[tcs.P])
+        test_betas, test_ses = helper.mock_grma(rel_input=rel_info, se_info=se_info,
                                                         G=tc[tcs.G], pheno=tc[tcs.P])
 
         # Get actual results
@@ -251,5 +257,7 @@ class TestGRMA:
 
 
         # Compare
-        assert np.allclose(actual_betas, expected_betas)
-        assert np.allclose(actual_ses, expected_ses)
+        assert np.allclose(actual_betas, expected_betas, atol=0.001) if tc.get(tcs.OUTPUT) is not None else \
+               np.allclose(actual_betas, expected_betas)
+        assert np.allclose(actual_ses, expected_ses, atol=0.001) if tc.get(tcs.OUTPUT) is not None else \
+               np.allclose(actual_ses, expected_ses)

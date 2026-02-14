@@ -80,6 +80,9 @@ INF_3RD = "3rd"
 INF_4TH = "4th"
 INF_UNRELATED = "UN"
 
+MAX_RELATEDNESS = 4  # Maximum degree of relatedness from king output
+SE_RELATEDNESS = 3  # Relatedness to include in SE calculations
+
 # Column name used to label phenotype when pulled in from separate phenotype file
 PHENOFILE_PHENO_COL = "Phenofile_Phenotype"
 
@@ -88,7 +91,7 @@ MIN_KINSHIP_THRESH = 0.0
 MAX_KINSHIP_THRESH = 0.0625
 
 # Map of rel degree to numeric value to subset king output
-REL_TO_DEG_MAP = {"FS": 0, "1": 1, "2": 2, "3": 3, "4": 4}
+REL_TO_DEG_MAP = {"FS": 0, "1": 1, "2": 2, "3": 3}
 
 # List of inputs to accept as flags to specify degree of relation allowed
 REL_DEG_INPUTS = list(REL_TO_DEG_MAP.keys())
@@ -175,7 +178,7 @@ def _get_id_df_from_fam_file(fam_filename: Union[str, pd.DataFrame],
     
     # If id_list is specified, then filter id_df to include those individuals
     if sample_indices_to_keep:
-        id_df = id_df.iloc[sample_indices_to_keep]
+        id_df = id_df.iloc[sample_indices_to_keep] # TODO(jonbjala) Confirm this works as desired
           
     # Create an index col 
     id_df[INDEX_COL] = range(len(id_df))
@@ -207,10 +210,9 @@ def format_covar_file(covar_filename: Union[str, pd.DataFrame],
 
 # -------------------------
 def convert_king_output_to_rel_info(
-    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: str,
+    king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: Union[str, float],
     sample_indices_to_keep: List[int]=None, rel_info_file: str = ""
-) -> tuple[THRESHOLDED_REL_TYPE, np.ndarray]:
-    MAX_RELATEDNESS = 4  # Maximum degree of relatedness from king output
+) -> tuple[THRESHOLDED_REL_TYPE, np.ndarray, sp.csr_array]:
 
     if rel_info_file:
         with open(rel_info_file, 'rb') as f:
@@ -221,7 +223,7 @@ def convert_king_output_to_rel_info(
     
     king_time = time.time()
     logging.info(f'Relationship degree is {rel_degree}.')
-    # Read in King output and filter out unneeded rows (where relatedness is too weak)
+    # Read in King output
     if isinstance(king_output, str):
         king_df = pd.read_csv(king_output, sep=r"\s+")[NEEDED_KING_COLS]
     elif isinstance(king_output, pd.DataFrame):
@@ -230,9 +232,11 @@ def convert_king_output_to_rel_info(
         raise TypeError(f"Type of parameter king_output ({type(king_output)}) is not supported.")
     logging.info(f"Reading in king output took {time.time() - king_time} seconds")
 
-    # Convert InfTypes using INF_TO_DEG_MAP and filter out weak relations using REL_TO_DEG_MAP
+    # Convert InfTypes using INF_TO_DEG_MAP
     king_df[KING_REL_COL] = king_df[KING_REL_COL].map(INF_TO_DEG_MAP)
-    king_df = king_df[king_df[KING_REL_COL] <= REL_TO_DEG_MAP[rel_degree]]
+
+    # Filter down to SE relatedness threshold first
+    king_df = king_df[king_df[KING_REL_COL] <= SE_RELATEDNESS]
 
     # Use the .fam file to get FID/IID mapping to person number
     id_df = _get_id_df_from_fam_file(fam_filename, sample_indices_to_keep)
@@ -256,6 +260,20 @@ def convert_king_output_to_rel_info(
         },
     )
     king_df = king_df.merge(id_df, on=[KING_FID2_COL, KING_IID2_COL], copy=False)
+
+    # Create the SE info object
+    i1 = king_df[INDEX1_COL].to_numpy(dtype=np.int64, copy=False)
+    i2 = king_df[INDEX2_COL].to_numpy(dtype=np.int64, copy=False)
+    rows = np.concatenate([i1, i2])
+    cols = np.concatenate([i2, i1])
+    data = np.ones(rows.shape[0], dtype=np.int8)
+    se_info = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
+    se_info.setdiag(1)
+    se_info.eliminate_zeros()
+    del i1, i2, rows, cols, data
+
+    # Pare down the King dataframe to the relatedness threshold requested by the user
+    king_df = king_df[king_df[KING_REL_COL] <= REL_TO_DEG_MAP[rel_degree]]
 
     # Find the minimum value of KING_REL_COL given groups of indices in index cols.
     # Then combine index, degree pairs into a single lowest_degree series.
@@ -291,17 +309,17 @@ def convert_king_output_to_rel_info(
         list(
             sorted(
                 set(
-                it.chain(
-                    king_df[INDEX1_COL][
-                        (king_df[INDEX2_COL] == person_num)
-                        & (king_df[KING_REL_COL] == lowest_degree[person_num])
-                    ],
-                    king_df[INDEX2_COL][
-                        (king_df[INDEX1_COL] == person_num)
-                        & (king_df[KING_REL_COL] == lowest_degree[person_num])
-                    ],
-                    [person_num],
-                )
+                    it.chain(
+                        king_df[INDEX1_COL][
+                            (king_df[INDEX2_COL] == person_num)
+                            & (king_df[KING_REL_COL] == lowest_degree[person_num])
+                        ],
+                        king_df[INDEX2_COL][
+                            (king_df[INDEX1_COL] == person_num)
+                            & (king_df[KING_REL_COL] == lowest_degree[person_num])
+                        ],
+                        [person_num],
+                    )
                 )
             )
         )
@@ -316,82 +334,29 @@ def convert_king_output_to_rel_info(
     
     counter = sum(len(inner_list) > 1 for inner_list in rel_info)
     logging.info(f'Num focal individuals is {counter}')
+
     
-    
-        
-    return rel_info, rel_set_sizes
+    return rel_info, rel_set_sizes, se_info
 
 # -------------------------
 
 def calculate_R_matrix(rel_info: THRESHOLDED_REL_TYPE, rel_set_sizes: np.ndarray = None
-    ) -> tuple[sp.csr_matrix, np.ndarray, float]:
+    ) -> sp.csr_matrix:
     
-    # Determine the number of people / samples
+    mat_time = time.time()
+    logging.info(f"Creating R matrix")
+
+    # Create the R matrix
     N = len(rel_info)
+    rows = np.array([i for i, sublist in enumerate(rel_info) for v in sublist])
+    cols = np.array([v for sublist in rel_info for v in sublist])
+    data = np.array([-1.0/len(sublist) for sublist in rel_info for v in sublist])
+    R_matrix = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
+    R_matrix.setdiag(R_matrix.diagonal() + 1.0)
+    R_matrix.eliminate_zeros()
 
-
-    # Calculate the trace
-    rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info],
-                             dtype=float) if rel_set_sizes is None else rel_set_sizes
-    trace_rr = float(N) - np.sum(np.reciprocal(rel_set_sizes))
-    logging.info(f"Trace rr is {trace_rr}")
-
-
-    # Determine individuals in blocks (later processing is simplified for these)
-    duplicates, examined = np.zeros(N, dtype=bool), np.zeros(N, dtype=bool)
-    for cur_index, cur_list in enumerate(rel_info):
-        # If this index has already been examined, we won't get any new information from it here
-        if examined[cur_index]:
-            continue
-
-        # We've found a block if all the lists agree and are all new
-        duplicates[cur_list] = not any(examined[cur_list]) and \
-                               all(rel_info[i] == cur_list for i in cur_list)
-
-        # If it's not a block, check if any previous blocks need to be unmarked
-        if not duplicates[cur_index]:
-            # Any indices in the current (not actual) "block" (as defined by cur_list) that point to
-            # anything marked as a duplicate means that is a block that needs to be unmarked
-            block_indices_to_unmark = {blk_index for index in cur_list
-                                                 for blk_index in rel_info[index]
-                                       if duplicates[blk_index]}
-
-            for block_index in block_indices_to_unmark:
-                duplicates[rel_info[block_index]] = False
-
-        # Finally mark the current list as examined and processed
-        examined[cur_list] = True
-    logging.info(f"There are {np.count_nonzero(duplicates)} individuals in relational blocks")
-
-
-    # Make R matrix for the remaining indices 
-    remaining_indices = np.argwhere(~duplicates).flatten()
-    num_remaining = len(remaining_indices)
-
-    # Construct reverse lookup to map from remaining indices to matrix indices
-    reverse_indices = np.zeros(len(rel_info), dtype=int)
-    reverse_indices[remaining_indices] = np.arange(num_remaining)
-        
-    mat_time = time.time()
-    R_matrix = np.identity(num_remaining,  dtype=float)
-    for mat_index, old_p_index in enumerate(remaining_indices):
-        # Get the relational list that corresponds to the current matrix row
-        cur_list = rel_info[old_p_index]
-        
-        # Get the corresponding entries in the current row of the R matrix
-        mat_list = [reverse_indices[p_index] for p_index in cur_list]
-        
-        # Subtract off the inverse of the relational list size from the correct elements
-        R_matrix[mat_index, mat_list] -= np.reciprocal(len(cur_list), dtype=float)
     logging.info(f"Time to create R matrix {time.time() - mat_time}")
-    
-
-    # Convert to sparse format
-    mat_time = time.time()
-    R_matrix = sp.csr_matrix(R_matrix)
-    logging.info(f"Time to convert to csr {time.time() - mat_time}")
-    
-    return R_matrix, duplicates, trace_rr
+    return R_matrix
 # -------------------------
 def demean_phenotypes(
     phenotypes: np.ndarray,
@@ -441,8 +406,7 @@ def residualize_genotypes(
     rel_set_sizes: np.ndarray = None,
 ) -> np.ndarray:
     geno_time = time.time()
-    # TODO(jonbjala) Might want to experiment with different numpy API calls and approaches to see if there are good speed / memory tradeoffs
-    # mean_genos = np.vstack([np.sum(G[:, rel_list], axis=1) for rel_list in rel_info]).T / rel_set_sizes
+
     # genotypes has dimension num_snps x N. The entry in the X matrix is the score (num alleles - 0, 1, or 2)
     mean_genos = np.vstack([np.nanmean(genotypes[:, rel_list], axis=1) for rel_list in rel_info]).T
 
@@ -453,35 +417,34 @@ def residualize_genotypes(
 
 
 # -------------------------
-# TODO (dhruvaj) Pass residualized phenotypes in, instead of var_y and N?
-#    - there may be small changes from rounding if divide and multiply by N after passing var_y around
-def calculate_ses(R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float,
+def calculate_ses(R_matrix: sp.csr_array, se_info: sp.csr_array, residuals: np.ndarray,
                   residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray) -> np.ndarray:
     ses_time = time.time()
 
-    block_indices = np.argwhere(duplicates).flatten() # len b
-    remaining_indices = np.argwhere(~duplicates).flatten() # len nb
-    G_sq_sum_per_snp = np.nansum(np.square(residualized_genotypes), axis=1) # This is X'X = M x 1
+    XtX = np.nansum(np.square(residualized_genotypes), axis=1) # This is X'X = M x 1
+    
+    M, N = residualized_genotypes.shape
+    
+    ses = np.zeros(M, dtype=float)
+    for snp in range(M):
+        snp_residuals = residuals[snp].reshape((N,1))
 
-    # Calculate X'RR'X for block indices. X is M x b, R doesn't matter
-    block_XRRX = np.nansum(np.square(residualized_genotypes[:, block_indices]), axis=1) # This is X_b'X_b and is M x 1
+        center_matrix = R_matrix @ (snp_residuals.T * se_info * snp_residuals) @ R_matrix.T
 
-    # Calculating X'RR'X for reamining indices. X is M x nb, R is nb x nb
-    X = residualized_genotypes[:, remaining_indices]
-    XR = X @ R_matrix
-    non_block_XRRX = np.nansum(np.square(XR), axis=1) # This is X'RR'X and is M x 1
-    XRRX = block_XRRX + non_block_XRRX
+        ses[snp] = np.sqrt(residualized_genotypes[snp] @ center_matrix @ residualized_genotypes[snp])
 
-    ses = np.sqrt((XRRX * np.dot(residualized_phenotypes, residualized_phenotypes)) / (np.square(G_sq_sum_per_snp) * (trace_rr - (XRRX / G_sq_sum_per_snp))))
+
+    ses /= XtX
 
     logging.info(f"Time to calculate ses is {time.time() - ses_time}")
-
     return ses
 
 # -------------------------
 def run_regressions(
-    residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray, R_matrix: sp.csr_matrix, duplicates: np.ndarray, trace_rr: float,
-) -> tuple[np.ndarray, np.ndarray]:
+    genotypes: np.ndarray, phenotypes: np.ndarray,
+    residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray,
+    R_matrix: sp.csr_array, se_info: sp.csr_array) -> tuple[np.ndarray, np.ndarray]:
+
     reg_time = time.time()
 
     G_sq_sum_per_snp = np.nansum(np.square(residualized_genotypes), axis=1)
@@ -490,7 +453,17 @@ def run_regressions(
         np.nansum(residualized_genotypes * residualized_phenotypes, axis=1)
         / G_sq_sum_per_snp
     )
-    ses = calculate_ses(R_matrix=R_matrix, duplicates=duplicates, trace_rr=trace_rr, residualized_genotypes=residualized_genotypes, residualized_phenotypes=residualized_phenotypes)
+
+    M_sub, N = genotypes.shape
+    residuals = -(betas * genotypes.T - phenotypes.reshape((N, 1))).T
+
+    ses = calculate_ses(        
+        R_matrix=R_matrix,
+        se_info=se_info,
+        residuals=residuals,
+        residualized_genotypes=residualized_genotypes,
+        residualized_phenotypes=residualized_phenotypes
+    )
 
     logging.info(f"Running regressions takes {time.time() - reg_time}")
     return betas, ses, G_sq_sum_per_snp
@@ -565,6 +538,8 @@ def grma(
     snp_list: str = ""
 ) -> pd.DataFrame:
 
+    # TODO(jonbjala) Add SE info flag
+
     logging.info(f"\nBeginning grma() for {bed_file}")
     logging.debug(
         f"\t{rel_input=}\n\t{bed_file=}\n\t{bim_file=}\n\t{fam_file=}\n\t{pheno_file=}"
@@ -592,20 +567,14 @@ def grma(
     # Construct the relatedness object
     logging.debug("Converting King output to actionable relatedness info...")
     start_time = time.time()
-    rel_info, rel_set_sizes = convert_king_output_to_rel_info(
+    rel_info, rel_set_sizes, se_info = convert_king_output_to_rel_info(
         king_output=rel_input, fam_filename=fam_file, rel_degree=rel_degree,
         rel_info_file=rel_info_file, sample_indices_to_keep=sample_indices_to_keep
     )
     logging.info(f"Processed King output in {time.time() - start_time} seconds")
 
-    # Calculate the effective N
-    logging.info("Creating R matrix")
-    start_time = time.time()
-    R_matrix, duplicates, trace_rr = calculate_R_matrix(rel_info=rel_info, rel_set_sizes=rel_set_sizes)
-    logging.debug(f"After returning from calculate R matrix: Duplicates type is {duplicates.dtype}."
-                 f"  Duplicates length is {len(duplicates)}.  Duplicates num of true values is "
-                 f"{np.sum(duplicates)}")
-    logging.info(f"Processed R matrix in {time.time() - start_time} seconds")
+    # Calculate the relatedness matrix
+    R_matrix = calculate_R_matrix(rel_info=rel_info, rel_set_sizes=rel_set_sizes)
 
     # Retrieve raw phenotypes from the file
     p_not_demeaned = get_phenotypes_from_file(pheno_filename=pheno_file,
@@ -617,8 +586,9 @@ def grma(
         logging.info("Residualizing phenotypes on covariates...")
         start_time = time.time()
         p_not_demeaned = residualize_phenotypes_on_covars(
-            phenotypes=p_not_demeaned ,
-            covars=format_covar_file(covar_file, fam_file, id_list))
+            phenotypes=p_not_demeaned,
+            covars=format_covar_file(covar_file, fam_file, id_list)
+        )
         logging.info(f"Residualized phenotypes on covariates in {time.time() - start_time} seconds")
   
     # Demean the phenotypes
@@ -642,26 +612,31 @@ def grma(
         M_start = block_num * snps_per_block
         num_snps_in_block = min(M - M_start, snps_per_block)
 
+        genotypes=subset_genotypes(
+            genotypes=read_bed_file(
+                bed_filename=bed_file,
+                N=N,
+                M=M,
+                M_start=M_start,
+                num_snps=num_snps_in_block
+            ), 
+            sample_indices_to_keep=sample_indices_to_keep, 
+            snp_indices_to_keep=snp_indices_to_keep, 
+            M_start=M_start, 
+            snps_per_block=snps_per_block
+        )
+
         block_betas, block_ses, block_sum_sq_x = run_regressions(
+            genotypes=genotypes,
+            phenotypes=p_not_demeaned,
             residualized_genotypes=residualize_genotypes(
-                genotypes=subset_genotypes(
-                    genotypes=read_bed_file(
-                        bed_filename=bed_file,
-                        N=N,
-                        M=M,
-                        M_start=M_start,
-                        num_snps=num_snps_in_block), 
-                    sample_indices_to_keep=sample_indices_to_keep, 
-                    snp_indices_to_keep=snp_indices_to_keep, 
-                    M_start=M_start, 
-                    snps_per_block=snps_per_block),
+                genotypes=genotypes,
                 rel_info=rel_info,
                 rel_set_sizes=rel_set_sizes,
             ),
             residualized_phenotypes=P,
             R_matrix=R_matrix,
-            duplicates=duplicates,
-            trace_rr=trace_rr,
+            se_info=se_info
         )
         betas[M_start: M_start + len(block_betas)] = block_betas
         ses[M_start: M_start + len(block_ses)] = block_ses
@@ -672,7 +647,7 @@ def grma(
     logging.info(f"Var_y for rel_degree {rel_degree} is {get_var_y(P)} ")
     
     pvals = calculate_pvals(betas=betas, ses=ses)
-    results = combine_results_with_bim_file(betas=betas, ses=ses, pvals=pvals,
+    results = combine_results_with_bim_file(betas=-betas, ses=ses, pvals=pvals,
                                             sum_sq_x=sum_sq_x, bim_filename=bim_file,
                                             snp_indices_to_keep=snp_indices_to_keep)
     
