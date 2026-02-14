@@ -230,12 +230,14 @@ def convert_king_output_to_rel_info(
         king_df = king_output
     else:
         raise TypeError(f"Type of parameter king_output ({type(king_output)}) is not supported.")
-    logging.info(f"Reading in king output took {time.time() - king_time} seconds")
 
     # Convert InfTypes using INF_TO_DEG_MAP
     king_df[KING_REL_COL] = king_df[KING_REL_COL].map(INF_TO_DEG_MAP)
+    logging.info(f"Reading in king output took {time.time() - king_time} seconds")
 
+    king_time = time.time()
     # Filter down to SE relatedness threshold first
+    # TODO(jonbjala) This will need to change if we bring back higher degree thresholds
     king_df = king_df[king_df[KING_REL_COL] <= SE_RELATEDNESS]
 
     # Use the .fam file to get FID/IID mapping to person number
@@ -271,9 +273,12 @@ def convert_king_output_to_rel_info(
     se_info.setdiag(1)
     se_info.eliminate_zeros()
     del i1, i2, rows, cols, data
+    logging.info(f"Creating SE object took {time.time() - king_time} seconds")
 
+    king_time = time.time()
     # Pare down the King dataframe to the relatedness threshold requested by the user
     king_df = king_df[king_df[KING_REL_COL] <= REL_TO_DEG_MAP[rel_degree]]
+
 
     # Find the minimum value of KING_REL_COL given groups of indices in index cols.
     # Then combine index, degree pairs into a single lowest_degree series.
@@ -296,47 +301,105 @@ def convert_king_output_to_rel_info(
     # The lowest_degree[person_num] will give the lowest degree for that person regardless of
     #  the positional index value.
     lowest_degree = ind1_mins.combine(ind2_mins, min, MAX_RELATEDNESS + 1)
-
-    # Store the indices of individuals whose lowest degree is UN
-    unrel_indices = np.nonzero(lowest_degree.to_numpy() == MAX_RELATEDNESS + 1)
     lowest_degree = lowest_degree.combine(max_degree_series, min, MAX_RELATEDNESS + 1)
     logging.info(f"Finding the lowest value of relation for all people and combining into "
                  f"series takes {time.time() - king_time} seconds")
 
+    index1_degree = king_df[INDEX1_COL].map(lowest_degree)
+    index2_degree = king_df[INDEX2_COL].map(lowest_degree)
+
+
+    df1 = king_df[index1_degree == king_df[KING_REL_COL]]
+    df2 = king_df[index2_degree == king_df[KING_REL_COL]]
+
+
+    rows = np.concatenate([df1[INDEX1_COL], df2[INDEX2_COL],
+                           lowest_degree.index.to_numpy()])
+    cols = np.concatenate([df1[INDEX2_COL], df2[INDEX1_COL],
+                           lowest_degree.index.to_numpy()])
+
+    data = np.ones(rows.shape[0], dtype=float)
+    R_matrix = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
+    R_matrix.eliminate_zeros()
+
+    R_matrix *= -np.reciprocal(R_matrix.sum(axis=1)).reshape((N,1))
+
+    R_matrix +=  sp.identity(N, dtype=float)
+    logging.info(f"Creating R matrix took {time.time() - king_time} seconds")
+    # # Create the SE info object
+    # i1 = king_df[INDEX1_COL].to_numpy(dtype=np.int64, copy=False)
+    # i2 = king_df[INDEX2_COL].to_numpy(dtype=np.int64, copy=False)
+    # rows = np.concatenate([i1, i2])
+    # cols = np.concatenate([i2, i1])
+    # data = np.ones(rows.shape[0], dtype=np.int8)
+    # se_info = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
+    # se_info.setdiag(1)
+    # se_info.eliminate_zeros()
+    # del i1, i2, rows, cols, data
+
+
+    # # Create the R matrix
+    # #king_df['INDEX1_MIN_REL'] = 
+
+
+
+    # i1 = king_df[INDEX1_COL].to_numpy(dtype=np.int64, copy=False)
+    # i2 = king_df[INDEX2_COL].to_numpy(dtype=np.int64, copy=False)
+    # rows = np.concatenate([i1, i2])
+    # cols = np.concatenate([i2, i1])
+    # data = np.ones(rows.shape[0], dtype=np.int8)
+    # se_info = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
+    # se_info.setdiag(1)
+    # se_info.eliminate_zeros()
+    # del i1, i2, rows, cols, data
+
+
+    # rows = np.array([i for i, sublist in enumerate(rel_info) for v in sublist])
+    # cols = np.array([v for sublist in rel_info for v in sublist])
+    # data = np.array([-1.0/len(sublist) for sublist in rel_info for v in sublist])
+    # R_matrix = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
+    # R_matrix.setdiag(R_matrix.diagonal() + 1.0)
+    # R_matrix.eliminate_zeros()
+
+
+
     # Store a list of lists that contains groups of individuals who are closely related
-    king_time = time.time()
-    rel_info = [
-        list(
-            sorted(
-                set(
-                    it.chain(
-                        king_df[INDEX1_COL][
-                            (king_df[INDEX2_COL] == person_num)
-                            & (king_df[KING_REL_COL] == lowest_degree[person_num])
-                        ],
-                        king_df[INDEX2_COL][
-                            (king_df[INDEX1_COL] == person_num)
-                            & (king_df[KING_REL_COL] == lowest_degree[person_num])
-                        ],
-                        [person_num],
-                    )
-                )
-            )
-        )
-        for person_num in range(N)
-    ]
+    #king_time = time.time()
+    # rel_info = [
+    #     list(
+    #         sorted(
+    #             set(
+    #                 it.chain(
+    #                     king_df[INDEX1_COL][
+    #                         (king_df[INDEX2_COL] == person_num)
+    #                         & (king_df[KING_REL_COL] == lowest_degree[person_num])
+    #                     ],
+    #                     king_df[INDEX2_COL][
+    #                         (king_df[INDEX1_COL] == person_num)
+    #                         & (king_df[KING_REL_COL] == lowest_degree[person_num])
+    #                     ],
+    #                     [person_num],
+    #                 )
+    #             )
+    #         )
+    #     )
+    #     for person_num in range(N)
+    # ]
 
-    logging.info(f"Making rel_lists takes {time.time() - king_time} seconds.")
+    # logging.info(f"Making rel_lists takes {time.time() - king_time} seconds.")
 
-    rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info], dtype=float)
-    logging.info(f"Max of rel set sizes is {max(rel_set_sizes)}")
-    logging.info(f"Min of rel set sizes is {min(rel_set_sizes)}")
+    # rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info], dtype=float)
+    # logging.info(f"Max of rel set sizes is {max(rel_set_sizes)}")
+    # logging.info(f"Min of rel set sizes is {min(rel_set_sizes)}")
     
-    counter = sum(len(inner_list) > 1 for inner_list in rel_info)
-    logging.info(f'Num focal individuals is {counter}')
+    # counter = sum(len(inner_list) > 1 for inner_list in rel_info)
+    # logging.info(f'Num focal individuals is {counter}')
 
     
-    return rel_info, rel_set_sizes, se_info
+    # print(f"GRMA {rel_info=}")
+    # print(f"GRMA {R_matrix.toarray()=}")
+
+    return R_matrix, se_info
 
 # -------------------------
 
@@ -358,20 +421,16 @@ def calculate_R_matrix(rel_info: THRESHOLDED_REL_TYPE, rel_set_sizes: np.ndarray
     logging.info(f"Time to create R matrix {time.time() - mat_time}")
     return R_matrix
 # -------------------------
-def demean_phenotypes(
-    phenotypes: np.ndarray,
-    rel_info: THRESHOLDED_REL_TYPE,
-    rel_set_sizes: np.ndarray = None,
-) -> np.ndarray:
+def demean_phenotypes(phenotypes: np.ndarray, R_matrix: sp.csr_array) -> np.ndarray:
     # TODO(jonbjala)  Handle missing phenotype values?
-    N = len(phenotypes)
-    rel_set_sizes = (np.array([len(rel_list) for rel_list in rel_info], dtype=float)
-                     if rel_set_sizes is None else rel_set_sizes)  # TODO(jonbjala) Make this a function?
+    # N = len(phenotypes)
+    # rel_set_sizes = (np.array([len(rel_list) for rel_list in rel_info], dtype=float)
+    #                  if rel_set_sizes is None else rel_set_sizes)  # TODO(jonbjala) Make this a function?
 
-    mean_phenos = (np.fromiter((np.sum(phenotypes[rel_list]) for rel_list in rel_info),
-                       dtype=float, count=N,)/ rel_set_sizes)
+    # mean_phenos = (np.fromiter((np.sum(phenotypes[rel_list]) for rel_list in rel_info),
+    #                    dtype=float, count=N,)/ rel_set_sizes)
 
-    return phenotypes - mean_phenos
+    return R_matrix @ phenotypes
 
 # -------------------------
 def residualize_phenotypes_on_covars(phenotypes:np.ndarray, covars:np.ndarray) -> np.ndarray:
@@ -401,19 +460,18 @@ def residualize_phenotypes_on_covars(phenotypes:np.ndarray, covars:np.ndarray) -
 # -------------------------
 def residualize_genotypes(
     genotypes: np.ndarray,
-    rel_info: THRESHOLDED_REL_TYPE,
-    *,
-    rel_set_sizes: np.ndarray = None,
+    R_matrix: sp.csr_array,
 ) -> np.ndarray:
-    geno_time = time.time()
+    # geno_time = time.time()
 
-    # genotypes has dimension num_snps x N. The entry in the X matrix is the score (num alleles - 0, 1, or 2)
-    mean_genos = np.vstack([np.nanmean(genotypes[:, rel_list], axis=1) for rel_list in rel_info]).T
+    # # genotypes has dimension num_snps x N. The entry in the X matrix is the score (num alleles - 0, 1, or 2)
+    # mean_genos = np.vstack([np.nanmean(genotypes[:, rel_list], axis=1) for rel_list in rel_info]).T
 
-    # Subtract row mean value from each snp for the row composed of the related group individuals. 
-    # np.nanmean throws a warning because there are some rows that are all NaNs. It's still correct.
-    logging.info(f"Residualizing genotypes takes {time.time() - geno_time} seconds")
-    return genotypes - mean_genos
+    # # Subtract row mean value from each snp for the row composed of the related group individuals. 
+    # # np.nanmean throws a warning because there are some rows that are all NaNs. It's still correct.
+    # logging.info(f"Residualizing genotypes takes {time.time() - geno_time} seconds")
+
+    return (R_matrix @ genotypes.T).T
 
 
 # -------------------------
@@ -567,14 +625,14 @@ def grma(
     # Construct the relatedness object
     logging.debug("Converting King output to actionable relatedness info...")
     start_time = time.time()
-    rel_info, rel_set_sizes, se_info = convert_king_output_to_rel_info(
+    R_matrix, se_info = convert_king_output_to_rel_info(
         king_output=rel_input, fam_filename=fam_file, rel_degree=rel_degree,
         rel_info_file=rel_info_file, sample_indices_to_keep=sample_indices_to_keep
     )
     logging.info(f"Processed King output in {time.time() - start_time} seconds")
 
     # Calculate the relatedness matrix
-    R_matrix = calculate_R_matrix(rel_info=rel_info, rel_set_sizes=rel_set_sizes)
+    #R_matrix = calculate_R_matrix(rel_info=rel_info, rel_set_sizes=rel_set_sizes)
 
     # Retrieve raw phenotypes from the file
     p_not_demeaned = get_phenotypes_from_file(pheno_filename=pheno_file,
@@ -596,8 +654,7 @@ def grma(
     start_time = time.time()
     P = demean_phenotypes(
                phenotypes=p_not_demeaned,
-                rel_info=rel_info,
-                rel_set_sizes=rel_set_sizes,
+               R_matrix=R_matrix,
         )
     logging.info(f"Demeaned the phenotypes in {time.time() - start_time} seconds")  
 
@@ -631,8 +688,7 @@ def grma(
             phenotypes=p_not_demeaned,
             residualized_genotypes=residualize_genotypes(
                 genotypes=genotypes,
-                rel_info=rel_info,
-                rel_set_sizes=rel_set_sizes,
+                R_matrix=R_matrix
             ),
             residualized_phenotypes=P,
             R_matrix=R_matrix,

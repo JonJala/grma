@@ -255,6 +255,11 @@ class TestGRMA:
         actual_betas = result_df[sut.OUTPUT_BETA_COL].to_numpy()
         actual_ses = result_df[sut.OUTPUT_SE_COL].to_numpy()
 
+        print(f"{expected_betas=}")
+        print(f"{actual_betas=}")
+        print()
+        print(f"{expected_ses=}")
+        print(f"{actual_ses=}")
 
         # Compare
         assert np.allclose(actual_betas, expected_betas, atol=0.001) if tc.get(tcs.OUTPUT) is not None else \
