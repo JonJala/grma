@@ -25,6 +25,7 @@ pd.options.mode.copy_on_write = True
 
 from bedbimfam import (
     BED_SUFFIX,
+    BIM_COLS,
     BIM_SUFFIX,
     FAM_COLS,
     FAM_FID_COL,
@@ -211,7 +212,7 @@ def format_covar_file(covar_filename: Union[str, pd.DataFrame],
 # -------------------------
 def convert_king_output_to_rel_info(
     king_output: Union[str, pd.DataFrame], fam_filename: str, rel_degree: Union[str, float],
-    sample_indices_to_keep: List[int]=None, rel_info_file: str = ""
+    phenotypes: np.ndarray, sample_indices_to_keep: List[int]=None, rel_info_file: str = ""
 ) -> tuple[THRESHOLDED_REL_TYPE, np.ndarray, sp.csr_array]:
 
     if rel_info_file:
@@ -273,7 +274,8 @@ def convert_king_output_to_rel_info(
     se_info.setdiag(1)
     se_info.eliminate_zeros()
     del i1, i2, rows, cols, data
-    logging.info(f"Creating SE object took {time.time() - king_time} seconds")
+    se_info = phenotypes.reshape((N,1)) * se_info * phenotypes.reshape((N,1)).T
+    logging.info(f"Creating Omega took {time.time() - king_time} seconds")
 
     king_time = time.time()
     # Pare down the King dataframe to the relatedness threshold requested by the user
@@ -282,7 +284,6 @@ def convert_king_output_to_rel_info(
 
     # Find the minimum value of KING_REL_COL given groups of indices in index cols.
     # Then combine index, degree pairs into a single lowest_degree series.
-    king_time = time.time()
     # Pandas Series are 1 dimensional so each element contains a group (index and min rel degree).
     # However, the index is based on by=INDEX_COL so you can access the correct group in the series
     # by using the original index number
@@ -326,100 +327,32 @@ def convert_king_output_to_rel_info(
 
     R_matrix +=  sp.identity(N, dtype=float)
     logging.info(f"Creating R matrix took {time.time() - king_time} seconds")
-    # # Create the SE info object
-    # i1 = king_df[INDEX1_COL].to_numpy(dtype=np.int64, copy=False)
-    # i2 = king_df[INDEX2_COL].to_numpy(dtype=np.int64, copy=False)
-    # rows = np.concatenate([i1, i2])
-    # cols = np.concatenate([i2, i1])
-    # data = np.ones(rows.shape[0], dtype=np.int8)
-    # se_info = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
-    # se_info.setdiag(1)
-    # se_info.eliminate_zeros()
-    # del i1, i2, rows, cols, data
 
 
-    # # Create the R matrix
-    # #king_df['INDEX1_MIN_REL'] = 
-
-
-
-    # i1 = king_df[INDEX1_COL].to_numpy(dtype=np.int64, copy=False)
-    # i2 = king_df[INDEX2_COL].to_numpy(dtype=np.int64, copy=False)
-    # rows = np.concatenate([i1, i2])
-    # cols = np.concatenate([i2, i1])
-    # data = np.ones(rows.shape[0], dtype=np.int8)
-    # se_info = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
-    # se_info.setdiag(1)
-    # se_info.eliminate_zeros()
-    # del i1, i2, rows, cols, data
-
-
-    # rows = np.array([i for i, sublist in enumerate(rel_info) for v in sublist])
-    # cols = np.array([v for sublist in rel_info for v in sublist])
-    # data = np.array([-1.0/len(sublist) for sublist in rel_info for v in sublist])
-    # R_matrix = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
-    # R_matrix.setdiag(R_matrix.diagonal() + 1.0)
-    # R_matrix.eliminate_zeros()
-
-
-
-    # Store a list of lists that contains groups of individuals who are closely related
-    #king_time = time.time()
-    # rel_info = [
-    #     list(
-    #         sorted(
-    #             set(
-    #                 it.chain(
-    #                     king_df[INDEX1_COL][
-    #                         (king_df[INDEX2_COL] == person_num)
-    #                         & (king_df[KING_REL_COL] == lowest_degree[person_num])
-    #                     ],
-    #                     king_df[INDEX2_COL][
-    #                         (king_df[INDEX1_COL] == person_num)
-    #                         & (king_df[KING_REL_COL] == lowest_degree[person_num])
-    #                     ],
-    #                     [person_num],
-    #                 )
-    #             )
-    #         )
-    #     )
-    #     for person_num in range(N)
-    # ]
-
-    # logging.info(f"Making rel_lists takes {time.time() - king_time} seconds.")
-
-    # rel_set_sizes = np.array([len(rel_list) for rel_list in rel_info], dtype=float)
-    # logging.info(f"Max of rel set sizes is {max(rel_set_sizes)}")
-    # logging.info(f"Min of rel set sizes is {min(rel_set_sizes)}")
-    
-    # counter = sum(len(inner_list) > 1 for inner_list in rel_info)
-    # logging.info(f'Num focal individuals is {counter}')
-
-    
-    # print(f"GRMA {rel_info=}")
-    # print(f"GRMA {R_matrix.toarray()=}")
+    se_info = R_matrix @ se_info
+    se_info = se_info @ R_matrix.T
 
     return R_matrix, se_info
 
 # -------------------------
 
-def calculate_R_matrix(rel_info: THRESHOLDED_REL_TYPE, rel_set_sizes: np.ndarray = None
-    ) -> sp.csr_matrix:
+# def calculate_R_matrix(rel_info: THRESHOLDED_REL_TYPE, rel_set_sizes: np.ndarray = None
+#     ) -> sp.csr_matrix:
     
-    mat_time = time.time()
-    logging.info(f"Creating R matrix")
+#     mat_time = time.time()
+#     logging.info(f"Creating R matrix")
 
-    # Create the R matrix
-    N = len(rel_info)
-    rows = np.array([i for i, sublist in enumerate(rel_info) for v in sublist])
-    cols = np.array([v for sublist in rel_info for v in sublist])
-    data = np.array([-1.0/len(sublist) for sublist in rel_info for v in sublist])
-    R_matrix = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
-    R_matrix.setdiag(R_matrix.diagonal() + 1.0)
-    R_matrix.eliminate_zeros()
+#     # Create the R matrix
+#     N = len(rel_info)
+#     rows = np.array([i for i, sublist in enumerate(rel_info) for v in sublist])
+#     cols = np.array([v for sublist in rel_info for v in sublist])
+#     data = np.array([-1.0/len(sublist) for sublist in rel_info for v in sublist])
+#     R_matrix = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
+#     R_matrix.setdiag(R_matrix.diagonal() + 1.0)
+#     R_matrix.eliminate_zeros()
 
-    logging.info(f"Time to create R matrix {time.time() - mat_time}")
-    return R_matrix
+#     logging.info(f"Time to create R matrix {time.time() - mat_time}")
+#     return R_matrix
 # -------------------------
 def demean_phenotypes(phenotypes: np.ndarray, R_matrix: sp.csr_array) -> np.ndarray:
     # TODO(jonbjala)  Handle missing phenotype values?
@@ -475,22 +408,14 @@ def residualize_genotypes(
 
 
 # -------------------------
-def calculate_ses(R_matrix: sp.csr_array, se_info: sp.csr_array, residuals: np.ndarray,
-                  residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray) -> np.ndarray:
+def calculate_ses(se_info: sp.csr_array, residualized_genotypes: np.ndarray, XtX: np.ndarray) -> np.ndarray:
     ses_time = time.time()
 
-    XtX = np.nansum(np.square(residualized_genotypes), axis=1) # This is X'X = M x 1
-    
     M, N = residualized_genotypes.shape
     
     ses = np.zeros(M, dtype=float)
     for snp in range(M):
-        snp_residuals = residuals[snp].reshape((N,1))
-
-        center_matrix = R_matrix @ (snp_residuals.T * se_info * snp_residuals) @ R_matrix.T
-
-        ses[snp] = np.sqrt(residualized_genotypes[snp] @ center_matrix @ residualized_genotypes[snp])
-
+        ses[snp] = np.sqrt(residualized_genotypes[snp] @ se_info @ residualized_genotypes[snp])
 
     ses /= XtX
 
@@ -501,7 +426,7 @@ def calculate_ses(R_matrix: sp.csr_array, se_info: sp.csr_array, residuals: np.n
 def run_regressions(
     genotypes: np.ndarray, phenotypes: np.ndarray,
     residualized_genotypes: np.ndarray, residualized_phenotypes: np.ndarray,
-    R_matrix: sp.csr_array, se_info: sp.csr_array) -> tuple[np.ndarray, np.ndarray]:
+    se_info: sp.csr_array) -> tuple[np.ndarray, np.ndarray]:
 
     reg_time = time.time()
 
@@ -513,14 +438,12 @@ def run_regressions(
     )
 
     M_sub, N = genotypes.shape
-    residuals = -(betas * genotypes.T - phenotypes.reshape((N, 1))).T
+    #residuals = -(betas * genotypes.T - phenotypes.reshape((N, 1))).T
 
-    ses = calculate_ses(        
-        R_matrix=R_matrix,
+    ses = calculate_ses(
         se_info=se_info,
-        residuals=residuals,
         residualized_genotypes=residualized_genotypes,
-        residualized_phenotypes=residualized_phenotypes
+        XtX=G_sq_sum_per_snp
     )
 
     logging.info(f"Running regressions takes {time.time() - reg_time}")
@@ -622,22 +545,24 @@ def grma(
     # Get the indices of the individuals to keep
     sample_indices_to_keep = get_sample_indices_to_keep(id_list, fam_file) if id_list else None
 
-    # Construct the relatedness object
-    logging.debug("Converting King output to actionable relatedness info...")
-    start_time = time.time()
-    R_matrix, se_info = convert_king_output_to_rel_info(
-        king_output=rel_input, fam_filename=fam_file, rel_degree=rel_degree,
-        rel_info_file=rel_info_file, sample_indices_to_keep=sample_indices_to_keep
-    )
-    logging.info(f"Processed King output in {time.time() - start_time} seconds")
-
-    # Calculate the relatedness matrix
-    #R_matrix = calculate_R_matrix(rel_info=rel_info, rel_set_sizes=rel_set_sizes)
 
     # Retrieve raw phenotypes from the file
     p_not_demeaned = get_phenotypes_from_file(pheno_filename=pheno_file,
                                               fam_filename=fam_file,
                                               sample_indices_to_keep=sample_indices_to_keep)
+
+    # Construct the relatedness object
+    logging.debug("Converting King output to actionable relatedness info...")
+    start_time = time.time()
+    R_matrix, se_info = convert_king_output_to_rel_info(
+        king_output=rel_input, fam_filename=fam_file, rel_degree=rel_degree,
+        rel_info_file=rel_info_file, sample_indices_to_keep=sample_indices_to_keep,
+        phenotypes=p_not_demeaned
+    )
+    logging.info(f"Processed King output in {time.time() - start_time} seconds")
+
+    # Calculate the relatedness matrix
+    #R_matrix = calculate_R_matrix(rel_info=rel_info, rel_set_sizes=rel_set_sizes)
                
     # Incorporate / residualize on covariates if they exist
     if covar_file:
@@ -691,7 +616,6 @@ def grma(
                 R_matrix=R_matrix
             ),
             residualized_phenotypes=P,
-            R_matrix=R_matrix,
             se_info=se_info
         )
         betas[M_start: M_start + len(block_betas)] = block_betas

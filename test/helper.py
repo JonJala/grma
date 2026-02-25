@@ -6,6 +6,7 @@ import pandas as pd
 
 main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(main_directory)
+import grma
 import grma_lib
 
 '''
@@ -19,7 +20,8 @@ def mock_create_rel_info(king_df: pd.DataFrame, rel_thresh: str):
     ids = sorted(set(king_df[grma_lib.KING_IID1_COL].tolist()).union(
                  set(king_df[grma_lib.KING_IID2_COL].tolist())))
     N = len(ids)
-    rel_thresh_val = grma_lib.REL_TO_DEG_MAP[rel_thresh]
+
+    rel_thresh_val = grma.REL_TO_DEG_MAP[rel_thresh]
 
     # Find the closest relationship levels for everyone
     lowest_rel = [5] * N
@@ -36,7 +38,7 @@ def mock_create_rel_info(king_df: pd.DataFrame, rel_thresh: str):
 
     # Construct the rel_info object and se_info objects
     rel_info = [[i] for i in range(N)]
-    se_info = np.identity(N, dtype=np.int8)
+    se_rel = np.identity(N, dtype=np.int8)
     for index, row in king_df.iterrows():
         cur_rel = grma_lib.INF_TO_DEG_MAP[row[grma_lib.KING_REL_COL]]
         id1 = row[grma_lib.KING_IID1_COL]
@@ -50,8 +52,8 @@ def mock_create_rel_info(king_df: pd.DataFrame, rel_thresh: str):
             rel_info[id2].append(id1)
 
         if cur_rel <= grma_lib.SE_RELATEDNESS:
-            se_info[id1, id2] = 1
-            se_info[id2, id1] = 1
+            se_rel[id1, id2] = 1
+            se_rel[id2, id1] = 1
 
 
     # Sort the rel_info entries
@@ -59,7 +61,7 @@ def mock_create_rel_info(king_df: pd.DataFrame, rel_thresh: str):
         rel_info[i] = sorted(rel)
 
 
-    return rel_info, se_info
+    return rel_info, se_rel
 
 
 
@@ -100,11 +102,16 @@ def mock_demean(rel_input: list, arr: np.ndarray):
     for person_num, row in enumerate(rel_input):
         result[:, person_num] -= np.mean(arr[:, row], axis=1)
 
+    result[np.isnan(result)] = 0.0
+
     return result
 
 
 def mock_run_regressions(demeaned_G: np.ndarray, demeaned_P: np.ndarray):
     M, N = demeaned_G.shape
+
+    XtX = np.sum(np.square(demeaned_G), axis=1)
+
 
     betas = np.zeros(M)
     for snp in range(M):
@@ -113,8 +120,7 @@ def mock_run_regressions(demeaned_G: np.ndarray, demeaned_P: np.ndarray):
     return betas
 
 
-def mock_calc_ses(demeaned_G: np.ndarray, demeaned_P: np.ndarray, R: np.ndarray,
-                  residuals: np.ndarray, se_info: np.ndarray):
+def mock_calc_ses(demeaned_G: np.ndarray, P: np.ndarray, R: np.ndarray, se_rel: np.ndarray):
     M, N = demeaned_G.shape
 
     ses = np.zeros(M, dtype=float)
@@ -123,9 +129,9 @@ def mock_calc_ses(demeaned_G: np.ndarray, demeaned_P: np.ndarray, R: np.ndarray,
         X = demeaned_G[snp].T
         XXinv = np.reciprocal(np.dot(X, X))
 
-        snp_residuals = residuals[snp].reshape((N, 1))
+        #snp_residuals = residuals[snp].reshape((N, 1))
 
-        omega = snp_residuals.T * se_info * snp_residuals
+        omega = P.reshape((N, 1)).T * se_rel * P.reshape((N, 1))  #snp_residuals.T * se_rel * snp_residuals
 
         RtX = R.T @ X
 
@@ -145,7 +151,7 @@ def mock_calc_residuals(betas: np.ndarray, G: np.ndarray, pheno: np.ndarray) -> 
     return residuals
 
 
-def mock_grma(rel_input: list, se_info: np.ndarray, G: np.ndarray, pheno: np.ndarray):
+def mock_grma(rel_input: list, se_rel: np.ndarray, G: np.ndarray, pheno: np.ndarray):
 
     R = mock_construct_R(rel_input)
 
@@ -154,8 +160,8 @@ def mock_grma(rel_input: list, se_info: np.ndarray, G: np.ndarray, pheno: np.nda
 
     betas = mock_run_regressions(demeaned_G=demeaned_geno, demeaned_P=demeaned_pheno)
     residuals = mock_calc_residuals(betas=betas, G=G, pheno=pheno)
-    ses = mock_calc_ses(demeaned_G=demeaned_geno, demeaned_P=demeaned_pheno, R=R,
-                       residuals=residuals, se_info=se_info)
+    ses = mock_calc_ses(demeaned_G=demeaned_geno, P=pheno, R=R,
+                        se_rel=se_rel)
 
     return -betas, ses
 

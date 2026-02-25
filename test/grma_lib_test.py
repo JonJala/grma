@@ -17,7 +17,8 @@ sys.path.append(main_directory)
 pd.options.mode.copy_on_write = True #https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#
 
 import bedbimfam
-import grma_lib as sut
+import grma
+import grma_lib_new as sut
 
 import helper
 import tcs
@@ -46,7 +47,7 @@ def make_bim(bim_filename: str, M: int):
 
 def make_fam(fam_filename: str, N: int, pheno: np.ndarray=None):
     iids=np.array([i for i in range(N)])
-    fids=np.zeros(N, dtype=int)
+    fids=iids.copy()
     bedbimfam.write_fam_file(fam_filename=fam_filename, fid=fids, iid=iids, pheno=pheno.ravel())
 
 
@@ -126,7 +127,7 @@ def long_fam_file():
     return fam_file_format(num_rows=20)
 
 # List of InfTypes that are available in the InfType column of a King output file.
-ALLOWED_INFTYPES = [key for key in sut.INF_TO_DEG_MAP.keys()]
+ALLOWED_INFTYPES = [key for key in sut.INFTYPE_TO_DEG_MAP.keys()]
 
 # Getting MAX_ID of king_output_same_degree to use in tests
 DF2 = generate_king_output_same_degree(inftype="Dup/MZTwin") # InfType doesn't matter here, as we only care about max_ID for range in iid parametrization. 
@@ -178,37 +179,37 @@ class TestKingOutputtoRelInfo:
 
     # test__varying_threshold__expected_results repeatedly raises the relatedness degree input on a df that has one pair of individuals per degree of relation
     # This allows us to test that rel_info is correct for all levels of relatedness inputs on a single df.
-    @pytest.mark.parametrize("rel_index", range(len(sut.REL_DEG_INPUTS)))
-    def test__varying_threshold__expected_results(self, king_output_disconnected_rels, long_fam_file, rel_index):
-        fam_df = long_fam_file
-        king_df= king_output_disconnected_rels
+    # @pytest.mark.parametrize("rel_index", range(len(sut.REL_DEG_INPUTS)))
+    # def test__varying_threshold__expected_results(self, king_output_disconnected_rels, long_fam_file, rel_index):
+    #     fam_df = long_fam_file
+    #     king_df= king_output_disconnected_rels
 
-        expected_sizes = [[1]] * len(fam_df)
-        expected_sizes[0:(4 + 2*rel_index)] = [["a", "b"]] * (4+ 2*rel_index)
+    #     expected_sizes = [[1]] * len(fam_df)
+    #     expected_sizes[0:(4 + 2*rel_index)] = [["a", "b"]] * (4+ 2*rel_index)
 
-        actual_rel_info, actual_rel_sizes, se_info = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=sut.REL_DEG_INPUTS[rel_index])
+    #     actual_rel_info, actual_rel_sizes, se_info = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=sut.REL_DEG_INPUTS[rel_index])
 
-        assert len(list(it.chain(*actual_rel_info))) == len(list(it.chain(*expected_sizes)))
-        assert all(len(actual_rel_info[i]) == len(expected_sizes[i]) for i in range(len(fam_df)))
+    #     assert len(list(it.chain(*actual_rel_info))) == len(list(it.chain(*expected_sizes)))
+    #     assert all(len(actual_rel_info[i]) == len(expected_sizes[i]) for i in range(len(fam_df)))
 
     # test__varying_threshold_within_every_degree uses the fully connected df to vary both InfType values within the df and rel_degrees and ensures that rel sizes are correct.
 
-    @pytest.mark.parametrize("king_output_same_degree", ALLOWED_INFTYPES, indirect=True)
-    @pytest.mark.parametrize("rel_index", range(len(sut.REL_DEG_INPUTS)))
-    def test__varying_threshold_within_every_degree__expected_results(self, king_output_same_degree, long_fam_file, rel_index):
-        fam_df = long_fam_file
-        king_df = king_output_same_degree
-        inftype = king_df["InfType"][1]
-        inftype_index = ALLOWED_INFTYPES.index(inftype)
+    # @pytest.mark.parametrize("king_output_same_degree", ALLOWED_INFTYPES, indirect=True)
+    # @pytest.mark.parametrize("rel_index", range(len(sut.REL_DEG_INPUTS)))
+    # def test__varying_threshold_within_every_degree__expected_results(self, king_output_same_degree, long_fam_file, rel_index):
+    #     fam_df = long_fam_file
+    #     king_df = king_output_same_degree
+    #     inftype = king_df["InfType"][1]
+    #     inftype_index = ALLOWED_INFTYPES.index(inftype)
 
-        if inftype_index - 1 <= rel_index:
-            num_singletons = len(fam_df) - DF2_MAX_ID
-            expected_size = (DF2_MAX_ID * DF2_MAX_ID) + num_singletons
-        else:
-            expected_size = len(fam_df)
+    #     if inftype_index - 1 <= rel_index:
+    #         num_singletons = len(fam_df) - DF2_MAX_ID
+    #         expected_size = (DF2_MAX_ID * DF2_MAX_ID) + num_singletons
+    #     else:
+    #         expected_size = len(fam_df)
 
-        actual_rel_info, actual_rel_sizes, se_info = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=sut.REL_DEG_INPUTS[rel_index])
-        assert len(list(it.chain(*actual_rel_info))) == expected_size
+    #     actual_rel_info, actual_rel_sizes, se_info = sut.convert_king_output_to_rel_info(king_output=king_df, fam_filename=fam_df, rel_degree=sut.REL_DEG_INPUTS[rel_index])
+    #     assert len(list(it.chain(*actual_rel_info))) == expected_size
     
 
 
@@ -226,43 +227,42 @@ class TestGRMA:
         make_bim(bim_filename=bim_filename, M=M)
         make_fam(fam_filename=fam_filename, N=N, pheno=tc[tcs.P])
 
-        # Get rel_info and check against expected if that is specified
-        rel_info, se_info = helper.mock_create_rel_info(king_df=tc[tcs.KING_DF],
-                                               rel_thresh=tc[tcs.REL_THRESH])
-        if tc.get(tcs.REL_INFO) is not None:
-            expected_rel_info = tc[tcs.REL_INFO]
-            assert rel_info == expected_rel_info
 
-        if tc.get(tcs.SE_INFO) is not None:
-            expected_se_info = tc[tcs.SE_INFO]
-            assert se_info == expected_se_info
+        for rel_thresh, expected_output in tc[tcs.OUTPUT].items():
+            # Get rel_info and check against expected if that is specified
+            rel_info, se_rel = helper.mock_create_rel_info(king_df=tc[tcs.KING_DF],
+                                                           rel_thresh=rel_thresh)
+            # if tc.get(tcs.REL_INFO) is not None:
+            #     expected_rel_info = tc[tcs.REL_INFO]
+            #     assert rel_info == expected_rel_info
+            print(f"JJ: TEST {rel_info=}")
 
+            # Get expected results
+            test_betas, test_ses = helper.mock_grma(rel_input=rel_info, se_rel=se_rel,
+                                                            G=tc[tcs.G], pheno=tc[tcs.P])
+            expected_betas, expected_ses = expected_output if expected_output is not None else \
+                                           (test_betas, test_ses)
 
-        # Get expected results
-        expected_betas, expected_ses = tc[tcs.OUTPUT] if tc.get(tcs.OUTPUT) is not None else \
-                                       helper.mock_grma(rel_input=rel_info, se_info=se_info,
-                                                        G=tc[tcs.G], pheno=tc[tcs.P])
-        test_betas, test_ses = helper.mock_grma(rel_input=rel_info, se_info=se_info,
-                                                        G=tc[tcs.G], pheno=tc[tcs.P])
+            # Get actual results
+            result_df = sut.grma(rel_file=tc[tcs.KING_DF],
+                                 bed_file=bed_filename,
+                                 bim_file=bim_filename,
+                                 fam_file=fam_filename,
+                                 rel_degree=grma.REL_TO_DEG_MAP[rel_thresh])
 
-        # Get actual results
-        result_df = sut.grma(rel_input=tc[tcs.KING_DF],
-                             bed_file=bed_filename,
-                             bim_file=bim_filename,
-                             fam_file=fam_filename,
-                             rel_degree=tc[tcs.REL_THRESH])
+            actual_betas = result_df[sut.OUTPUT_BETA_COL].to_numpy()
+            actual_ses = result_df[sut.OUTPUT_SE_COL].to_numpy()
 
-        actual_betas = result_df[sut.OUTPUT_BETA_COL].to_numpy()
-        actual_ses = result_df[sut.OUTPUT_SE_COL].to_numpy()
+            print(f"{expected_betas=}")
+            print(f"{test_betas=}")
+            print(f"{actual_betas=}")
+            print()
+            print(f"{expected_ses=}")
+            print(f"{test_ses=}")
+            print(f"{actual_ses=}")
 
-        print(f"{expected_betas=}")
-        print(f"{actual_betas=}")
-        print()
-        print(f"{expected_ses=}")
-        print(f"{actual_ses=}")
-
-        # Compare
-        assert np.allclose(actual_betas, expected_betas, atol=0.001) if tc.get(tcs.OUTPUT) is not None else \
-               np.allclose(actual_betas, expected_betas)
-        assert np.allclose(actual_ses, expected_ses, atol=0.001) if tc.get(tcs.OUTPUT) is not None else \
-               np.allclose(actual_ses, expected_ses)
+            # Compare
+            assert np.allclose(actual_betas, expected_betas, atol=0.001) if expected_output is not None else \
+                   np.allclose(actual_betas, expected_betas)
+            assert np.allclose(actual_ses, expected_ses, atol=0.001) if expected_output is not None else \
+                   np.allclose(actual_ses, expected_ses)

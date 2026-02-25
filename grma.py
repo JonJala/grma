@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from bedbimfam import (BED_SUFFIX, BIM_SUFFIX, FAM_SUFFIX)
-import grma_lib as lib
+import grma_lib_new as lib
 
 
 # Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to
@@ -50,6 +50,13 @@ HEADER = f"""
 <> All other correspondence: {OTHER_CORRESPONDENCE_EMAIL}
 <><>
 """
+
+# Map of rel degree to numeric value to subset king output
+REL_TO_DEG_MAP = {"FS": 0, "1": 1, "2": 2, "3": 3}
+
+# List of inputs to accept as flags to specify degree of relation allowed
+REL_DEG_INPUTS = list(REL_TO_DEG_MAP.keys())
+
 
 # Relatedness degree constants
 MIN_RELATEDNESS = 1
@@ -156,7 +163,7 @@ def rel_thresh_type(s_input: str) -> Union[str, float]:
 
     stripped_thresh = s_input.strip().upper()
 
-    if stripped_thresh in lib.REL_DEG_INPUTS:
+    if stripped_thresh in REL_DEG_INPUTS:
         return stripped_thresh
 
 
@@ -166,7 +173,7 @@ def rel_thresh_type(s_input: str) -> Union[str, float]:
 
     float_thresh = float(stripped_thresh)
     if not (lib.MIN_KINSHIP_THRESH <= float_thresh <= lib.MAX_KINSHIP_THRESH):
-        raise ValueError(f"Expected threshold value of {lib.REL_DEG_INPUTS} or "
+        raise ValueError(f"Expected threshold value of {REL_DEG_INPUTS} or "
                          f"float between {lib.MIN_KINSHIP_THRESH} and {lib.MAX_KINSHIP_THRESH}")
 
     return float_thresh
@@ -253,31 +260,15 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
                             help="Optional input to specify a (Plink-style) covariates file: "
                                  "https://www.cog-genomics.org/plink/2.0/input#covar")
 
-    rel_opt = infile_opt.add_mutually_exclusive_group(required=True)
-    rel_opt.add_argument("--rel-grma", metavar="PKL_FILE NPZ_FILE", type=input_file, nargs=2,
-                         help="Mutually exclusive with other --rel options.  Required.  "
-                              "Path to serialized relatedness information that has been "
-                              "pre-processed by GRMA.")
-    
-    rel_opt.add_argument("--rel-pedigree", metavar="FILE", type=input_file,
-                         help=f"Mutually exclusive with other --rel options.  Required.  "
-                              f"Path to KING-formatted relatedness file (ASCII). "
-                              f"Needs the following columns: {lib.NEEDED_KING_COLS}")
-
-    rel_opt.add_argument("--rel-only", metavar="FILE", type=input_file,
-                         help=f"Mutually exclusive with other --rel options.  Required.  "
-                              f"Path to KING-formatted relatedness file (ASCII). "
-                              f"Needs the following columns: {lib.NEEDED_KING_COLS}.  "
-                              f"Use to process KING relatedness file and produce serialized "
-                              f"relatedness files \"[--out]_grma.pkl\" and \"[--out]_se.npz\" "
-                              f"for --rel-grma calls.")
+    infile_opt.add_argument("--rel-pedigree", metavar="FILE", type=input_file,
+                            help=f"Path to KING-formatted relatedness file (ASCII). "
+                                 f"Needs the following columns: {lib.NEEDED_KING_COLS}")
 
 
     a_opt = parser.add_argument_group(title="Analysis Options")
     a_opt.add_argument("--rel-thresh", metavar="THRESHOLD",
                        default=DEFAULT_REL_DEG, type=rel_thresh_type,
-                       help=f"Relatedness threshold (required with --rel-pedigree). Ignored if "
-                            f"--rel-grma is specified. Can be one of {lib.REL_DEG_INPUTS}.")
+                       help=f"Relatedness threshold.  Can be one of {REL_DEG_INPUTS}.")
 
     
     infilt_opt = parser.add_argument_group(title="Input Filtering Options")
@@ -459,7 +450,7 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     bed_files = [f"{bfile}{BED_SUFFIX}" for bfile in bfiles]
     bim_files = [f"{bfile}{BIM_SUFFIX}" for bfile in bfiles]
     fam_files = [pargs.fam] if pargs.fam else [f"{bfile}{FAM_SUFFIX}" for bfile in bfiles]
-    file_list = fam_files if pargs.rel_only else bed_files + bim_files + fam_files
+    file_list = bed_files + bim_files + fam_files
     
     missing_files = [file for file in file_list if not os.path.exists(file)]
     
@@ -473,12 +464,8 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         OUT_DIR : os.path.dirname(pargs.out),
         BED_FILES : bed_files,
         BIM_FILES : bim_files,
-        FAM_FILES : [pargs.fam]*len(bfiles) if pargs.fam else [f"{bfile}{FAM_SUFFIX}"
-                                                               for bfile in bfiles],
+        FAM_FILES : fam_files,
         REL_FILE : pargs.rel_pedigree,
-        REL_INFO_FILE : pargs.rel_grma[0] if pargs.rel_grma else None,
-        SE_INFO_FILE : pargs.rel_grma[1] if pargs.rel_grma else None,
-        REL_ONLY : getattr(pargs, "rel_only", False),
         PHENO_FILE : pargs.pheno,
         COVAR_FILE : pargs.covar,
         REL_DEG : pargs.rel_thresh,
@@ -531,33 +518,21 @@ def main_func(argv: List[str]):
         logging.info("Performing additional validation of inputs.")
         iargs = validate_inputs(parsed_args, user_args)
 
-        # If only the relatedness processing step is required, do that, pickle the results, and exit
-        if iargs[REL_ONLY]:
-            rel_info, _, se_info = lib.convert_king_output_to_rel_info(
-                king_output=iargs[REL_FILE],
-                fam_filename=iargs[FAM_FILES][0], # TODO(jonbjala): Will there ever be a use case where multiple (different) fam files are needed?
-                rel_degree=iargs[REL_DEG],
-                sample_indices_to_keep=iargs[ID_LIST])
-
-            grma_filename = f"{iargs[OUT_PREFIX]}_grma.pkl"
-            se_filename = f"{iargs[OUT_PREFIX]}_se.npz"
-
-            logging.info(f"Writing relatedness results ({grma_filename}, {se_filename}) to disk.")
-            with open(grma_filename, 'wb') as f:
-                pickle.dump(rel_info, f)
-            sp.save_npz(se_filename, se_info)        
-            return
-
 
         # Run the GRMA pipeline
         logging.info("Calling main GRMA function")
         for bed_file, bim_file, fam_file in zip(iargs[BED_FILES], iargs[BIM_FILES], iargs[FAM_FILES]):
             results = lib.grma(
-                rel_input=iargs[REL_FILE], rel_info_file=iargs[REL_INFO_FILE],
-                bed_file=bed_file, bim_file=bim_file,
-                fam_file=fam_file, pheno_file=iargs[PHENO_FILE], covar_file=iargs[COVAR_FILE],
-                rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK],
-                id_list=iargs[ID_LIST], snp_list=iargs[SNP_LIST]
+                rel_file=iargs[REL_FILE],
+                bed_file=bed_file,
+                bim_file=bim_file,
+                fam_file=fam_file,
+                rel_degree=iargs[REL_DEG],
+                pheno_file=iargs[PHENO_FILE],
+                covar_file=iargs[COVAR_FILE],
+                snps_per_block=iargs[SNPS_PER_BLOCK],
+                id_list=iargs[ID_LIST],
+                snp_list=iargs[SNP_LIST]
             )
 
             # Write out the results to disk per chromosome
