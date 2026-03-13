@@ -3,6 +3,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 
 main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(main_directory)
@@ -26,7 +27,7 @@ def mock_create_rel_info(king_df: pd.DataFrame, rel_thresh: str):
     # Find the closest relationship levels for everyone
     lowest_rel = [5] * N
     for index, row in king_df.iterrows():
-        cur_rel = grma_lib.INF_TO_DEG_MAP[row[grma_lib.KING_REL_COL]]
+        cur_rel = grma_lib.INFTYPE_TO_DEG_MAP[row[grma_lib.KING_REL_COL]]
         id1 = row[grma_lib.KING_IID1_COL]
         id2 = row[grma_lib.KING_IID2_COL]
 
@@ -40,7 +41,7 @@ def mock_create_rel_info(king_df: pd.DataFrame, rel_thresh: str):
     rel_info = [[i] for i in range(N)]
     se_rel = np.identity(N, dtype=np.int8)
     for index, row in king_df.iterrows():
-        cur_rel = grma_lib.INF_TO_DEG_MAP[row[grma_lib.KING_REL_COL]]
+        cur_rel = grma_lib.INFTYPE_TO_DEG_MAP[row[grma_lib.KING_REL_COL]]
         id1 = row[grma_lib.KING_IID1_COL]
         id2 = row[grma_lib.KING_IID2_COL]
 
@@ -107,11 +108,16 @@ def mock_demean(rel_input: list, arr: np.ndarray):
     return result
 
 
+def mock_calc_xtx(G: np.ndarray):
+    XtX = np.sum(np.square(G), axis=1)
+    XtX[XtX == 0.0] = np.finfo(XtX.dtype).eps
+    return XtX
+
+
 def mock_run_regressions(demeaned_G: np.ndarray, demeaned_P: np.ndarray):
     M, N = demeaned_G.shape
 
-    XtX = np.sum(np.square(demeaned_G), axis=1)
-
+    XtX = mock_calc_xtx(demeaned_G)
 
     betas = np.zeros(M)
     for snp in range(M):
@@ -125,19 +131,22 @@ def mock_calc_ses(demeaned_G: np.ndarray, P: np.ndarray, R: np.ndarray, se_rel: 
 
     ses = np.zeros(M, dtype=float)
 
+    omega = se_rel * np.outer(P, P)
+
     for snp in range(M):
         X = demeaned_G[snp].T
-        XXinv = np.reciprocal(np.dot(X, X))
-
-        #snp_residuals = residuals[snp].reshape((N, 1))
-
-        omega = P.reshape((N, 1)).T * se_rel * P.reshape((N, 1))  #snp_residuals.T * se_rel * snp_residuals
+        XtX = np.dot(X, X)
+        if XtX == 0.0:
+            XtX = np.finfo(XtX.dtype).eps
+        XXinv = np.reciprocal(XtX)
 
         RtX = R.T @ X
 
         central_value = RtX.T @ omega @ RtX
 
         ses[snp] = XXinv * np.sqrt(central_value)
+
+    ses[ses == 0.0] = np.finfo(ses.dtype).eps
 
     return ses
 
