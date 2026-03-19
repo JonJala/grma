@@ -3,7 +3,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 import bedbimfam as bbf
-import grma_lib_new as lib
+import grma_lib as lib
 
 
 NUM_SNPS = 5
@@ -22,6 +22,10 @@ BIM_DF = pd.DataFrame(
 SNP_LIST = None
 
 SNP_FILTER = None
+
+SAMPLE_LIST = None
+
+SAMPLE_FILTER = None
 
 FAM_DF = pd.DataFrame(
     {
@@ -267,37 +271,6 @@ R_MATRICES = {
     lib.DEG_4TH : sp.csr_array(DEG_4TH_R)
 }
 
-
-BASE_SE_MATRIX = sp.csr_array(np.array(
-    [
-        [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-        [0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-        [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
-        [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-        [0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
-        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0],
-        [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
-        [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-        [0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
-        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0],
-        [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
-        [0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-        [0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
-        [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0],
-        [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]
-    ],
-    dtype=float
-))
-
-
-OMEGA = BASE_SE_MATRIX * np.outer(FAM_DF[bbf.FAM_PHENO_COL].to_numpy(),
-                                  FAM_DF[bbf.FAM_PHENO_COL].to_numpy())
-
-
-SE_MATRICES = {deg : sp.csr_array(R_MATRICES[deg] @ OMEGA @ R_MATRICES[deg].T)
-               for deg in R_MATRICES.keys()
-}
 
 
 BETAS = {

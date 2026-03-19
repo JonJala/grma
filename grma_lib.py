@@ -13,6 +13,7 @@ from typing import Tuple, Union #Any, Callable, Dict, List, Tuple, Union
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 from scipy.stats import norm
 
 from bedbimfam import (
@@ -115,6 +116,10 @@ MAX_KINSHIP_THRESH = 0.0625
 # Default number of SNPs to process at a time
 DEFAULT_SNPS_PER_BLOCK = 100
 
+# Default values in omega shrinking procedure
+DEFAULT_OMEGA_EPSILON = 1e-10
+DEFAULT_EIGSH_TOL = 1e-8
+
 
 # Output columns
 OUTPUT_BETA_COL = 'BETA'
@@ -151,67 +156,12 @@ def get_df(filename: Union[str, pd.DataFrame], df_name: str, read_csv_params: di
 
     return df, mi
 
-# # -------------------------
-# def process_phenotypes_alt(fam_file: Union[str, pd.DataFrame], *,
-#                        pheno_file: Union[str, pd.DataFrame],
-#                        sample_id_file: Union[str, pd.DataFrame],
-#                        covar_file: Union[str, pd.DataFrame]
-#     ) -> Tuple[int, int, np.ndarray, pd.DataFrame, np.ndarray]:
-
-#     # Preserve initial order and indexing (to align with bed file), then trim to minimal columns
-#     fam_df[FAM_INDEX] = fam_df.index.to_numpy()
-#     fam_df = fam_df[[*FAM_KEY, FAM_INDEX, FAM_PHENO_COL]]
-#     logging.info(f"There are {len(fam_df)} samples in fam file")
-
-#     sample_df, _ = get_df(sample_id_file, "sample_id_file", {"usecols" : (0,1), "names" : FAM_KEY})
-#     pheno_df, _ = get_df(pheno_file, "pheno_file", {"names" : FAM_KEY + [FAM_PHENO_COL]})
-#     covar_df, _ = get_df(covar_file, "covar_file")
-
-
-#     if sample_id_file:
-#         logging.info(f"There are {len(sample_df)} samples in sample ID file")
-#         fam_df = fam_df.merge(sample_df[FAM_KEY], on=FAM_KEY, how="inner", sort=False)
-
-#     if pheno_file:
-#         temp_pheno_col_name = f"{FAM_PHENO_COL}_pheno_df"
-#         logging.info(f"There are {len(pheno_df)} samples in phenotype file")
-#         fam_df = fam_df.merge(pheno_df[[*FAM_KEY, FAM_PHENO_COL]].rename(
-#                                   columns={FAM_PHENO_COL : temp_pheno_col_name}),
-#                               on=FAM_KEY, how="inner", sort=False)
-
-#     if covar_file:
-#         n_covars = covar_df.shape[1] - 2 # Since there should be two initial columns, FID and IID
-#         if n_covars < 1:
-#             raise ValueError(f"Covariates file {covar_file} should contain at least 3 columns")
-#         if covar_df.iloc[:, 2:].isna().values.any():
-#             num_orig_covar_rows = len(covar_df)
-#             covar_df = covar_df[covar_df.iloc[:, 2:].notna().all(axis=1)]
-#             num_nan_rows = num_orig_covar_rows - len(covar_df)
-#             logging.warning(f"Covariates file {covar_file} contains NaN values.  "
-#                             f"Dropped {num_nan_rows} samples.")
-
-#         covar_df.columns = FAM_KEY + [f"COVAR_{i+1}" for i in range(n_covars)]
-
-#         logging.info(f"There are {len(covar_df)} non-NaN samples in the covariates file")
-#         fam_df = fam_df.merge(covar_df[FAM_KEY], on=FAM_KEY, how="inner", sort=False)
-
-#     if any([sample_id_file, pheno_file, covar_file]):
-#         logging.info(f"\nThere are {len(fam_df)} samples in the intersection")
-
-
-
-#     if pheno_file:
-#         fam_df[FAM_PHENO_COL] = fam_df[temp_pheno_col_name]
-
-#     return (N_orig, N, fam_df[FAM_INDEX].to_numpy(), fam_df[FAM_KEY].reset_index(drop=True),
-#             phenotypes)
-
 
 # TODO(jonbjala) Check various files for duplicates?
 def process_phenotypes(fam_file: Union[str, pd.DataFrame], *,
-                       pheno_file: Union[str, pd.DataFrame],
-                       sample_id_file: Union[str, pd.DataFrame],
-                       covar_file: Union[str, pd.DataFrame]
+                       pheno_file: Union[str, pd.DataFrame]=None,
+                       sample_id_file: Union[str, pd.DataFrame]=None,
+                       covar_file: Union[str, pd.DataFrame]=None
     ) -> Tuple[int, int, np.ndarray, pd.DataFrame, np.ndarray]:
     
 
@@ -227,7 +177,7 @@ def process_phenotypes(fam_file: Union[str, pd.DataFrame], *,
     # Read in id_list file (if specified) and find intersection of sample IDs
     sample_df, sample_mi = get_df(sample_id_file, "sample_id_file",
                                   {"usecols" : (0,1), "names" : FAM_KEY}, FAM_KEY)
-    if sample_id_file:
+    if sample_id_file is not None:
         total_intersection = total_intersection.intersection(sample_mi)
         logging.info(f"There are {len(sample_mi)} samples in {sample_id_file}")
 
@@ -235,17 +185,17 @@ def process_phenotypes(fam_file: Union[str, pd.DataFrame], *,
     # Read in phenotype file (if specified) and find intersection of sample IDs
     pheno_df, pheno_mi = get_df(pheno_file, "pheno_file",
                                 {"names":[FAM_FID_COL, FAM_IID_COL, FAM_PHENO_COL]}, FAM_KEY)
-    if pheno_file:
+    if pheno_file is not None:
         total_intersection = total_intersection.intersection(pheno_mi)
         logging.info(f"There are {len(pheno_mi)} samples in {pheno_file}")
 
 
     # Read in covariates file (if specified) and find intersection of sample IDs
     covar_df, _ = get_df(covar_file, "covar_file")
-    if covar_file:
+    if covar_file is not None:
         n_covars = covar_df.shape[1] - 2 # Since there should be two initial columns, FID and IID
         if n_covars < 1:
-            raise ValueError(f"Covariates file {covar_file} should contain at least 3 columns")
+            raise ValueError(f"Covariates file should contain at least 3 columns")
         if covar_df.iloc[:, 2:].isna().values.any():
             num_orig_covar_rows = len(covar_df)
             covar_df = covar_df[covar_df.iloc[:, 2:].notna().all(axis=1)]
@@ -261,7 +211,7 @@ def process_phenotypes(fam_file: Union[str, pd.DataFrame], *,
 
 
     # Restrict down to the intersection of available samples
-    if any([sample_id_file, pheno_file, covar_file]):
+    if any([sample_id_file is not None, pheno_file is not None, covar_file is not None]):
         logging.info(f"\nThere are {len(total_intersection)} samples in the intersection")
         if len(total_intersection) < N_orig:
             logging.info(f"Restricting to these samples")
@@ -269,7 +219,7 @@ def process_phenotypes(fam_file: Union[str, pd.DataFrame], *,
             fam_mi = total_intersection
 
     # Reassign the phenotype values to the ones from the phenotype file (override fam values)
-    if pheno_file:
+    if pheno_file is not None:
         pheno_s = pheno_df.set_index(FAM_KEY)[FAM_PHENO_COL]
         fam_df[FAM_PHENO_COL] = pheno_s.reindex(fam_df.index).to_numpy()
 
@@ -282,7 +232,7 @@ def process_phenotypes(fam_file: Union[str, pd.DataFrame], *,
     fam_mi = fam_df.index
 
     # Residualize phenotypes on covariates
-    if covar_file:
+    if covar_file is not None:
         covar_df = covar_df.set_index(FAM_KEY, drop=False).reindex(fam_mi)
         covar_df["Intercept"] = 1.0
 
@@ -304,6 +254,63 @@ def process_phenotypes(fam_file: Union[str, pd.DataFrame], *,
 
 
 # -------------------------
+def get_lambda_min(B: np.ndarray, tol=DEFAULT_EIGSH_TOL) -> float:
+
+    N = B.shape[0]
+
+    for ncv_factor_exp in range(5):
+        ncv = min(N, 20 * 2 ** (ncv_factor_exp + 1))
+
+        try:
+            eigenvalues, _ = spla.eigsh(B, k=1, which='SA', tol=tol, ncv=ncv)
+            return eigenvalues[0]
+        except spla.ArpackNoConvergence:
+            continue
+
+    raise RuntimeError("Eigsh failed to converge.  Not possible to compute omega.")
+
+
+def get_rel_covariances(rel_df: pd.DataFrame,
+                        unresidualized_phenotypes: np.ndarray) -> dict[int, float]:
+    rel_to_cov = {rel_deg : 
+        np.cov(unresidualized_phenotypes[np.concatenate([df_view[FAM_INDEX_1].to_numpy(np.int64),
+                                                         df_view[FAM_INDEX_2].to_numpy(np.int64)])],
+               unresidualized_phenotypes[np.concatenate([df_view[FAM_INDEX_2].to_numpy(np.int64),
+                                                         df_view[FAM_INDEX_1].to_numpy(np.int64)])],
+               ddof=0)[0, 1] if len(df_view) > 0 else np.nan
+                  for rel_deg in range(SE_RELATEDNESS+1)
+                  for df_view in [rel_df[rel_df[KING_REL_COL] == rel_deg]]}
+
+    return rel_to_cov
+
+
+def calculate_omega(rel_df: pd.DataFrame, N: int, unresidualized_phenotypes: np.ndarray,
+                    epsilon=DEFAULT_OMEGA_EPSILON) -> sp.csr_array:
+
+    rel_to_cov = get_rel_covariances(rel_df=rel_df,
+                                     unresidualized_phenotypes=unresidualized_phenotypes)
+
+
+    i1 = rel_df[FAM_INDEX_1].to_numpy(np.int64)
+    i2 = rel_df[FAM_INDEX_2].to_numpy(np.int64)
+    rel = rel_df[KING_REL_COL]
+
+    rows = np.concatenate([i1, i2])
+    cols = np.concatenate([i2, i1])
+    data = np.tile(rel.map(rel_to_cov).to_numpy(), 2)
+
+    off_diag = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
+
+    lambda_min = get_lambda_min(off_diag)
+
+    pheno_variance = np.var(unresidualized_phenotypes)
+    alpha = min((epsilon - pheno_variance) / lambda_min, 1.0)
+
+    omega = pheno_variance * sp.eye(N) + alpha * off_diag
+
+    return omega
+
+
 def process_relatedness(
     rel_file: Union[str, pd.DataFrame],
     fam_df: pd.DataFrame,
@@ -343,14 +350,7 @@ def process_relatedness(
     rel_df = rel_df[rel_df[KING_REL_COL] <= SE_RELATEDNESS]
 
     # Create omega matrix
-    i1 = rel_df[FAM_INDEX_1].to_numpy(np.int64)
-    i2 = rel_df[FAM_INDEX_2].to_numpy(np.int64)
-
-    rows = np.concatenate([i1, i2, np.arange(N, dtype=np.int64)])
-    cols = np.concatenate([i2, i1, np.arange(N, dtype=np.int64)])
-    data = unresidualized_phenotypes[rows] * unresidualized_phenotypes[cols]
-
-    omega = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
+    omega = calculate_omega(rel_df=rel_df, N=N, unresidualized_phenotypes=unresidualized_phenotypes)
 
     # Create R matrix
     rel_df = rel_df[rel_df[KING_REL_COL] <= rel_degree]
@@ -382,11 +382,12 @@ def process_relatedness(
     del omega
     se_matrix = se_matrix @ R.T
 
+
     return R, se_matrix, phenotypes
 
 
 # -------------------------
-# TODO(jonbjala) This might need to be more complicated and return a SNP breakdown plan
+# TODO(jonbjala) This might need to be more complicated, return a SNP breakdown plan (for LD scores)
 def process_bim_file(bim_file: Union[str, pd.DataFrame], snp_list: Union[str, pd.DataFrame]
     ) -> Tuple[int, int, np.ndarray]:
 
@@ -403,14 +404,6 @@ def process_bim_file(bim_file: Union[str, pd.DataFrame], snp_list: Union[str, pd
         positions = bim_index.get_indexer(snp_df[BIM_RSID_COL])
         missing_mask = (positions == -1)
         num_missing = int(missing_mask.sum())
-        print(f"JJ: snp_df=\n{snp_df}\nbim_df=\n{bim_df}\npositions=\n{positions}\nmissing_mask=\n{missing_mask}\nnum_missing={num_missing}")
-        
-        # if num_missing > 0:
-        #     snp_list_name = snp_list if isinstance(snp_list, str) else "snp list"
-        #     bim_file_name = bim_file if isinstance(bim_file, str) else "bim file"
-        #     logging.warning(f"There are {num_missing} values specified in {snp_list_name} that are "
-        #                     f"not in {bim_file}.")
-        #     logging.debug(f"The SNPs are: [{snp_df[BIM_RSID_COL][missing_mask].to_list()}]")
 
         return M_orig, len(snp_df) - num_missing, np.sort(positions[~missing_mask])
 
@@ -521,8 +514,6 @@ def process_genotypes(bed_file: Union[str, np.ndarray], M_orig: int, N_orig: int
 
         # Calculate betas, squared sum of genotypes, and SEs for this block of SNPs
         block_betas, block_XtX = calculate_betas(genotypes=block_genotypes, phenotypes=phenotypes)
-        print(block_XtX.flags['OWNDATA'])       # False means it's a view
-        print(np.shares_memory(block_XtX, XtX)) # True means aliased with outer XtX
         block_ses = calculate_ses(genotypes=block_genotypes, se_matrix=se_matrix, XtX=block_XtX)
 
         # Record the values and increment the current result position

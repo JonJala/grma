@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from bedbimfam import (BED_SUFFIX, BIM_SUFFIX, FAM_SUFFIX)
-import grma_lib_new as lib
+import grma_lib as lib
 
 
 # Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to
@@ -164,7 +164,7 @@ def rel_thresh_type(s_input: str) -> Union[str, float]:
     stripped_thresh = s_input.strip().upper()
 
     if stripped_thresh in REL_DEG_INPUTS:
-        return stripped_thresh
+        return REL_TO_DEG_MAP[stripped_thresh]
 
 
     # Kinship value currently not supported.  TODO(jonbjala) Implement that in GRMA lib and then

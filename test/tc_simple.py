@@ -3,7 +3,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 import bedbimfam as bbf
-import grma_lib_new as lib
+import grma_lib as lib
 
 
 BIM_DF = pd.DataFrame(
@@ -20,6 +20,10 @@ BIM_DF = pd.DataFrame(
 
 SNP_LIST = pd.DataFrame({bbf.BIM_RSID_COL : ['rs1', 'rs3', 'rs4']})
 SNP_FILTER = np.array([0, 2, 3])
+
+SAMPLE_LIST = None
+
+SAMPLE_FILTER = None
 
 FAM_DF = pd.DataFrame(
     {
@@ -79,35 +83,13 @@ DEG_4TH_R = DEG_3RD_R.copy(); DEG_4TH_R[5] = np.array([-0.5, 0.0, 0.0, 0.0, 0.0,
 
 
 R_MATRICES = {
-    lib.DEG_FULLSIB : DEG_FS_R,
-    lib.DEG_PARENT_OFFSPRING : DEG_PO_R,
-    lib.DEG_2ND : DEG_2ND_R,
-    lib.DEG_3RD : DEG_3RD_R,
-    lib.DEG_4TH : DEG_4TH_R
+    lib.DEG_FULLSIB : sp.csr_array(DEG_FS_R),
+    lib.DEG_PARENT_OFFSPRING : sp.csr_array(DEG_PO_R),
+    lib.DEG_2ND : sp.csr_array(DEG_2ND_R),
+    lib.DEG_3RD : sp.csr_array(DEG_3RD_R),
+    lib.DEG_4TH : sp.csr_array(DEG_4TH_R)
 }
 
-
-BASE_SE_MATRIX = np.array(
-    [
-        [1, 1, 1, 1, 1, 0, 0],
-        [1, 1, 0, 0, 0, 0, 0],
-        [1, 0, 1, 0, 0, 0, 0],
-        [1, 0, 0, 1, 0, 0, 0],
-        [1, 0, 0, 0, 1, 0, 0],
-        [0, 0, 0, 0, 0, 1, 0],
-        [0, 0, 0, 0, 0, 0, 1]
-    ],
-    dtype=float
-)
-
-
-OMEGA = BASE_SE_MATRIX * np.outer(FAM_DF[bbf.FAM_PHENO_COL].to_numpy(),
-                                  FAM_DF[bbf.FAM_PHENO_COL].to_numpy())
-
-
-SE_MATRICES = {deg : sp.csr_array(R_MATRICES[deg] @ OMEGA @ R_MATRICES[deg].T)
-               for deg in R_MATRICES.keys()
-}
 
 DEMEANED_P = {deg : r_matrix @ FAM_DF[bbf.FAM_PHENO_COL].to_numpy() for deg, r_matrix in R_MATRICES.items()}
 DEMEANED_G = {deg : np.nan_to_num(G @ r_matrix.T) for deg, r_matrix in R_MATRICES.items()}

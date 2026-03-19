@@ -4,11 +4,13 @@ import sys
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 
 main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(main_directory)
 import grma
 import grma_lib
+import bedbimfam as bbf
 
 '''
 This contains a straightforward, unscalable version of GRMA to use to test against in small enough
@@ -66,24 +68,96 @@ def mock_create_rel_info(king_df: pd.DataFrame, rel_thresh: str):
 
 
 
-def mock_calc_duplicates(rel_input: list):
-    N = len(rel_input)
-    dups = [False] * N
+def mock_shrink_offdiag(matrix: sp.csr_array, weight: float = 0.75):
 
-    for cur_rownum, cur_row in enumerate(rel_input):
-        maybe_dup = all(rel_input[i] == cur_row for i in cur_row)
-        if not maybe_dup:
-            continue
+    lam_min = spla.eigsh(matrix, k=1, which="SA", return_eigenvectors=False)[0]
+    if lam_min > 0.0:
+        return matrix
 
-        false_alarm = any(i in row for i in cur_row
-                                   for row_num, row in enumerate(rel_input)
-                                       if row_num not in cur_row)
-        if false_alarm:
-            continue
 
-        dups[cur_rownum] = True
+    D = sp.diags(matrix.diagonal())
+    off_diag = matrix.copy()
+    off_diag.setdiag(0)
+    off_diag.eliminate_zeros()
 
-    return np.array(dups)
+    alpha_min = 0.0
+    alpha_max = 1.0
+
+    num_iterations = 35
+    for iter_num in range(num_iterations):
+        alpha = weight * alpha_max + (1.0 - weight) * alpha_min
+
+        result = D + alpha * off_diag
+        lam_min = spla.eigsh(result, k=1, which="SA", return_eigenvectors=False)[0]
+        if lam_min > 0:
+            alpha_min = alpha
+        else:
+            alpha_max = alpha
+
+    print(f"TEST: {alpha=}")
+
+    lam_min = spla.eigsh(result, k=1, which="SA", return_eigenvectors=False)[0]
+    if lam_min < 0:
+        result = D + alpha_min * off_diag
+
+
+    return result
+
+
+def mock_calc_omega(fam_df: pd.DataFrame, N: int, rel_df: pd.DataFrame,
+                    unresidualized_phenotypes: np.ndarray):
+
+    FAM_INDEX1_COL = "Fam Index 1"
+    FAM_INDEX2_COL = "Fam Index 2"
+
+    master_df = rel_df.copy()
+
+
+    fam_idx = pd.MultiIndex.from_frame(fam_df[[bbf.FAM_FID_COL, bbf.FAM_IID_COL]])
+
+    master_df[FAM_INDEX1_COL] = fam_idx.get_indexer(
+        pd.MultiIndex.from_arrays([rel_df[grma_lib.KING_FID1_COL], rel_df[grma_lib.KING_IID1_COL]])
+    )
+    master_df[FAM_INDEX2_COL] = fam_idx.get_indexer(
+        pd.MultiIndex.from_arrays([rel_df[grma_lib.KING_FID2_COL], rel_df[grma_lib.KING_IID2_COL]])
+    )
+
+    master_df[grma_lib.KING_REL_COL] = master_df[grma_lib.KING_REL_COL].map(grma_lib.INFTYPE_TO_DEG_MAP)
+
+    master_df = master_df[[FAM_INDEX1_COL, FAM_INDEX2_COL, grma_lib.KING_REL_COL]]
+    master_df = master_df[master_df[grma_lib.KING_REL_COL] <= grma_lib.SE_RELATEDNESS]
+
+
+    rel_to_cov_dict = dict()
+    for rel_deg in range(grma_lib.SE_RELATEDNESS + 1):
+        temp_df = master_df[master_df[grma_lib.KING_REL_COL] == rel_deg]
+
+        ind1 = np.concatenate([temp_df[FAM_INDEX1_COL].to_numpy(int), temp_df[FAM_INDEX2_COL].to_numpy(int)])
+        ind2 = np.concatenate([temp_df[FAM_INDEX2_COL].to_numpy(int), temp_df[FAM_INDEX1_COL].to_numpy(int)])
+
+        covar = np.cov(unresidualized_phenotypes[ind1], unresidualized_phenotypes[ind2], ddof=0)[0, 1] \
+            if len(temp_df) > 0 else np.nan
+
+        rel_to_cov_dict[rel_deg] = covar
+
+
+    master_df["COV"] = master_df[grma_lib.KING_REL_COL].map(rel_to_cov_dict)
+
+    variance = np.var(unresidualized_phenotypes)
+
+    rows = np.concatenate([master_df[FAM_INDEX1_COL].to_numpy(int), master_df[FAM_INDEX2_COL].to_numpy(int), np.arange(N)])
+    cols = np.concatenate([master_df[FAM_INDEX2_COL].to_numpy(int), master_df[FAM_INDEX1_COL].to_numpy(int), np.arange(N)])
+    data = np.concatenate([master_df["COV"].to_numpy(), master_df["COV"].to_numpy(), variance * np.ones(N)])
+
+    omega = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
+    shrunk_omega = mock_shrink_offdiag(omega)
+
+    print(f"TEST: unshrunk omega=\n{omega.toarray()}")
+    print(f"TEST: shrunk omega=\n{shrunk_omega.toarray()}")
+
+    return shrunk_omega
+
+
 
 
 def mock_construct_R(rel_input: list):
@@ -126,12 +200,11 @@ def mock_run_regressions(demeaned_G: np.ndarray, demeaned_P: np.ndarray):
     return betas
 
 
-def mock_calc_ses(demeaned_G: np.ndarray, P: np.ndarray, R: np.ndarray, se_rel: np.ndarray):
+def mock_calc_ses(demeaned_G: np.ndarray, se_matrix: np.ndarray):
     M, N = demeaned_G.shape
 
     ses = np.zeros(M, dtype=float)
 
-    omega = se_rel * np.outer(P, P)
 
     for snp in range(M):
         X = demeaned_G[snp].T
@@ -140,9 +213,7 @@ def mock_calc_ses(demeaned_G: np.ndarray, P: np.ndarray, R: np.ndarray, se_rel: 
             XtX = np.finfo(XtX.dtype).eps
         XXinv = np.reciprocal(XtX)
 
-        RtX = R.T @ X
-
-        central_value = RtX.T @ omega @ RtX
+        central_value = X.T @ se_matrix @ X
 
         ses[snp] = XXinv * np.sqrt(central_value)
 

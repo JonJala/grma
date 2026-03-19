@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import pandas as pd
 import scipy.sparse as sp
+from scipy import stats
 
 main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 test_directory = os.path.abspath(os.path.join(main_directory, "test"))
@@ -24,10 +25,12 @@ import grma_lib as sut
 import helper
 import tcs
 
+
 ##############
 
-# rng = np.random.default_rng(seed=0)
+np.seterr(all='print')
 
+##############
 
 
 def make_bim(bim_filename: str, M: int):
@@ -61,6 +64,20 @@ def make_fam(fam_filename: str, N: int, pheno: np.ndarray=None):
     bbf.write_fam_file(fam_filename=fam_filename, fid=fids, iid=iids, pheno=pheno.ravel())
 
 
+
+def make_fam_df(N: int):
+    return pd.DataFrame(
+        {
+            bbf.FAM_FID_COL : [2*i for i in range(N)],
+            bbf.FAM_IID_COL : [i for i in range(N)],
+            bbf.FAM_IIDF_COL : 0,
+            bbf.FAM_IIDM_COL : 0,
+            bbf.FAM_SEX_COL : 0,
+            bbf.FAM_PHENO_COL : [float((i+1) * -1 ** i) for i in range(N)]
+        }
+    )
+
+
 make_bed=bbf.write_bed_file
 
 
@@ -69,34 +86,167 @@ make_bed=bbf.write_bed_file
 class TestProcessPhenotypes:
 
     def test__simple_fam_file__return_unchanged(self):
-        pass
+        N = 100
 
-    def test__fam_file_with_nans__nan_rows_dropped(self):
-        pass
+        fam_df = make_fam_df(N)
 
-    def test__sample_id_file__expected_filtering(self):
-        pass
+        actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
+            sut.process_phenotypes(fam_file=fam_df)
 
-    def test__pheno_file__expected_pheno_values(self):
-        pass
+        assert actual_N == actual_N_orig
+        assert actual_N == N
+        assert np.array_equal(actual_indices, np.arange(N))
+        assert fam_df[sut.FAM_KEY].equals(actual_id_df)
+        assert np.allclose(actual_pheno, fam_df[bbf.FAM_PHENO_COL].to_numpy())
+
+
+    @pytest.mark.parametrize("rng_seed", [90, 456])
+    def test__randomized_phenos__expected_results(self, rng_seed):
+        rng = np.random.default_rng(seed=rng_seed)
+
+        N = 100 + rng.integers(1, 100)
+
+        fam_df = make_fam_df(N)
+        phenotypes = 10.0 * rng.random(N) + 1.0
+        fam_df[bbf.FAM_PHENO_COL] = phenotypes
+
+        actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
+            sut.process_phenotypes(fam_file=fam_df)
+
+        assert actual_N_orig == N
+        assert actual_N == N
+        assert np.array_equal(actual_indices, np.arange(N))
+        assert fam_df[sut.FAM_KEY].equals(actual_id_df)
+        assert np.allclose(actual_pheno, phenotypes)
+
+
+    @pytest.mark.parametrize("rng_seed", [37, 268])
+    def test__fam_file_with_nans__nan_rows_dropped(self, rng_seed):
+        rng = np.random.default_rng(seed=rng_seed)
+
+        N = 100 + rng.integers(1, 100)
+
+        num_nan = rng.integers(1, N // 10 + 1)
+        nan_indices = rng.choice(N, size=num_nan, replace=False)
+
+        fam_df = make_fam_df(N)
+        fam_df.loc[nan_indices, bbf.FAM_PHENO_COL] = np.nan
+
+        expected_dropped = fam_df.iloc[nan_indices]
+
+        actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
+            sut.process_phenotypes(fam_file=fam_df)
+
+        assert actual_N_orig == N
+        assert actual_N == N - num_nan
+        assert not expected_dropped[bbf.FAM_FID_COL].isin(actual_id_df[bbf.FAM_FID_COL]).any()
+        assert not expected_dropped[bbf.FAM_IID_COL].isin(actual_id_df[bbf.FAM_IID_COL]).any()
+        assert not expected_dropped[bbf.FAM_PHENO_COL].isin(actual_pheno).any()
+
+
+    @pytest.mark.parametrize("rng_seed", [6, 8923])
+    def test__sample_id_file__expected_filtering(self, rng_seed):
+        rng = np.random.default_rng(seed=rng_seed)
+
+        N = 100 + rng.integers(1, 100)
+
+        num_samples = rng.integers(N // 10 + 1, 9 * (N // 10))
+        sample_indices = rng.choice(N, size=num_samples, replace=False)
+
+        fam_df = make_fam_df(N)
+        sample_df = fam_df[[bbf.FAM_FID_COL, bbf.FAM_IID_COL]].iloc[sample_indices].copy()
+
+
+        actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
+            sut.process_phenotypes(fam_file=fam_df, sample_id_file=sample_df)
+
+        assert actual_N_orig == N
+        assert actual_N == num_samples
+        assert sample_df[bbf.FAM_FID_COL].isin(actual_id_df[bbf.FAM_FID_COL]).all()
+        assert sample_df[bbf.FAM_IID_COL].isin(actual_id_df[bbf.FAM_IID_COL]).all()
+        # TODO(jonbjala) Check phenotype values?
+        assert len(actual_id_df) == num_samples
+
+
+    @pytest.mark.parametrize("rng_seed", [16, 18923])
+    def test__pheno_file__expected_pheno_values(self, rng_seed):
+        rng = np.random.default_rng(seed=rng_seed)
+
+        N = 100 + rng.integers(1, 100)
+
+        num_phenos = rng.integers(N // 10 + 1, 9 * (N // 10))
+        pheno_indices = rng.choice(N, size=num_phenos, replace=False)
+
+        fam_df = make_fam_df(N)
+        phenotypes = 10.0 * rng.random(num_phenos) + 1.0
+        pheno_df = fam_df[[bbf.FAM_FID_COL, bbf.FAM_IID_COL, bbf.FAM_PHENO_COL]].iloc[pheno_indices].copy()
+
+        pheno_df[bbf.FAM_PHENO_COL] = phenotypes
+
+        actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
+            sut.process_phenotypes(fam_file=fam_df, pheno_file=pheno_df)
+
+        assert actual_N_orig == N
+        assert actual_N == num_phenos
+        assert np.allclose(actual_pheno, pheno_df[bbf.FAM_PHENO_COL].sort_index().to_numpy())
+        assert pheno_df[bbf.FAM_FID_COL].isin(actual_id_df[bbf.FAM_FID_COL]).all()
+        assert pheno_df[bbf.FAM_IID_COL].isin(actual_id_df[bbf.FAM_IID_COL]).all()
+        assert len(actual_id_df) == num_phenos
+
 
     def test__covar_file__expected_residualization(self):
         pass
 
+
     def test__covar_file_with_nans__nan_rows_dropped(self):
         pass
 
+
+
     def test__invalid_covar_file__expected_error(self):
-        pass
+        N = 100
+
+        invalid_covar_df = pd.DataFrame(data={bbf.FAM_FID_COL : list(range(N)),
+                                              bbf.FAM_IID_COL : list(range(N))})
+
+        fam_df = make_fam_df(N)
+
+        with pytest.raises(ValueError) as ex_info:
+            actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
+                sut.process_phenotypes(fam_file=fam_df, covar_file=invalid_covar_df)
 
     def test__all_inputs__expected_results(self):
         pass
 
-    def test__permute_pheno_file_rows__permuted_results(self):
+    @pytest.mark.parametrize("rng_seed", [316, 765765])
+    def test__permute_fam_file_rows__permuted_results(self, rng_seed):
         pass
 
-    def test__permute_pheno_file_rows__unchanged_results(self):
-        pass
+    @pytest.mark.parametrize("rng_seed", [25, 908])
+    def test__permute_pheno_file_rows__unchanged_results(self, rng_seed):
+        rng = np.random.default_rng(seed=rng_seed)
+
+        N = 100 + rng.integers(1, 100)
+
+        fam_df = make_fam_df(N)
+        phenotypes = 10.0 * rng.random(N) + 1.0
+        pheno_df_1 = fam_df[[bbf.FAM_FID_COL, bbf.FAM_IID_COL, bbf.FAM_PHENO_COL]].copy()
+        pheno_df_1[bbf.FAM_PHENO_COL] = phenotypes
+
+        actual_N_orig_1, actual_N_1, actual_indices_1, actual_id_df_1, actual_pheno_1 = \
+            sut.process_phenotypes(fam_file=fam_df, pheno_file=pheno_df_1)
+
+        pheno_df_2 = pheno_df_1.sample(frac=1, random_state=rng).reset_index(drop=True).copy()
+
+        actual_N_orig_2, actual_N_2, actual_indices_2, actual_id_df_2, actual_pheno_2 = \
+            sut.process_phenotypes(fam_file=fam_df, pheno_file=pheno_df_2)
+
+        assert actual_N_orig_1 == actual_N_orig_2
+        assert actual_N_1 == actual_N_2
+        assert np.array_equal(actual_indices_1, actual_indices_2)
+        assert actual_id_df_1.equals(actual_id_df_2)
+        assert np.allclose(actual_pheno_1, actual_pheno_2)
+
 
     def test__permute_covar_file_rows__unchanged_results(self):
         pass
@@ -104,18 +254,47 @@ class TestProcessPhenotypes:
     def test__permute_covar_file_cols__unchanged_results(self):
         pass
 
-    def test__permute_sample_file_rows__unchanged_results(self):
-        pass
+    @pytest.mark.parametrize("rng_seed", [125, 1908])
+    def test__permute_sample_file_rows__unchanged_results(self, rng_seed):
+        rng = np.random.default_rng(seed=rng_seed)
+
+        N = 100 + rng.integers(1, 100)
+
+        fam_df = make_fam_df(N)
+        sample_df_1 = fam_df[[bbf.FAM_FID_COL, bbf.FAM_IID_COL]].copy()
+
+        actual_N_orig_1, actual_N_1, actual_indices_1, actual_id_df_1, actual_pheno_1 = \
+            sut.process_phenotypes(fam_file=fam_df, sample_id_file=sample_df_1)
+
+        sample_df_2 = sample_df_1.sample(frac=1, random_state=rng).reset_index(drop=True).copy()
+
+        actual_N_orig_2, actual_N_2, actual_indices_2, actual_id_df_2, actual_pheno_2 = \
+            sut.process_phenotypes(fam_file=fam_df, sample_id_file=sample_df_2)
+
+        assert actual_N_orig_1 == actual_N_orig_2
+        assert actual_N_1 == actual_N_2
+        assert np.array_equal(actual_indices_1, actual_indices_2)
+        assert actual_id_df_1.equals(actual_id_df_2)
+        assert np.allclose(actual_pheno_1, actual_pheno_2)
 
     def test__zero__intersection__expected_results(self):
         pass
+
+class TestCalculateOmega:
+
+    def test__already_PSD__no_change(self):
+        pass
+
+    def test__not_PDS__shrink_as_expected(self):
+        pass
+
 
 
 
 class TestProcessRelatedness:
 
     @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
-    @pytest.mark.parametrize("tc_key", [tcs.KEY_SIMPLE, tcs.KEY_2FAM, tcs.KEY_VARIED])
+    @pytest.mark.parametrize("tc_key", [tcs.KEY_SIMPLE, tcs.KEY_2FAM, tcs.KEY_VARIED, tcs.KEY_PT])
     def test__precanned_tcs__expected_results(self, rel_degree, tc_key):
         rel_df, fam_df = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
         N = len(fam_df)
@@ -124,7 +303,10 @@ class TestProcessRelatedness:
 
         unres_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy()
 
-        expected_se_matrix = tcs.SE_MATRICES[tc_key][rel_degree]
+
+        expected_omega = helper.mock_calc_omega(fam_df=fam_df, N=N, rel_df=rel_df,
+                                                unresidualized_phenotypes=unres_pheno)
+        expected_se_matrix = expected_R @ expected_omega @ expected_R.T
 
         expected_res_pheno = tcs.DEMEANED_P[tc_key][rel_degree]
 
@@ -133,7 +315,8 @@ class TestProcessRelatedness:
             sut.process_relatedness(rel_file=rel_df, fam_df=fam_df, rel_degree=rel_degree,
                                     unresidualized_phenotypes=unres_pheno)
 
-        assert np.allclose(expected_R, actual_R.toarray(), atol=0.001)
+
+        assert np.allclose(expected_R.toarray(), actual_R.toarray(), atol=0.001)
         assert np.allclose(expected_res_pheno, actual_res_pheno, atol=0.001)
         assert np.allclose(expected_se_matrix.toarray(), actual_se_matrix.toarray(), atol=0.001)
 
@@ -150,8 +333,9 @@ class TestProcessRelatedness:
         expected_R = tcs.R_MATRICES[tc_key][rel_degree]
 
         unres_pheno = 10.0 * rng.random(N)
-        expected_omega = tcs.BASE_SE_MATRICES[tc_key] * np.outer(unres_pheno, unres_pheno)
-        expected_se_matrix = expected_R @ expected_omega @ expected_R.T
+        expected_omega = helper.mock_calc_omega(fam_df=fam_df, N=N, rel_df=rel_df,
+                                                unresidualized_phenotypes=unres_pheno)
+        expected_se_matrix = expected_se_matrix = expected_R @ expected_omega @ expected_R.T
         
         expected_res_pheno = expected_R @ unres_pheno
 
@@ -160,9 +344,9 @@ class TestProcessRelatedness:
             sut.process_relatedness(rel_file=rel_df, fam_df=fam_df, rel_degree=rel_degree,
                                     unresidualized_phenotypes=unres_pheno)
 
-        assert np.allclose(expected_R, actual_R.toarray(), atol=0.001)
+        assert np.allclose(expected_R.toarray(), actual_R.toarray(), atol=0.001)
         assert np.allclose(expected_res_pheno, actual_res_pheno, atol=0.001)
-        assert np.allclose(expected_se_matrix, actual_se_matrix.toarray(), atol=0.001)
+        assert np.allclose(expected_se_matrix.toarray(), actual_se_matrix.toarray(), atol=0.001)
 
 
     @pytest.mark.parametrize("rng_seed", [1, 34])
@@ -305,7 +489,6 @@ class TestProcessBimFile:
         expected_M_orig = len(bim_df)
         expected_snp_filter = tcs.SNP_FILTERS[tc_key]
         expected_M = len(expected_snp_filter) if expected_snp_filter is not None else expected_M_orig
-        print(f"JJ: expected_M={expected_M}")
 
         actual_M_orig, actual_M, actual_snp_filter = sut.process_bim_file(
             bim_file=bim_df, snp_list=tcs.SNP_LISTS[tc_key])
@@ -360,10 +543,26 @@ class TestProcessBimFile:
 class TestGetResidualizedGenotypeData:
 
     # TODO(jonbjala)  Test some with an actual bed file?
-
+    @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
     @pytest.mark.parametrize("tc_key", [tcs.KEY_SIMPLE, tcs.KEY_2FAM, tcs.KEY_VARIED])
-    def test__precanned_tcs__expected_results(self, tc_key):
-        pass
+    def test__precanned_tcs__expected_results(self, tc_key, rel_degree):
+        
+        snp_filter = tcs.SNP_FILTERS[tc_key]
+        sample_filter = tcs.SAMPLE_FILTERS[tc_key]
+        expected_resid_G = tcs.DEMEANED_G[tc_key][rel_degree][snp_filter] if snp_filter is not None\
+            else tcs.DEMEANED_G[tc_key][rel_degree]
+        expected_resid_G = expected_resid_G[:, sample_filter] if sample_filter is not None \
+            else expected_resid_G
+
+        orig_G = tcs.G[tc_key]
+
+        actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=orig_G,
+            M_orig=orig_G.shape[0], N_orig=orig_G.shape[1], snp_filter=snp_filter,
+            sample_filter=sample_filter, R=tcs.R_MATRICES[tc_key][rel_degree],
+            M_start=0, num_snps=orig_G.shape[1])
+
+        assert actual_resid_G.shape == expected_resid_G.shape
+        assert np.allclose(actual_resid_G, expected_resid_G)
 
 
     @pytest.mark.parametrize("rng_seed", [2, 34])
@@ -648,21 +847,24 @@ class TestCalculateSEs:
     @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
     @pytest.mark.parametrize("tc_key", tcs.KEYS)
     def test__precanned_tcs__expected_results(self, tc_key, rel_degree):
-        se_matrix = tcs.SE_MATRICES[tc_key][rel_degree]
-        demeaned_G, fam_df, R, base_se_matrix, se_matrix = tcs.DEMEANED_G[tc_key][rel_degree], \
-                                                           tcs.FAM_DFS[tc_key], \
-                                                           tcs.R_MATRICES[tc_key][rel_degree], \
-                                                           tcs.BASE_SE_MATRICES[tc_key], \
-                                                           tcs.SE_MATRICES[tc_key][rel_degree]
 
-        test_ses = helper.mock_calc_ses(demeaned_G=demeaned_G,
-                                        P=fam_df[bbf.FAM_PHENO_COL].to_numpy(),
-                                        R=R, se_rel=base_se_matrix)
-        expected_ses = tcs.SES[tc_key][rel_degree] if (tcs.SES[tc_key] is not None and
-                                                       tcs.SES[tc_key][rel_degree] is not None) \
-                       else test_ses
+        demeaned_G, fam_df, R, rel_df = tcs.DEMEANED_G[tc_key][rel_degree], \
+                                        tcs.FAM_DFS[tc_key], \
+                                        tcs.R_MATRICES[tc_key][rel_degree], \
+                                        tcs.REL_DFS[tc_key]
 
-        actual_ses = sut.calculate_ses(genotypes=demeaned_G, se_matrix=se_matrix,
+        unres_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy()
+
+        expected_omega = helper.mock_calc_omega(fam_df=fam_df, N=len(fam_df), rel_df=rel_df,
+                                                unresidualized_phenotypes=unres_pheno)
+
+        expected_se_matrix = R @ expected_omega @ R.T
+                                                           
+
+        expected_ses = helper.mock_calc_ses(demeaned_G=demeaned_G,
+                                            se_matrix=expected_se_matrix)
+
+        actual_ses = sut.calculate_ses(genotypes=demeaned_G, se_matrix=expected_se_matrix,
                                        XtX=helper.mock_calc_xtx(demeaned_G))
 
         assert np.allclose(expected_ses, actual_ses, equal_nan=True, atol=0.001)
@@ -676,15 +878,10 @@ class TestCalculateSEs:
         N = 100
 
         G = 2.0 * rng.random(size=(M, N)) - 1.0
-        pheno = 4.0 * rng.random(size=N) - 2.0  # unresidualized
 
-        R = rng.random(size=(N, N))
-        base_se_matrix = rng.random(size=(N, N))
-        omega = base_se_matrix * np.outer(pheno, pheno)
-        
-        se_matrix = R @ omega @ R.T
+        se_matrix = rng.random(size=(N, N))
 
-        expected_ses = helper.mock_calc_ses(demeaned_G=G, P=pheno, R=R, se_rel=base_se_matrix)
+        expected_ses = helper.mock_calc_ses(demeaned_G=G, se_matrix=se_matrix)
 
         actual_ses = sut.calculate_ses(genotypes=G, se_matrix=se_matrix,
                                        XtX=helper.mock_calc_xtx(G))
@@ -701,45 +898,17 @@ class TestCalculateSEs:
         G = 2.0 * rng.random(size=(M, N)) - 1.0
         row = rng.integers(0, M)
         G[row] = 0.0
-        pheno = 4.0 * rng.random(size=N) - 2.0
 
-        R = rng.random(size=(N, N))
-        base_se_matrix = rng.random(size=(N, N))
-        omega = base_se_matrix * np.outer(pheno, pheno)
-        
-        se_matrix = R @ omega @ R.T
+        se_matrix = rng.random(size=(N, N))
 
-        expected_ses = helper.mock_calc_ses(demeaned_G=G, P=pheno, R=R, se_rel=base_se_matrix)
+        expected_ses = helper.mock_calc_ses(demeaned_G=G, se_matrix=se_matrix)
 
         actual_ses = sut.calculate_ses(genotypes=G, se_matrix=se_matrix,
                                        XtX=helper.mock_calc_xtx(G))
 
         assert np.allclose(expected_ses, actual_ses, equal_nan=True, atol=0.0001)
 
-
-    # @pytest.mark.parametrize("rng_seed", [290, 8989])
-    # def test__include_0_se_results__expected_results(self, rng_seed):
-    #     rng = np.random.default_rng(seed=rng_seed)
-    #     M = 20
-    #     N = 100
-
-    #     G = 2.0 * rng.random(size=(M, N)) - 1.0
-    #     pheno = np.zeros(N, dtype=float)
-
-    #     R = rng.random(size=(N, N))
-    #     base_se_matrix = rng.random(size=(N, N))
-    #     omega = base_se_matrix * np.outer(pheno, pheno)
-        
-    #     se_matrix = R @ omega @ R.T
-
-    #     expected_ses = helper.mock_calc_ses(demeaned_G=G, P=pheno, R=R, se_rel=base_se_matrix)
-
-    #     actual_ses = sut.calculate_ses(genotypes=G, se_matrix=se_matrix,
-    #                                    XtX=helper.mock_calc_xtx(G))
-
-    #     assert np.allclose(expected_ses, actual_ses, equal_nan=True, atol=0.0001)
-    #     assert not (actual_ses == 0.0).any()
-
+    # TODO(jonbjala) Add more tests?
 
 class TestProcessGenotypes:
 
@@ -764,14 +933,67 @@ class TestProcessGenotypes:
 
 class TestCalculatePVals:
 
-    def test__simple_inputs__expected_results(self):
-        pass
+    @pytest.mark.parametrize("betas, ses, expected_p", [
+        (np.array([1.96, 2.576]), np.array([1.0, 1.0]), np.array([0.05, 0.01])),
+        (np.array([1.0, 1.0]), np.array([1.0/1.96, 1.0/2.576]), np.array([0.05, 0.01])),
+        (np.array([1.96, 2.576]), np.array([-1.0, -1.0]), np.array([0.05, 0.01]))
+    ])
+    def test__precanned_tcs__expected_results(self, betas, ses, expected_p):
+        actual_p = sut.calculate_pvals(betas=betas, ses=ses)
+
+        assert np.allclose(actual_p.astype(float), expected_p, atol=0.00001)
+
+
+    @pytest.mark.parametrize("rng_seed", [54, 87])
+    def test__simple_inputs__expected_results(self, rng_seed):
+        rng = np.random.default_rng(seed=rng_seed)
+
+        N = 100
+
+        betas = 2.0 * rng.random(N) - 1.0
+        ses = 2.0 * rng.random(N) + 10.0
+
+        expected_p = 2.0 * (1.0 - stats.norm.cdf(np.abs(betas / ses)))
+
+        actual_p = sut.calculate_pvals(betas=betas, ses=ses)
+
+        assert np.allclose(actual_p.astype(float), expected_p)
+
+
+    @pytest.mark.parametrize("rng_seed", [316, 9999])
+    def test__negative_z__same_results(self, rng_seed):
+        rng = np.random.default_rng(seed=rng_seed)
+
+        N = 100
+
+        betas = 2.0 * rng.random(N) - 1.0
+        ses = 2.0 * rng.random(N) + 10.0
+        mask = rng.choice([True, False], size=N)
+
+        first_p = sut.calculate_pvals(betas=betas, ses=ses)
+
+        betas[mask] = -betas[mask]
+        second_p = sut.calculate_pvals(betas=betas, ses=ses)
+
+        assert np.all(first_p == second_p)
+
 
     def test__include_very_small_p__expected_results(self):
-        pass
+        betas = np.array([39.0, -39.0])
+        ses = np.array([1.0, 1.0])
+
+        actual_p = sut.calculate_pvals(betas=betas, ses=ses)
+
+        assert np.all(np.char.find(actual_p, "-332") >= 0)
+
 
     def test__include_p_equals_1__expected_results(self):
-        pass
+        betas = np.array([0.0, 0.0, 0.0])
+        ses = np.array([1.0, -1.0, 93478.0])
+
+        actual_p = sut.calculate_pvals(betas=betas, ses=ses)
+
+        assert np.all(actual_p == "1.0e0")
 
 
 class TestCreateOutput:
