@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Python tool for TODO
+Python tool for genetic association analyses
 """
 
 import argparse as argp
@@ -10,11 +10,9 @@ import glob
 from io import StringIO
 import logging
 import os
-import re
 import sys
 import time
 from typing import Any, Callable, Dict, List, Set, Tuple, Union
-import glob
 
 import numpy as np
 import pandas as pd
@@ -76,9 +74,6 @@ BED_FILES = "Bed files"
 BIM_FILES = "Bim files"
 FAM_FILES = "Fam files"
 REL_FILE = "Relatedness File"
-REL_INFO_FILE = "Rel info File"
-REL_ONLY = "Rel processing only"
-SE_INFO_FILE = "SE info NPZ File"
 PHENO_FILE = "Phenotype File"
 COVAR_FILE = "Covariate File"
 REL_DEG = "Relatedness Degree"
@@ -145,20 +140,20 @@ def output_prefix(s_input: str) -> str:
                            f"an existing file or directory")
 
     s_dir = os.path.dirname(stripped_p)
-    if not os.path.exists(s_dir):
+    if s_dir != "" and not os.path.exists(s_dir):
         raise ValueError(f"The designated output directory [{s_dir}] does not exist.")
 
     return stripped_p
 
 #################################
-def rel_thresh_type(s_input: str) -> Union[str, float]:
+def rel_thresh_type(s_input: str) -> int:
     """
     Used for parsing some inputs to this program, namely relatedness thresholds.
     Whitespace is removed, but no case-changing occurs.
 
     :param s_input: String passed in by argparse
 
-    :return float: The relatedness threshold
+    :return int: The relatedness degree threshold
     """
 
     stripped_thresh = s_input.strip().upper()
@@ -166,31 +161,7 @@ def rel_thresh_type(s_input: str) -> Union[str, float]:
     if stripped_thresh in REL_DEG_INPUTS:
         return REL_TO_DEG_MAP[stripped_thresh]
 
-
-    # Kinship value currently not supported.  TODO(jonbjala) Implement that in GRMA lib and then
-    # remove this exception
-    raise ValueError("Specifying kinship value for relatedness threshold not supported yet.")
-
-    float_thresh = float(stripped_thresh)
-    if not (lib.MIN_KINSHIP_THRESH <= float_thresh <= lib.MAX_KINSHIP_THRESH):
-        raise ValueError(f"Expected threshold value of {REL_DEG_INPUTS} or "
-                         f"float between {lib.MIN_KINSHIP_THRESH} and {lib.MAX_KINSHIP_THRESH}")
-
-    return float_thresh
-
-
-#################################
-def to_flag(arg_str: str) -> str:
-    """
-    Utility method to convert from the name of an argparse Namespace attribute / variable
-    (which often is adopted elsewhere in this code, as well) to the corresponding flag
-
-    :param arg_str: Name of the arg
-
-    :return: The name of the flag (sans "--")
-    """
-
-    return arg_str.replace("_", "-")
+    raise ValueError(f"Invalid input ({stripped_thresh}) for relatedness threshold.")
 
 
 def to_arg(flag_str: str) -> str:
@@ -233,7 +204,7 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
     :return: argparse ArgumentParser
     """
 
-    # Create the initally blank parser
+    # Create the initially blank parser
     parser = argp.ArgumentParser(prog=progname)
 
 
@@ -412,7 +383,7 @@ def setup_func(argv: List[str], get_parser: ParserFunc,
     # Set up the logger
     log_file = parsed_args.out + ".log"
     if parsed_args.quiet:
-        log_level = logging.WARN
+        log_level = logging.WARNING
     elif parsed_args.verbose:
         log_level = logging.DEBUG
     else:
@@ -457,6 +428,9 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     if missing_files:
         raise FileNotFoundError(f"Missing the following files: {missing_files}")
 
+    if len(fam_files) == 1:
+        fam_files = fam_files * len(bed_files)
+
     # Prepare dictionary that will hold internal values for this program
     logging.debug("Constructing dictionary of values from flags passed in.")
     internal_values = {
@@ -485,7 +459,7 @@ def write_results_to_file(filename: str, results: pd.DataFrame):
 
     results.to_csv(filename, index = False, header=True, sep='\t')
     logging.info(f"Time taken to write results is {time.time() - res_start_time}")
-    return results
+
     
 
 

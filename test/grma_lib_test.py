@@ -73,7 +73,7 @@ def make_fam_df(N: int):
             bbf.FAM_IIDF_COL : 0,
             bbf.FAM_IIDM_COL : 0,
             bbf.FAM_SEX_COL : 0,
-            bbf.FAM_PHENO_COL : [float((i+1) * -1 ** i) for i in range(N)]
+            bbf.FAM_PHENO_COL : [float((i+1) * (-1) ** i) for i in range(N)]
         }
     )
 
@@ -141,7 +141,7 @@ class TestProcessPhenotypes:
         assert actual_N == N - num_nan
         assert not expected_dropped[bbf.FAM_FID_COL].isin(actual_id_df[bbf.FAM_FID_COL]).any()
         assert not expected_dropped[bbf.FAM_IID_COL].isin(actual_id_df[bbf.FAM_IID_COL]).any()
-        assert not expected_dropped[bbf.FAM_PHENO_COL].isin(actual_pheno).any()
+        assert not np.any(np.isnan(actual_pheno))
 
 
     @pytest.mark.parametrize("rng_seed", [6, 8923])
@@ -164,7 +164,8 @@ class TestProcessPhenotypes:
         assert actual_N == num_samples
         assert sample_df[bbf.FAM_FID_COL].isin(actual_id_df[bbf.FAM_FID_COL]).all()
         assert sample_df[bbf.FAM_IID_COL].isin(actual_id_df[bbf.FAM_IID_COL]).all()
-        # TODO(jonbjala) Check phenotype values?
+        assert set(zip(actual_id_df[bbf.FAM_FID_COL], actual_id_df[bbf.FAM_IID_COL])) == \
+               set(zip(sample_df[bbf.FAM_FID_COL], sample_df[bbf.FAM_IID_COL]))
         assert len(actual_id_df) == num_samples
 
 
@@ -194,13 +195,34 @@ class TestProcessPhenotypes:
         assert len(actual_id_df) == num_phenos
 
 
-    def test__covar_file__expected_residualization(self):
-        pass
+    @pytest.mark.parametrize("rng_seed", [215, 887])
+    def test__covar_file__expected_residualization(self, rng_seed):
+        rng = np.random.default_rng(seed=rng_seed)
+
+        N = 100
+        num_covariates = rng.integers(4,10)
+        covar_names = [f"COVAR_{covar_num+1}" for covar_num in range(num_covariates)]
+
+        fam_df = make_fam_df(N)
+        orig_phenotypes = fam_df[bbf.FAM_PHENO_COL].to_numpy().copy()
+        covariates = np.hstack([(10.0 * rng.random(size=(N, num_covariates)) - 5.0), np.ones((N,1))])
+        covar_df = pd.DataFrame({bbf.FAM_FID_COL : fam_df[bbf.FAM_FID_COL],
+                                 bbf.FAM_IID_COL : fam_df[bbf.FAM_IID_COL]} |
+                                {covar_names[i] : covariates[:, i].ravel()
+                                    for i in range(num_covariates)
+                                })
+
+        x, _, _, _ = np.linalg.lstsq(a = covariates, b = orig_phenotypes, rcond = None)
+        expected_pheno = orig_phenotypes - covariates @ x
+
+        actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
+            sut.process_phenotypes(fam_file=fam_df, covar_file=covar_df)
+
+        assert np.allclose(actual_pheno, expected_pheno, equal_nan=True)
 
 
     def test__covar_file_with_nans__nan_rows_dropped(self):
         pass
-
 
 
     def test__invalid_covar_file__expected_error(self):
@@ -248,11 +270,64 @@ class TestProcessPhenotypes:
         assert np.allclose(actual_pheno_1, actual_pheno_2)
 
 
-    def test__permute_covar_file_rows__unchanged_results(self):
-        pass
+    @pytest.mark.parametrize("rng_seed", [382, 99903])
+    def test__permute_covar_file_rows__unchanged_results(self, rng_seed):
+        rng = np.random.default_rng(seed=rng_seed)
 
-    def test__permute_covar_file_cols__unchanged_results(self):
-        pass
+        N = 100
+        fam_df = make_fam_df(N)
+
+        covar_df_1 = pd.DataFrame({bbf.FAM_FID_COL : fam_df[bbf.FAM_FID_COL],
+                                 bbf.FAM_IID_COL : fam_df[bbf.FAM_IID_COL],
+                                 'COVAR_1' : 10.0 * rng.random(N),
+                                 'COVAR_2' : -7.0 * rng.random(N)})
+
+        covar_df_2 = covar_df_1.sample(frac=1, random_state=rng).reset_index(drop=True).copy()
+
+        N_orig_1, N_1, ind_1, fam_cols_1, pheno_1 = \
+            sut.process_phenotypes(fam_file=fam_df, covar_file=covar_df_1)
+
+
+        N_orig_2, N_2, ind_2, fam_cols_2, pheno_2 = \
+            sut.process_phenotypes(fam_file=fam_df, covar_file=covar_df_2)
+
+        assert N_orig_1 == N_orig_2
+        assert N_1 == N_2
+        assert np.array_equal(ind_1, ind_2)
+        assert fam_cols_1.equals(fam_cols_2)
+        assert np.allclose(pheno_1, pheno_2)
+
+
+    @pytest.mark.parametrize("rng_seed", [17, 85])
+    def test__permute_covar_file_cols__unchanged_results(self, rng_seed):
+        rng = np.random.default_rng(seed=rng_seed)
+
+        N = 100
+        fam_df = make_fam_df(N)
+
+        covar_df_1 = pd.DataFrame({bbf.FAM_FID_COL : fam_df[bbf.FAM_FID_COL],
+                                 bbf.FAM_IID_COL : fam_df[bbf.FAM_IID_COL],
+                                 'COVAR_1' : 10.0 * rng.random(N),
+                                 'COVAR_2' : -7.0 * rng.random(N),
+                                 'COVAR_3' : 4.5 * rng.random(N)})
+
+        covar_df_2 = covar_df_1[[bbf.FAM_FID_COL, bbf.FAM_IID_COL,
+                                 'COVAR_2', 'COVAR_3', 'COVAR_1']].copy()
+
+        N_orig_1, N_1, ind_1, fam_cols_1, pheno_1 = \
+            sut.process_phenotypes(fam_file=fam_df, covar_file=covar_df_1)
+        
+
+        N_orig_2, N_2, ind_2, fam_cols_2, pheno_2 = \
+            sut.process_phenotypes(fam_file=fam_df, covar_file=covar_df_2)
+
+        assert N_orig_1 == N_orig_2
+        assert N_1 == N_2
+        assert np.array_equal(ind_1, ind_2)
+        assert fam_cols_1.equals(fam_cols_2)
+        assert np.allclose(pheno_1, pheno_2)
+
+
 
     @pytest.mark.parametrize("rng_seed", [125, 1908])
     def test__permute_sample_file_rows__unchanged_results(self, rng_seed):
@@ -277,16 +352,80 @@ class TestProcessPhenotypes:
         assert actual_id_df_1.equals(actual_id_df_2)
         assert np.allclose(actual_pheno_1, actual_pheno_2)
 
-    def test__zero__intersection__expected_results(self):
+    def test__zero__intersection__expected_error(self):
         pass
 
 class TestCalculateOmega:
 
     def test__already_PSD__no_change(self):
-        pass
+        # 1 pair (0,1) at degree 1; pheno chosen so pheno_variance >> |pair_cov|.
+        # For a single pair, pair_cov = -1.0 exactly (analytically), while pheno_var = 24.4.
+        # Since lambda_min(off_diag) = -1.0 > -24.4 = -pheno_var, the full
+        # omega = pheno_var*I + off_diag is already PSD, so alpha = 1.0 (no shrinkage).
+        N = 5
+        pheno = np.array([1.0, -1.0, 10.0, 10.0, 10.0])
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: [0],
+            sut.FAM_INDEX_2: [1],
+            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING],
+        })
 
-    def test__not_PDS__shrink_as_expected(self):
-        pass
+        actual_omega = sut.calculate_omega(rel_df=rel_df, N=N, unresidualized_phenotypes=pheno)
+
+        # Expected: pheno_var * I + 1.0 * off_diag  (alpha = 1.0, no shrinkage applied)
+        pheno_var = np.var(pheno)
+        pair_cov = np.cov(pheno[[0, 1]], pheno[[1, 0]], ddof=0)[0, 1]  # = -1.0
+        expected_off_diag = sp.coo_array(
+            (np.array([pair_cov, pair_cov]), ([0, 1], [1, 0])), shape=(N, N)
+        ).tocsr()
+        expected_omega = pheno_var * sp.eye(N) + expected_off_diag
+
+        assert np.allclose(actual_omega.toarray(), expected_omega.toarray())
+
+    def test__not_PSD__shrink_as_expected(self):
+        # 1 pair (0,1) at degree 1; pheno chosen so pheno_variance < |pair_cov|.
+        # For a single pair, pair_cov = -1.0 exactly, while pheno_var approx = 0.40.
+        # Since lambda_min(off_diag) = -1.0 < -0.40 = -pheno_var, the full
+        # omega = pheno_var*I + off_diag is NOT PSD, so shrinkage is applied (alpha < 1.0).
+        # Cross-validates the closed-form shrinkage formula against the mock binary search.
+        N = 5
+        pheno = np.array([1.0, -1.0, 0.1, 0.1, 0.1])
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: [0],
+            sut.FAM_INDEX_2: [1],
+            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING],
+        })
+
+        # Build KING-format data for mock cross-validation
+        fam_df = pd.DataFrame({
+            bbf.FAM_FID_COL: list(range(N)),
+            bbf.FAM_IID_COL: list(range(N)),
+            bbf.FAM_IIDF_COL: 0,
+            bbf.FAM_IIDM_COL: 0,
+            bbf.FAM_SEX_COL: 0,
+            bbf.FAM_PHENO_COL: pheno,
+        })
+        king_rel_df = pd.DataFrame({
+            sut.KING_FID1_COL: [0],
+            sut.KING_IID1_COL: [0],
+            sut.KING_FID2_COL: [1],
+            sut.KING_IID2_COL: [1],
+            sut.KING_KINSHIP_COL: [0.0],
+            sut.KING_REL_COL: [sut.INF_PARENT_OFFSPRING],
+        }, columns=sut.NEEDED_KING_COLS)
+
+        actual_omega = sut.calculate_omega(rel_df=rel_df, N=N, unresidualized_phenotypes=pheno)
+
+        # Verify result is PSD
+        actual_eigenvalues = np.linalg.eigvalsh(actual_omega.toarray())
+        assert np.all(actual_eigenvalues >= -1e-8)
+
+        # Cross-validate: closed-form formula (production) vs. binary search (mock).
+        # Both methods should find the same alpha; atol accounts for binary search precision.
+        expected_omega = helper.mock_calc_omega(
+            fam_df=fam_df, N=N, rel_df=king_rel_df, unresidualized_phenotypes=pheno
+        )
+        assert np.allclose(actual_omega.toarray(), expected_omega.toarray(), atol=1e-3)
 
 
 
@@ -335,7 +474,7 @@ class TestProcessRelatedness:
         unres_pheno = 10.0 * rng.random(N)
         expected_omega = helper.mock_calc_omega(fam_df=fam_df, N=N, rel_df=rel_df,
                                                 unresidualized_phenotypes=unres_pheno)
-        expected_se_matrix = expected_se_matrix = expected_R @ expected_omega @ expected_R.T
+        expected_se_matrix = expected_R @ expected_omega @ expected_R.T
         
         expected_res_pheno = expected_R @ unres_pheno
 
@@ -350,7 +489,7 @@ class TestProcessRelatedness:
 
 
     @pytest.mark.parametrize("rng_seed", [1, 34])
-    def test__permute_ref_file__same_results(self, rng_seed):
+    def test__permute_rel_file__same_results(self, rng_seed):
         rng = np.random.default_rng(seed=rng_seed)
         rel_degree = sut.MAX_GRMA_RELATEDNESS
         tc_key = tcs.KEY_VARIED
@@ -412,7 +551,7 @@ class TestProcessRelatedness:
     def test__rearrange_fam_file__rearranged_results(self, rng_seed):
         rng = np.random.default_rng(seed=rng_seed)
         rel_degree = sut.MAX_GRMA_RELATEDNESS
-        tc_key = tcs.KEY_2FAM #tcs.KEY_VARIED
+        tc_key = tcs.KEY_2FAM
 
         rel_df, fam_df_1 = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
 
@@ -476,7 +615,6 @@ class TestProcessRelatedness:
 
 
     def test__fully_randomized__expected_results(self):
-        # TODO(jonbjala) Need to code up mock method to get SE matrix
         pass
 
 
@@ -509,7 +647,7 @@ class TestProcessBimFile:
         snp_mask = rng.choice([True, False], size=M)
 
         expected_M = np.sum(snp_mask)
-        expected_snp_filter = np.where(snp_mask)
+        expected_snp_filter = np.where(snp_mask)[0]
         snp_list = bim_df[[bbf.BIM_RSID_COL]].loc[snp_mask]
 
         actual_M_orig, actual_M, actual_snp_filter = sut.process_bim_file(
@@ -559,7 +697,7 @@ class TestGetResidualizedGenotypeData:
         actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=orig_G,
             M_orig=orig_G.shape[0], N_orig=orig_G.shape[1], snp_filter=snp_filter,
             sample_filter=sample_filter, R=tcs.R_MATRICES[tc_key][rel_degree],
-            M_start=0, num_snps=orig_G.shape[1])
+            M_start=0, num_snps=orig_G.shape[0])
 
         assert actual_resid_G.shape == expected_resid_G.shape
         assert np.allclose(actual_resid_G, expected_resid_G)
@@ -575,7 +713,7 @@ class TestGetResidualizedGenotypeData:
         R = sp.csr_array(np.identity(N))
 
         actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-            M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=0, num_snps=N)
+            M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=0, num_snps=M)
 
 
         assert actual_M == M
@@ -637,7 +775,7 @@ class TestGetResidualizedGenotypeData:
         R = sp.csr_array(rng.random(size=(N, N)))
 
         actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-            M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=0, num_snps=N)
+            M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=0, num_snps=M)
 
 
         assert actual_M == M
@@ -659,7 +797,7 @@ class TestGetResidualizedGenotypeData:
         G[x, y] = np.nan
 
         actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-            M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=0, num_snps=N)
+            M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=0, num_snps=M)
 
         expected_resid_G = np.nan_to_num(G @ R.T)
 
@@ -799,6 +937,8 @@ class TestGetResidualizedGenotypeData:
         with pytest.raises(ValueError) as ex_info:
             actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
                 M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=0, num_snps=0)
+
+        assert "(0)" in str(ex_info.value)
 
 
 class TestCalculateBetas:
@@ -1005,8 +1145,40 @@ class TestCreateOutput:
 
 class TestGRMA:
 
-    def test__simple_inputs__expected_results(self):
-        pass
+    @pytest.mark.parametrize("tc_key", tcs.KEYS)
+    @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
+    def test__precanned_tcs__expected_results(self, tc_key, rel_degree):
+
+        filtered_G = tcs.G[tc_key]
+        filtered_pheno = tcs.FAM_DFS[tc_key][bbf.FAM_PHENO_COL].to_numpy()
+        if tcs.SNP_FILTERS[tc_key] is not None:
+            filtered_G = filtered_G[tcs.SNP_FILTERS[tc_key]]
+        if tcs.SAMPLE_FILTERS[tc_key] is not None:
+            filtered_G = filtered_G[:, tcs.SAMPLE_FILTERS[tc_key]]
+            filtered_pheno = filtered_pheno[tcs.SAMPLE_FILTERS[tc_key]]
+
+        actual_results = sut.grma(
+            rel_file=tcs.REL_DFS[tc_key],
+            bed_file=tcs.G[tc_key],
+            bim_file=tcs.BIM_DFS[tc_key],
+            fam_file=tcs.FAM_DFS[tc_key],
+            rel_degree=rel_degree,
+            id_list=tcs.SAMPLE_LISTS[tc_key],
+            snp_list=tcs.SNP_LISTS[tc_key]
+        )
+
+
+        test_betas, test_ses = helper.mock_grma(
+            rel_df=tcs.REL_DFS[tc_key],
+            fam_df=tcs.FAM_DFS[tc_key],
+            G=filtered_G,
+            pheno=filtered_pheno,
+            rel_deg=rel_degree
+        )
+        expected_betas, expected_ses = test_betas, test_ses
+        assert np.allclose(actual_results[sut.OUTPUT_BETA_COL].to_numpy(), expected_betas, atol=0.001, equal_nan=True)
+        assert np.allclose(actual_results[sut.OUTPUT_SE_COL].to_numpy(), expected_ses, atol=0.001, equal_nan=True)
+        # TODO(jonbjala)  Should test P and Sum_Sq_X at some point
 
 
     def test__add_singletons__same_results(self):
@@ -1022,57 +1194,3 @@ class TestGRMA:
 
 
     # TODO(jonbjala) Definitely need error cases
-
-
-# class TestGRMA_old:
-
-#     #@pytest.mark.parametrize("tc", tcs.TC_DATA)
-#     #@pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
-#     def test__end_to_end__expected_results(self, tmp_path):
-#         tc = tcs.TC_DATA[3]
-#         M,N = tc[tcs.G].shape
-        
-
-#         # Create bed/bim/fam files
-#         bed_filename = os.path.join(tmp_path, "temp.bed")
-#         bim_filename = os.path.join(tmp_path, "temp.bim")
-#         fam_filename = os.path.join(tmp_path, "temp.fam")
-#         make_bed(bed_filename=bed_filename, G=tc[tcs.G])
-#         make_bim(bim_filename=bim_filename, M=M)
-#         make_fam(fam_filename=fam_filename, N=N, pheno=tc[tcs.P])
-
-
-#         for rel_thresh, expected_output in tc[tcs.OUTPUT].items():
-#             # Get rel_info and check against expected if that is specified
-#             rel_info, se_rel = helper.mock_create_rel_info(king_df=tc[tcs.KING_DF],
-#                                                            rel_thresh=rel_thresh)
-
-#             # Get expected results
-#             test_betas, test_ses = helper.mock_grma(rel_input=rel_info, se_rel=se_rel,
-#                                                             G=tc[tcs.G], pheno=tc[tcs.P])
-#             expected_betas, expected_ses = expected_output if expected_output is not None else \
-#                                            (test_betas, test_ses)
-
-#             # Get actual results
-#             result_df = sut.grma(rel_file=tc[tcs.KING_DF],
-#                                  bed_file=bed_filename,
-#                                  bim_file=bim_filename,
-#                                  fam_file=fam_filename,
-#                                  rel_degree=grma.REL_TO_DEG_MAP[rel_thresh])
-
-#             actual_betas = result_df[sut.OUTPUT_BETA_COL].to_numpy()
-#             actual_ses = result_df[sut.OUTPUT_SE_COL].to_numpy()
-
-#             print(f"{expected_betas=}")
-#             print(f"{test_betas=}")
-#             print(f"{actual_betas=}")
-#             print()
-#             print(f"{expected_ses=}")
-#             print(f"{test_ses=}")
-#             print(f"{actual_ses=}")
-
-#             # Compare
-#             assert np.allclose(actual_betas, expected_betas, atol=0.001) if expected_output is not None else \
-#                    np.allclose(actual_betas, expected_betas)
-#             assert np.allclose(actual_ses, expected_ses, atol=0.001) if expected_output is not None else \
-#                    np.allclose(actual_ses, expected_ses)

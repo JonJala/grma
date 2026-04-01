@@ -291,5 +291,5 @@ SES = {
 
 
 
-DEMEANED_P = {deg : r_matrix @ FAM_DF[bbf.FAM_PHENO_COL] for deg, r_matrix in R_MATRICES.items()}
+DEMEANED_P = {deg : r_matrix @ FAM_DF[bbf.FAM_PHENO_COL].to_numpy() for deg, r_matrix in R_MATRICES.items()}
 DEMEANED_G = {deg : np.nan_to_num(G @ r_matrix.T) for deg, r_matrix in R_MATRICES.items()}

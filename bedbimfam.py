@@ -1,8 +1,6 @@
-import collections
 import itertools as it
 import logging
 import math
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -93,16 +91,6 @@ def get_num_snps_from_bim_file(bim_filename: str):
 
     return M
 
-
-# -------------------------
-def get_phenotypes_from_fam_file(fam_filename: str):
-    fam_df = pd.read_csv(fam_filename, sep=r"\s+", usecols=(5,),
-                         names=[FAM_PHENO_COL], index_col=False)
-
-    return fam_df[FAM_PHENO_COL].to_numpy()
-
-
-
 # -------------------------
 # TODO(jonbjala) Allow for float64?
 def read_bed_file(bed_filename: str, N: int, M: int, M_start: int = 0, num_snps: int = -1):
@@ -123,11 +111,11 @@ def read_bed_file(bed_filename: str, N: int, M: int, M_start: int = 0, num_snps:
 
         # Read in the first 3 bytes and check against expected .bed file prefix
         initial_bytes = bed_file.read(3)        
-        if not(initial_bytes[0:2] == _BED_FILE_PREFIX_MAGIC_BYTEARRAY):
-            raise RuntimeError("Error: Initial bytes of bed file [0x%s] are not expected [%s].",
-                initial_bytes[0:2].hex(), _BED_FILE_PREFIX_MAGIC_HEX)
+        if not (initial_bytes[0:2] == _BED_FILE_PREFIX_MAGIC_BYTEARRAY):
+            raise RuntimeError(f"Error: Initial bytes of bed file [0x{initial_bytes[0:2].hex()}] "
+                               f"are not expected [{_BED_FILE_PREFIX_MAGIC_HEX}].")
 
-        if not(initial_bytes[2] == _BED_FILE_PREFIX_SNP_MAJOR_MAGIC_BYTEARRAY[0]):
+        if not (initial_bytes[2] == _BED_FILE_PREFIX_SNP_MAJOR_MAGIC_BYTEARRAY[0]):
             raise RuntimeError("Error: BED file not in SNP major order, third byte = %s" % 
                 hex(initial_bytes[2]))
 
@@ -145,10 +133,7 @@ def read_bed_file(bed_filename: str, N: int, M: int, M_start: int = 0, num_snps:
 
 
         # Convert the raw data into a matrix of floats (potentially with NaNs)
-        for i in range(0, num_snps):
-            start_byte_pos = i * bed_block_size_in_bytes
-            G[i] = read_bed_file._BED_MAP_ARRAY[list(raw_bed_file_contents[
-                start_byte_pos : start_byte_pos + bed_block_size_in_bytes])].ravel()[0:N]
+        G = read_bed_file._BED_MAP_ARRAY[list(raw_bed_file_contents)].reshape((num_snps, -1))[:, 0:N]
 
     return G
 
@@ -196,7 +181,7 @@ def write_bed_file(bed_filename: str, G: np.ndarray):
         bed_file.write(_BED_FILE_PREFIX_MAGIC_BYTEARRAY)
         bed_file.write(_BED_FILE_PREFIX_SNP_MAJOR_MAGIC_BYTEARRAY)
 
-        for snp in range(0, M):
+        for snp in range(M):
             count = 0
             for cluster_start in range(0, N, _BED_SAMPLES_PER_BYTE):
                 map_key = tuple(padded_G[snp, cluster_start:cluster_start+_BED_SAMPLES_PER_BYTE])
@@ -233,7 +218,7 @@ def write_fam_file(fam_filename: str, fid: np.ndarray, iid: np.ndarray, iidf: np
         FAM_SEX_COL : sex if sex is not None else np.zeros(N),
         FAM_PHENO_COL : pheno if pheno is not None else np.zeros(N)
     }
-    fam_df=pd.DataFrame(data=fam_dict, columns=FAM_COLS)
+    fam_df = pd.DataFrame(data=fam_dict, columns=FAM_COLS)
 
     fam_df.to_csv(fam_filename, sep="\t", header=False, index=False)
 
@@ -251,7 +236,7 @@ def write_bim_file(bim_filename: str, chrs: np.ndarray, rsid: np.ndarray, bp: np
         BIM_A1_COL : a1,
         BIM_A2_COL : a2
     }
-    bim_df=pd.DataFrame(data=bim_dict, columns=BIM_COLS)
+    bim_df = pd.DataFrame(data=bim_dict, columns=BIM_COLS)
 
     bim_df.to_csv(bim_filename, sep="\t", header=False, index=False)
 

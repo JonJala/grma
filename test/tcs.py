@@ -58,11 +58,6 @@ GROUPNAME_SUBNAME_DICT = {
     "SES" : "SES"
 }
 
-
-
-BIM_DFS = {key : getattr(mod_name, "BIM_DF", None) for key, mod_name in KEY_MOD_DICT.items()}
-
-
 for groupname, subname in GROUPNAME_SUBNAME_DICT.items():
     globals()[groupname] = {key : getattr(mod_name, subname, None)
                             for key, mod_name in KEY_MOD_DICT.items()}
