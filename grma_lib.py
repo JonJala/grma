@@ -4,11 +4,10 @@
 Library / core code for GRMA method
 """
 
-# TODO(jonbjala) Functions should have header comments to describe parameters, returns, and pre-/post-conditions
-
 import logging
+import textwrap
 import time
-from typing import Tuple, Union #Any, Callable, Dict, List, Tuple, Union
+from typing import Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -34,7 +33,9 @@ from bedbimfam import (
     read_bed_file,
 )
 
-# Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to increase clarity about whether objects are views or copies (https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#)
+# Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to increase clarity
+# about whether objects are views or copies
+# (https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#)
 pd.options.mode.copy_on_write = True
 
 # Calculate constants used in determination of P values
@@ -132,6 +133,25 @@ OUTPUT_SUMSQX_COL = 'SUM_SQ_X'
 def get_df(filename: Union[str, pd.DataFrame], df_name: str, read_csv_params: dict = None,
            mi_key: list = None) -> Tuple[pd.DataFrame, pd.MultiIndex]:
 
+    """Gets DataFrame from file (along with optional MultiIndex)
+
+    Helper function to retrieve data from a file and return it in Pandas Dataframe format.  Uses
+    default settings but allows for overrides and the possibility of creating a returning a 
+    MultiIndex.  Also allows for the possibilty of the Dataframe already being passed in,
+    essentially as a no-op, which is useful for testing or library purposes.
+
+    Args:
+        filename: String path to the file, or the Dataframe itself (already read in)
+        df_name: Name of the Dataframe, only for error / logging purposes
+        read_csv_params: Dictionary for specification / override of read_csv() function parameters
+        mi_key: Optional column names to allow for a MultiIndex to be returned along with the frame
+
+    Returns:
+        A tuple (df, mi) where df is the DataFrame in question and mi is a MultiIndex on the 
+        columns specified by mi_key (or None if no columns were specified)
+
+    """
+
     read_csv_defaults = {
         "sep" : r"\s+",
         "index_col" : False,
@@ -163,68 +183,102 @@ def process_phenotypes(fam_file: Union[str, pd.DataFrame], *,
                        sample_id_file: Union[str, pd.DataFrame]=None,
                        covar_file: Union[str, pd.DataFrame]=None
     ) -> Tuple[int, int, np.ndarray, pd.DataFrame, np.ndarray]:
-    
+    """Performs processing related to raw phenotypes and sample IDs
+
+    Function to read in a fam file along with various optional files that are relevant to this
+    portion of the GRMA processing, including filtering by sample ID, overriding the fam phenotypes,
+    and residualizing the phenotype values on covariates.  There is also checking for missing/NaN
+    values.  No input file should contain any column name headers.
+
+    Args:
+        fam_file: String path to the fam file, or the Dataframe itself (already read in).  This
+            needs to contain the columns specified by Plink.
+            (see https://www.cog-genomics.org/plink/1.9/formats#fam)
+        pheno_file: String path to the pheno file, or the Dataframe itself (already read in).  This
+            needs to contain the columns for a simple, phenotype file as specified by Plink.
+            (see https://www.cog-genomics.org/plink/1.9/input#pheno)
+        sample_id_file: String path to the sample ID file, or the Dataframe itself (already read in)
+            This needs to contain two columns, FID and IID.
+        covar_file: String path to the sample ID file, or the Dataframe itself (already read in).  
+            This needs to contain two columns, FID and IID, along with N other columns (where N > 0)
+            that contain the covariate values to use for residualizing the phenotypes.
+
+    Returns:
+        A tuple (N_orig, N, sample_filter, fam_id_cols, phenotypes) where:
+
+            N_orig is the initial number of samples in the fam file
+            N is the final number of samples after intersecting with any of the
+                optional inputs (pheno file, sample ID file, covariates file) and dropping samples with 
+                NaN/missing values.
+            sample_filter is the list of numerical (values from 0 to N_orig-1) indices to use when
+                filtering, say, the values in the bed file by sample
+            fam_id_cols is what is left of the fam DataFrame after all the sample filtering is 
+                complete and the columns are restricted down to FID and IID
+            phenotypes is array of phenotypes not yet residualized on relatedness
+    """
 
     # Read in fam file and take note of starting number of samples (before any filtering)
-    fam_df, fam_mi = get_df(fam_file, "fam_file", {"names":FAM_COLS}, FAM_KEY)
+    fam_name = fam_file if isinstance(fam_file, str) else "fam file"
+    fam_df, fam_mi = get_df(fam_file, "fam_file", {"names" : FAM_COLS}, FAM_KEY)
     fam_df = fam_df.reset_index(names=FAM_INDEX).set_index(FAM_KEY, drop=False)
     N_orig = len(fam_df)
     total_intersection = fam_mi.copy()
-    logging.info(f"There are {N_orig} samples in {fam_file}")
-    logging.debug(f"There are {len(total_intersection)} samples left in intersection")
-
+    logging.info(f"\tThere are {N_orig} samples in {fam_name}")
+    logging.debug(f"\tThere are {len(total_intersection)} samples left in intersection\n")
 
 
     # Read in id_list file (if specified) and find intersection of sample IDs
     _, sample_mi = get_df(sample_id_file, "sample_id_file",
                           {"usecols" : (0,1), "names" : FAM_KEY}, FAM_KEY)
     if sample_id_file is not None:
+        sample_name = sample_id_file if isinstance(sample_id_file, str) else "sample id file"
         total_intersection = total_intersection.intersection(sample_mi)
-        logging.info(f"There are {len(sample_mi)} samples in {sample_id_file}")
-        logging.debug(f"There are {len(total_intersection)} samples left in intersection")
+        logging.info(f"\tThere are {len(sample_mi)} samples in {sample_name}")
+        logging.debug(f"\tThere are {len(total_intersection)} samples left in intersection\n")
 
 
     # Read in phenotype file (if specified) and find intersection of sample IDs
     pheno_df, pheno_mi = get_df(pheno_file, "pheno_file",
                                 {"names":[FAM_FID_COL, FAM_IID_COL, FAM_PHENO_COL]}, FAM_KEY)
     if pheno_file is not None:
+        pheno_name = pheno_file if isinstance(pheno_file, str) else "phenotype file"
         total_intersection = total_intersection.intersection(pheno_mi)
-        logging.info(f"There are {len(pheno_mi)} samples in {pheno_file}")
-        logging.debug(f"There are {len(total_intersection)} samples left in intersection")
+        logging.info(f"\tThere are {len(pheno_mi)} samples in {pheno_name}")
+        logging.debug(f"\tThere are {len(total_intersection)} samples left in intersection\n")
 
 
     # Read in covariates file (if specified) and find intersection of sample IDs
     covar_df, _ = get_df(covar_file, "covar_file")
     if covar_file is not None:
+        covar_name = covar_file if isinstance(covar_file, str) else "covariates file"
         n_covars = covar_df.shape[1] - 2 # Since there should be two initial columns, FID and IID
         if n_covars < 1:
             raise ValueError(f"Covariates file should contain at least 3 columns")
         if covar_df.iloc[:, 2:].isna().values.any():
             num_orig_covar_rows = len(covar_df)
+            logging.info(f"\tThere are {num_orig_covar_rows} samples in {covar_name}")
             covar_df = covar_df[covar_df.iloc[:, 2:].notna().all(axis=1)]
             num_nan_rows = num_orig_covar_rows - len(covar_df)
-            logging.warning(f"Covariates file {covar_file} contains NaN values.  "
-                            f"Dropped {num_nan_rows} samples.")
+            logging.warning(f"Covariates file contains NaN values.  Dropped {num_nan_rows} samples.\n")
         covar_df.columns = FAM_KEY + [f"COVAR_{i+1}" for i in range(n_covars)]
         covar_mi = pd.MultiIndex.from_frame(covar_df[FAM_KEY])
 
         total_intersection = total_intersection.intersection(covar_mi)
-        logging.info(f"There are {len(covar_mi)} (non-NaN-containing) samples in {covar_file}")
-        logging.debug(f"There are {len(total_intersection)} samples left in intersection")
-
+        logging.info(f"\tThere are {len(covar_mi)} (non-NaN-containing) samples in {covar_name}")
+        logging.debug(f"\tThere are {len(total_intersection)} samples left in intersection\n")
 
 
     # Restrict down to the intersection of available samples
-    if any([sample_id_file is not None, pheno_file is not None, covar_file is not None]):
-        logging.info(f"\nThere are {len(total_intersection)} samples in the intersection")
+    if any(f is not None for f in (sample_id_file, pheno_file, covar_file)):
+        logging.info(f"\tThere are {len(total_intersection)} samples in the intermediate intersection")
         if len(total_intersection) < N_orig:
-            logging.info(f"Restricting to these samples")
+            logging.info(f"\tRestricting to these samples\n")
             fam_df = fam_df.reindex(total_intersection)
             fam_mi = total_intersection
 
     # Reassign the phenotype values to the ones from the phenotype file (override fam values)
     if pheno_file is not None:
-        logging.info(f"Extracting phenotype values from the provided phenotype file")
+        logging.info(f"\tExtracting phenotype values from the provided phenotype file")
         pheno_s = pheno_df.set_index(FAM_KEY)[FAM_PHENO_COL]
         fam_df[FAM_PHENO_COL] = pheno_s.reindex(fam_df.index).to_numpy()
 
@@ -233,12 +287,12 @@ def process_phenotypes(fam_file: Union[str, pd.DataFrame], *,
     fam_df = fam_df.dropna(subset=[FAM_PHENO_COL])
     num_nan = len(total_intersection) - len(fam_df)
     if num_nan > 0:
-        logging.info(f"Dropped {num_nan} samples with missing/NaN phenotype values.")
+        logging.info(f"\tDropped {num_nan} samples with missing/NaN phenotype values.")
     fam_mi = fam_df.index
 
     # Residualize phenotypes on covariates
     if covar_file is not None:
-        logging.info(f"Running regression to residualize phenotypes on covariates")
+        logging.info(f"\tRunning regression to residualize phenotypes on covariates")
         covar_df = covar_df.set_index(FAM_KEY, drop=False).reindex(fam_mi)
         covar_df["Intercept"] = 1.0
 
@@ -253,13 +307,21 @@ def process_phenotypes(fam_file: Union[str, pd.DataFrame], *,
 
     # Grab the phenotype values and the final value for N
     N = len(fam_df)
-    phenotypes = fam_df[FAM_PHENO_COL].copy().to_numpy()
+    phenotypes = fam_df[FAM_PHENO_COL].to_numpy()
 
-    return (N_orig, N, fam_df[FAM_INDEX].to_numpy(), fam_df[FAM_KEY].reset_index(drop=True),
-            phenotypes)
+    # Debug logging
+    sample_ids = fam_df[FAM_KEY].reset_index(drop=True)
+    logging.debug(f"\t{N_orig=} {N=} {len(sample_ids)=}")
+
+    return (N_orig, N, fam_df[FAM_INDEX].to_numpy(), sample_ids, phenotypes)
 
 
 # -------------------------
+def get_rel_report(rel_df: pd.DataFrame) -> str:
+    rel_counts = rel_df[KING_REL_COL].value_counts(sort=False).sort_index().to_dict()
+    return "{" + ", ".join(f"{deg}->{count}" for deg, count in rel_counts.items()) + "}"
+
+
 def get_lambda_min(B: Union[np.ndarray, sp.csr_array], tol=DEFAULT_EIGSH_TOL) -> float:
 
     N = B.shape[0]
@@ -287,7 +349,7 @@ def get_rel_covariances(rel_df: pd.DataFrame,
                   for rel_deg in range(SE_RELATEDNESS+1)
                   for df_view in [rel_df[rel_df[KING_REL_COL] == rel_deg]]}
 
-    logging.debug(f"{rel_to_cov=}")
+    logging.debug(f"\t{rel_to_cov=}\n")
 
     return rel_to_cov
 
@@ -310,63 +372,19 @@ def calculate_omega(rel_df: pd.DataFrame, N: int, unresidualized_phenotypes: np.
     off_diag = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
 
     lambda_min = get_lambda_min(off_diag)
-    logging.debug(f"{lambda_min=}")
+    logging.debug(f"\t{lambda_min=}")
 
     pheno_variance = np.var(unresidualized_phenotypes)
-    logging.debug(f"{pheno_variance=}")
+    logging.debug(f"\t{pheno_variance=}")
     alpha = min((epsilon - pheno_variance) / lambda_min, 1.0) if lambda_min < 0.0 else 1.0
-    logging.debug(f"{alpha=}")
+    logging.debug(f"\t{alpha=}\n")
 
     omega = pheno_variance * sp.eye(N) + alpha * off_diag
 
     return omega
 
 
-def process_relatedness(
-    rel_file: Union[str, pd.DataFrame],
-    fam_df: pd.DataFrame,
-    rel_degree: Union[str, int],
-    unresidualized_phenotypes: np.ndarray
-    ) -> Tuple[sp.csr_array, sp.csr_array, np.ndarray]:
-
-    # Make sure the relatedness threshold is of the correct type
-    if isinstance(rel_degree, str):
-        rel_degree = int(rel_degree)
-    elif not isinstance(rel_degree, int):
-        raise TypeError(f"Expected str or int for parameter rel_degree, but "
-                        f"received {type(rel_degree)}")
-
-    # Read in relatedness file (should be in KING format)
-    rel_df, _ = get_df(rel_file, "rel_file", {"header":0})
-    rel_df = rel_df[NEEDED_KING_COLS]
-    logging.debug(f"Read in {len(rel_df)} rows from relatedness file")
-
-    # Take note of the sample indices for each FID, IID pair to map to bed file and phenotypes
-    N = len(fam_df)
-    fam_mi = pd.MultiIndex.from_frame(fam_df[FAM_KEY])
-    fam_index_vals = fam_df.index.to_numpy()
-
-    pos1 = fam_mi.get_indexer(pd.MultiIndex.from_frame(rel_df[KING_KEY_1]))
-    pos2 = fam_mi.get_indexer(pd.MultiIndex.from_frame(rel_df[KING_KEY_2]))
-    mask = (pos1 != -1) & (pos2 != -1)
-
-    rel_df = rel_df.loc[mask].drop(columns=KING_KEY_1+KING_KEY_2).reset_index(drop=True)
-    rel_df[FAM_INDEX_1] = fam_index_vals[pos1[mask]]
-    rel_df[FAM_INDEX_2] = fam_index_vals[pos2[mask]]
-
-    # Make sure the InfType column is a number rather than a string
-    rel_df[KING_REL_COL] = rel_df[KING_REL_COL].map(INFTYPE_TO_DEG_MAP)
-
-    # Filter out relatedness that's too far away
-    # TODO(jonbjala) This will need to change if we bring back higher degree thresholds
-    rel_df = rel_df[rel_df[KING_REL_COL] <= SE_RELATEDNESS]
-    logging.debug(f"After restricting to SE relatedness threshold, {len(rel_df)} rows remaining in relatedness file")
-
-    # Create omega matrix
-    omega = calculate_omega(rel_df=rel_df, N=N, unresidualized_phenotypes=unresidualized_phenotypes)
-
-    # Create R matrix
-    rel_df = rel_df[rel_df[KING_REL_COL] <= rel_degree]
+def calculate_R(rel_df: pd.DataFrame, N: int) -> sp.csr_array:
     i1 = rel_df[FAM_INDEX_1].to_numpy(np.int64)
     i2 = rel_df[FAM_INDEX_2].to_numpy(np.int64)
     rel_vals = rel_df[KING_REL_COL].to_numpy(np.int8)  # Values should fit in a single byte
@@ -386,6 +404,94 @@ def process_relatedness(
     R *= -np.reciprocal(R.sum(axis=1)).reshape((N,1))
     R += sp.identity(N, dtype=float)
 
+    return R
+
+def process_relatedness(
+    rel_file: Union[str, pd.DataFrame],
+    fam_df: pd.DataFrame,
+    rel_degree: Union[str, int],
+    unresidualized_phenotypes: np.ndarray
+    ) -> Tuple[sp.csr_array, sp.csr_array, np.ndarray]:
+    """Performs processing of the KING-formatted relatedness / pedigree file
+
+    Function to read in the relatedness / pedigree file, filter based on the already-processed
+    fam file / sample IDs and the user-specified relatedness threshold, and generate the 
+    residualization matrix and the the matrix used to calculate standard errors.
+
+    Args:
+        rel_file: String path to the pedigree file, or the Dataframe itself (already read in).
+            (see https://www.kingrelatedness.com/manual.shtml)
+        fam_df: Contains the already-filtered sample IDs (two columns, FID and IID)
+        rel_degree: The maximum relatedness degree desired by the user, either an integer from
+            0 to MAX_GRMA_RELATEDNESS or those same values in string form.  NOT the KING InfTypes.
+        unresidualized_phenotypes: Phenotypes that have been processed up to the point of
+            (but not including!) residualization based on relatedness groups.
+
+    Returns:
+        A tuple (R, se_matrix, phenotypes) where:
+
+            R is the residualization matrix (multiplication by this matrix residualizes within 
+                relatedness groups)
+            se_matrix is the matrix used to calculate standard errors (see GRMA paper for details,
+                but this is essentially R @ Omega @ R.T)
+            phenotypes are the relatedness-residualized phenotypes
+    """
+
+
+    # Make sure the relatedness threshold is of the correct type
+    if isinstance(rel_degree, str):
+        rel_degree = int(rel_degree)
+    elif not isinstance(rel_degree, int):
+        raise TypeError(f"Expected str or int for parameter rel_degree, but "
+                        f"received {type(rel_degree)}")
+
+    # Read in relatedness file (should be in KING format)
+    rel_df, _ = get_df(rel_file, "rel_file", {"header":0})
+    rel_df = rel_df[NEEDED_KING_COLS]
+    logging.info(f"\tRead in {len(rel_df)} rows from relatedness file")
+    logging.info(f"\tRelatedness counts: {get_rel_report(rel_df)}\n")
+
+    # Take note of the sample indices for each FID, IID pair to map to bed file and phenotypes
+    N = len(fam_df)
+    fam_mi = pd.MultiIndex.from_frame(fam_df[FAM_KEY])
+    fam_index_vals = fam_df.index.to_numpy()
+
+    pos1 = fam_mi.get_indexer(pd.MultiIndex.from_frame(rel_df[KING_KEY_1]))
+    pos2 = fam_mi.get_indexer(pd.MultiIndex.from_frame(rel_df[KING_KEY_2]))
+    mask = (pos1 != -1) & (pos2 != -1)
+
+    rel_df = rel_df.loc[mask].drop(columns=KING_KEY_1+KING_KEY_2).reset_index(drop=True)
+    rel_df[FAM_INDEX_1] = fam_index_vals[pos1[mask]]
+    rel_df[FAM_INDEX_2] = fam_index_vals[pos2[mask]]
+    logging.debug(f"\tRestricted the KING file to relevant samples")
+    logging.debug(f"\tRelatedness degree counts: {get_rel_report(rel_df)}\n")
+
+
+    # Make sure the InfType column is a number rather than a string
+    rel_df[KING_REL_COL] = rel_df[KING_REL_COL].map(INFTYPE_TO_DEG_MAP)
+    logging.debug(f"\tMapping KING relatedness to relatedness degree")
+    logging.debug(f"\tRelatedness degree counts: {get_rel_report(rel_df)}\n")
+
+
+    # Filter out relatedness that's too far away
+    # TODO(jonbjala) This will need to change if we bring back higher degree thresholds
+    rel_df = rel_df[rel_df[KING_REL_COL] <= SE_RELATEDNESS]
+    logging.debug(f"\tAfter restricting to SE relatedness threshold, "
+                  f"{len(rel_df)} rows remaining in relatedness file")
+    logging.debug(f"\tRelatedness degree counts: {get_rel_report(rel_df)}\n")
+
+
+    # Create omega matrix
+    omega = calculate_omega(rel_df=rel_df, N=N, unresidualized_phenotypes=unresidualized_phenotypes)
+
+    # Create R matrix
+    rel_df = rel_df[rel_df[KING_REL_COL] <= rel_degree]
+    logging.debug(f"\tAfter restricting to user-specified relatedness threshold, "
+                  f"{len(rel_df)} rows remaining in relatedness file")
+    logging.debug(f"\tRelatedness degree counts: {get_rel_report(rel_df)}")
+    R = calculate_R(rel_df=rel_df, N=N)
+
+
     # Residualize the phenotypes using R
     phenotypes = R @ unresidualized_phenotypes
 
@@ -402,21 +508,46 @@ def process_relatedness(
 # TODO(jonbjala) This might need to be more complicated, return a SNP breakdown plan (for LD scores)
 def process_bim_file(bim_file: Union[str, pd.DataFrame], snp_list: Union[str, pd.DataFrame]
     ) -> Tuple[int, int, np.ndarray]:
+    """Performs processing of the bim file
 
+    Function to read in the bim file and possibly filter based on the optional
+    user-provided snp list.
+
+    Args:
+        bim_file: String path to the bim file, or the Dataframe itself (already read in).
+            (see https://www.cog-genomics.org/plink/1.9/formats#bim)
+        snp_list: Optional file that contains the rsIDs (one per line) that should be included
+            in the analysis
+
+    Returns:
+        A tuple (M_orig, M, snp_filter) where:
+
+            M_orig is the initial number of SNPs in the bim file
+            M is the final number of SNPs after filtering based on snp_list, if provided
+                (should be equal to M_orig if no snp_list is provided)
+            snp_filter is the list of numerical (values from 0 to M_orig-1) indices to use when
+                filtering, say, the values in the bed file by SNP
+    """
     # Read in bim file
     bim_df, _ = get_df(bim_file, "bim_file", {"usecols" : [BIM_COLS.index(BIM_RSID_COL)],
                                               "names" : [BIM_RSID_COL]})
     M_orig = len(bim_df)
+    bim_name = bim_file if isinstance(bim_file, str) else "bim file"
+    logging.info(f"\tThere are {M_orig} SNPs in {bim_name}")
 
     # Read in snp list (if it exists)
     if snp_list is not None:
         snp_df, _ = get_df(snp_list, "snp_list", {"names" : [BIM_RSID_COL]})
+        snplist_name = snp_list if isinstance(snp_list, str) else "SNP list"
+        logging.info(f"\tThere are {len(snp_df)} SNPs in {snplist_name}")
 
         bim_index = pd.Index(bim_df[BIM_RSID_COL])
         positions = bim_index.get_indexer(snp_df[BIM_RSID_COL])
         missing_mask = (positions == -1)
         num_missing = int(missing_mask.sum())
-        logging.debug(f"There are {num_missing} SNPs listed in SNP list that are not in the bim file")
+        logging.debug(f"\tThere are {num_missing} SNPs listed in SNP list that are not in "
+                      f"the bim file")
+        logging.info(f"\tThere are {len(snp_df) - num_missing} SNPs remaining after filtering")
 
         return M_orig, len(snp_df) - num_missing, np.sort(positions[~missing_mask])
 
@@ -429,6 +560,36 @@ def get_residualized_genotype_data(bed_file: Union[str, np.ndarray], M_orig: int
                                    snp_filter: np.ndarray, sample_filter: np.ndarray,
                                    R: sp.csr_array, M_start: int,
                                    num_snps: int) -> Tuple[np.ndarray, int]:
+    """Performs processing of the bed file
+
+    Function to read in the bed file, possibly filter based on either user-provided snp or sample
+    lists as well as samples or SNPs dropped due to NaN / missing values, and then residualize
+    based on relatedness grouping.  Using the M_start and num_snps parameter, a subset / chunk
+    of the data can be read in (for all samples but only some of the SNPs).  Any values that are
+    NaN are set to 0.0 after residualization.
+
+    Args:
+        bed_file: String path to the bed file, or the ndarray itself (already read in).
+            (see https://www.cog-genomics.org/plink/1.9/formats#bed)
+        M_orig: Number of SNPs provided in the bim/bed file (prior to filtering)
+        N_orig: Number of samples provided in the fam/bed file (prior to filtering)
+        snp_filter: Indices (valued 0 to M_orig-1) of SNPs to include in analysis.  If None,
+            all SNPs are included
+        sample_filter: Indices (valued 0 to N_orig-1) of samples to include in analysis.  If None,
+            all samples are included
+        R: Matrix used to residualize based on relatedness groups
+        M_start: The index of the SNP to start at when reading in the data.  Should be between 0 and
+            M_orig - 1, inclusive
+        num_snps: The number of SNPs (prior to filtering) that should be read in.  If this would
+            cause more SNPs to be read in than are available (given the value of M_start), as many
+            as possible are read in
+
+    Returns:
+        A tuple (G, M) where:
+
+            G is the residualized genotype array
+            M is the number of SNPs in G / the number of SNPs actually read in
+    """
 
     if M_start < 0 or M_start >= M_orig:
         raise ValueError(f"Invalid value for M_start ({M_start}), which should be between "
@@ -447,6 +608,7 @@ def get_residualized_genotype_data(bed_file: Union[str, np.ndarray], M_orig: int
         lower_index = np.searchsorted(snp_filter, M_start, side="left")
         upper_index = np.searchsorted(snp_filter, M_start + num_to_read, side="left")
 
+        logging.debug(f"\t\t{lower_index=} {upper_index=}")
         if lower_index == len(snp_filter) or lower_index == upper_index:
             return None, 0
 
@@ -495,20 +657,61 @@ def process_genotypes(bed_file: Union[str, np.ndarray], M_orig: int, N_orig: int
                       phenotypes: np.ndarray, snp_filter: np.ndarray, sample_filter: np.ndarray,
                       R: sp.csr_array, se_matrix: sp.csr_array, snps_per_block: int
                       ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    
+    """Performs the main GRMA processing (calculating betas and SEs)
+
+    Function that combines all the pre-processing and filtering, and then uses that to read in
+    the appropriate chunks of the bed file, and then calculate the betas and SEs.
+
+    Args:
+        bed_file: String path to the bed file, or the ndarray itself (already read in).
+            (see https://www.cog-genomics.org/plink/1.9/formats#bed)
+        M_orig: Number of SNPs provided in the bim/bed file (prior to filtering)
+        N_orig: Number of samples provided in the fam/bed file (prior to filtering)
+        M: Number of SNPs used in the analysis (post-filtering)
+        N: Number of samples used in the analysis (post-filtering)
+        phenotypes: Phenotypes that have been residualized by relatedness groups
+        snp_filter: Indices (valued 0 to M_orig-1) of SNPs to include in analysis.  If None,
+            all SNPs are included
+        sample_filter: Indices (valued 0 to N_orig-1) of samples to include in analysis.  If None,
+            all samples are included
+        R: Matrix used to residualize based on relatedness groups
+        se_matrix: Matrix used to calculate standard errors (see GRMA paper for details,
+            but this is essentially R @ Omega @ R.T)
+        snps_per_block: The number of SNPs to process at a time (prior to filtering, so some blocks
+            will potentially include less than this).  If more are specified here than are
+            available, then all SNPs will be processed together in one block.
+
+    Returns:
+        A tuple (G, M) where:
+
+            G is the residualized genotype array
+            M is the number of SNPs in G
+    """
+
+    # Error checking
     if not isinstance(bed_file, (str, np.ndarray)):
         raise TypeError(f"Expected str or Numpy array for parameter bed_file, but "
                         f"received {type(bed_file)}")
+
+    if snps_per_block <= 0:
+        raise ValueError(f"Invalid value for snps_per_block ({snps_per_block}).  "
+                         f"Must be > 0")
+    
+    # Debug logging
+    logging.debug(f"\t{M_orig=} {M=} {N_orig=} {N=} {snps_per_block=}")
+    logging.debug(f"\t{snp_filter=}")
+    logging.debug(f"\t{sample_filter=}")
 
     # Create a place for results to be stored
     betas, ses, XtX = np.zeros(M), np.zeros(M), np.zeros(M)
 
     # Process data in blocks of SNPs
     num_blocks = int(np.ceil(M_orig / snps_per_block))
-    logging.debug(f"Genotype data will be processed in {num_blocks} blocks")
+    logging.info(f"\tGenotype data will be processed in {num_blocks} "
+                  f"block{"s" if num_blocks > 1 else ""}\n")
     current_position = 0
     for block_num in range(num_blocks):
-        logging.debug(f"Processing block {block_num}")
+        logging.debug(f"\tProcessing block {block_num}")
 
         block_genotypes, snps_read = get_residualized_genotype_data(
             bed_file=bed_file,
@@ -521,7 +724,7 @@ def process_genotypes(bed_file: Union[str, np.ndarray], M_orig: int, N_orig: int
             num_snps=snps_per_block
         )
         if snps_read == 0:
-            logging.debug(f"All SNPs filtered out in this block")
+            logging.debug(f"\tAll SNPs filtered out in this block!")
             continue
 
         # Calculate betas, squared sum of genotypes, and SEs for this block of SNPs
@@ -534,6 +737,9 @@ def process_genotypes(bed_file: Union[str, np.ndarray], M_orig: int, N_orig: int
         XtX[current_position:current_position+snps_read] = block_XtX
         current_position += snps_read
 
+    logging.info("\tDone processing bed file blocks.\n")
+    logging.info(f"\tNumber of SNPs used: {M}")
+    logging.info(f"\tNumber of samples used: {N}")
     return betas, ses, XtX
 
 # -------------------------
@@ -558,6 +764,10 @@ def calculate_pvals(betas: np.ndarray, ses: np.ndarray) -> np.ndarray:
     return result
 
 
+def calculate_chisqs(betas: np.ndarray, ses: np.ndarray) -> np.ndarray:
+    return np.square(betas / ses)
+
+
 def create_output(bim_file: Union[str, np.ndarray], snp_filter: np.ndarray,
                   betas: np.ndarray, ses: np.ndarray, sum_sq_x: np.ndarray) -> pd.DataFrame:
 
@@ -571,9 +781,13 @@ def create_output(bim_file: Union[str, np.ndarray], snp_filter: np.ndarray,
     # Calculate P values
     p_values = calculate_pvals(betas=betas, ses=ses)
 
+    # Calculate chi squared values
+    chisqs = calculate_chisqs(betas=betas, ses=ses)
+
     # Create new dataframe with output columns
+    flip_betas = -betas  # Betas should be reported for A2, so flip sign
     extra_cols_df = pd.DataFrame(data={
-            OUTPUT_BETA_COL : -betas,  # Betas should be reported for A2, so flip sign
+            OUTPUT_BETA_COL : flip_betas, 
             OUTPUT_SE_COL : ses,
             OUTPUT_P_COL: p_values,
             OUTPUT_SUMSQX_COL: sum_sq_x
@@ -582,6 +796,19 @@ def create_output(bim_file: Union[str, np.ndarray], snp_filter: np.ndarray,
 
     # Combine dataframes
     results_df = pd.concat([bim_df, extra_cols_df], axis=1)
+
+
+    # Log some results
+    summary_df = pd.DataFrame(
+        {
+            "Beta" : [flip_betas.min(), flip_betas.mean(), flip_betas.std(), flip_betas.max()],
+            "SE" : [ses.min(), ses.mean(), ses.std(), ses.max()],
+            "CHI_SQ" : [chisqs.min(), chisqs.mean(), chisqs.std(), chisqs.max()]
+        },
+        index=["MIN", "MEAN", "STD_DEV", "MAX"]
+    )
+    logging.info(f"\tSummary table:\n{textwrap.indent(summary_df.to_string(), "\t")}")
+
 
     return results_df
 
@@ -601,10 +828,10 @@ def grma(
     snp_list: Union[str, pd.DataFrame] = None
 ) -> pd.DataFrame:
 
-    logging.debug(f"GRMA called with: {locals()}")
+    logging.debug(f"GRMA called with: {locals()}\n\n")
 
     grma_time = time.time()
-    logging.info("Beginning grma() processing")
+    logging.info("Beginning grma() processing\n")
 
     # Process fam file and phenotype data
     fam_time = time.time()
@@ -617,8 +844,7 @@ def grma(
     )
     if len(sample_filter) == 0:
         raise ValueError("Resulting sample filter is empty.")
-    logging.debug(f"{N_orig=} {N=} {len(sample_filter)=}")
-    logging.info(f"Processing fam file / phenotype data took {time.time() - fam_time} seconds")
+    logging.info(f"Processing fam file / phenotype data took {time.time() - fam_time} seconds\n")
 
 
 
@@ -632,7 +858,7 @@ def grma(
         unresidualized_phenotypes=unresidualized_phenotypes
     )
     del unresidualized_phenotypes
-    logging.info(f"Processing relatedness info took {time.time() - rel_time} seconds")
+    logging.info(f"Processing relatedness info took {time.time() - rel_time} seconds\n")
 
 
     # Process bim file (generate SNP filter)
@@ -641,7 +867,7 @@ def grma(
     M_orig, M, snp_filter = process_bim_file(bim_file=bim_file, snp_list=snp_list)
     if snp_filter is not None and len(snp_filter) == 0:
         raise ValueError("Resulting SNP filter is empty.")
-    logging.info(f"Processing bim file took {time.time() - bim_time} seconds")
+    logging.info(f"Processing bim file took {time.time() - bim_time} seconds\n")
 
 
     # Process bed file (generate betas and SEs)
@@ -660,17 +886,17 @@ def grma(
         se_matrix=se_matrix,
         snps_per_block=snps_per_block
     )
-    logging.info(f"Processing bed file took {time.time() - bed_time} seconds")
+    logging.info(f"Processing bed file took {time.time() - bed_time} seconds\n")
  
     # Collate results and output them
     output_time = time.time()
     logging.info("Creating output (combining results with values from bim file)")
     results = create_output(bim_file=bim_file, snp_filter=snp_filter,
                             betas=betas, ses=ses, sum_sq_x=sum_sq_x)
-    logging.info(f"Creating output took {time.time() - output_time} seconds")
+    logging.info(f"Creating output took {time.time() - output_time} seconds\n")
 
 
-    logging.info(f"Finished grma() processing.  It took {time.time() - grma_time} seconds.")
+    logging.info(f"Finished grma() processing.  It took {time.time() - grma_time} seconds.\n")
     return results
 
 

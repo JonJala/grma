@@ -32,7 +32,7 @@ __version__ = '0.1.0'
 
 # Email addresses to use in header banner to denote contacts
 SOFTWARE_CORRESPONDENCE_EMAIL = "jjala.ssgac@gmail.com"
-OTHER_CORRESPONDENCE_EMAIL = "paturley@broadinstitute.org" # TODO(jonbjala) Change this?
+OTHER_CORRESPONDENCE_EMAIL = "pturley@usc.edu"
 
 # Logging banner to use at the top of the log file
 HEADER = f"""
@@ -89,15 +89,15 @@ ParserFunc = Callable[[str], argp.ArgumentParser]
 # Functions ##################################
 
 #################################
-def numpy_err_handler(err: str, flag: bytes):
+def numpy_err_handler(err: str, flag: int):
     """
     Function that numpy should call when an error occurs.  This is used to ensure that any errors
     are also logged, as opposed to just going to stderr and not being collected in the log
 
     :param err: String describing the error
-    :param flag: A byte describing the error (see numpy.seterrcall() docs)
+    :param flag: An int describing the error (see numpy.seterrcall() docs)
     """
-    logging.error("Received Numpy error: %s (%s)", err, flag)
+    logging.error(f"Received Numpy error: {err} ({flag})")
 
 
 #################################
@@ -301,7 +301,7 @@ def format_terminal_call(cmd: List[str]) -> str:
 
 
 #################################
-def get_user_inputs(argv: List[str], parsed_args: argp.Namespace) -> str:
+def get_user_inputs(argv: List[str], parsed_args: argp.Namespace) -> Dict[str, Any]:
     """
     Create dictionary of user-specified options/flags and their values.  Leverages the argparse
     parsing output to glean the actual value, but checks for actual user-set flags in the input
@@ -392,8 +392,8 @@ def setup_func(argv: List[str], get_parser: ParserFunc,
 
     # Log header and other information
     logging.info(header)
-    logging.info("See full log at: %s\n", os.path.abspath(log_file))
-    logging.info("\nProgram executed via:\n%s\n", format_terminal_call(argv))
+    logging.info(f"See full log at: {os.path.abspath(log_file)}\n\n")
+    logging.info(f"Program executed via:\n{format_terminal_call(argv)}\n")
 
     return parsed_args, user_args
 
@@ -413,10 +413,10 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     """
 
     # Log user-specified arguments
-    logging.debug("\nProgram was called with the following arguments:\n%s", user_args)
+    logging.debug(f"Program was called with the following arguments: {user_args}\n")
 
     # Make sure bed/bim/fam files are specified
-    logging.debug("Checking whether bed/bim/fam files were specified.")
+    logging.debug("Checking whether bed/bim/fam files were specified.\n")
     bfiles = set.union(*pargs.bfile)
     bed_files = [f"{bfile}{BED_SUFFIX}" for bfile in bfiles]
     bim_files = [f"{bfile}{BIM_SUFFIX}" for bfile in bfiles]
@@ -432,7 +432,7 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         fam_files = fam_files * len(bed_files)
 
     # Prepare dictionary that will hold internal values for this program
-    logging.debug("Constructing dictionary of values from flags passed in.")
+    logging.debug("Constructing dictionary of values from flags passed in.\n")
     internal_values = {
         OUT_PREFIX : pargs.out,
         OUT_DIR : os.path.dirname(pargs.out),
@@ -483,18 +483,18 @@ def main_func(argv: List[str]):
         logging.debug("Printing Pandas' version summary:")
         with contextlib.redirect_stdout(StringIO()) as f:
             pd.show_versions()
-        logging.debug("%s\n", f.getvalue())
+        logging.debug(f"{f.getvalue()}\n")
 
     # Execute the rest of the program, but catch and log exceptions before failing
     try:
 
         # Validate user inputs and create internal dictionary
-        logging.info("Performing additional validation of inputs.")
+        logging.info("Performing additional validation of inputs.\n")
         iargs = validate_inputs(parsed_args, user_args)
 
 
         # Run the GRMA pipeline
-        logging.info("Calling main GRMA function")
+        logging.info("Calling main GRMA function\n")
         for bed_file, bim_file, fam_file in zip(iargs[BED_FILES], iargs[BIM_FILES], iargs[FAM_FILES]):
             results = lib.grma(
                 rel_file=iargs[REL_FILE],
@@ -516,7 +516,7 @@ def main_func(argv: List[str]):
             logging.debug(f"\t{filename}")
             write_results_to_file(filename, results)
 
-        # Log any remaining information TODO(jonbjala) Timing info?
+        # Log any remaining information
         logging.info("\nExecution complete.\n")
 
     # Disable pylint error since we do actually want to capture all exceptions here

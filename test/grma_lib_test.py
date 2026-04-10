@@ -3,6 +3,7 @@ Testing of grma_lib.py
 """
 
 import itertools as it
+import logging
 import os
 import sys
 
@@ -24,6 +25,7 @@ import grma_lib as sut
 
 import helper
 import tcs
+import tc_allopt  # Test case that is really only used once
 
 
 ##############
@@ -1180,6 +1182,31 @@ class TestGRMA:
         assert np.allclose(actual_results[sut.OUTPUT_SE_COL].to_numpy(), expected_ses, atol=0.001, equal_nan=True)
         # TODO(jonbjala)  Should test P and Sum_Sq_X at some point
 
+
+    @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
+    def test__all_opts__expected_results(self, rel_degree, caplog):
+
+        with caplog.at_level(logging.DEBUG):
+            actual_results = sut.grma(
+                rel_file=tc_allopt.REL_DF,
+                bed_file=tc_allopt.G,
+                bim_file=tc_allopt.BIM_DF,
+                fam_file=tc_allopt.FAM_DF,
+                pheno_file=tc_allopt.PHENO_DF,
+                covar_file=tc_allopt.COVAR_DF,
+                rel_degree=rel_degree,
+                id_list=tc_allopt.SAMPLE_DF,
+                snp_list=tc_allopt.SNP_LIST,
+                snps_per_block=tc_allopt.SNPS_PER_BLOCK
+            )
+        
+        captured = caplog.text
+
+
+        assert "All SNPs filtered out in this block" in captured
+        assert len(actual_results) == len(tc_allopt.SNP_LIST)
+        assert actual_results[bbf.BIM_RSID_COL].equals(tc_allopt.SNP_LIST[bbf.BIM_RSID_COL])
+        # TODO(jonbjala) Should probably compare actual results (betas, ses, etc)
 
     def test__add_singletons__same_results(self):
         pass
