@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Python tool for TODO
+Python tool for genetic association analyses
 """
 
 import argparse as argp
@@ -10,11 +10,9 @@ import glob
 from io import StringIO
 import logging
 import os
-import re
 import sys
 import time
 from typing import Any, Callable, Dict, List, Set, Tuple, Union
-import glob
 
 import numpy as np
 import pandas as pd
@@ -34,7 +32,7 @@ __version__ = '0.1.0'
 
 # Email addresses to use in header banner to denote contacts
 SOFTWARE_CORRESPONDENCE_EMAIL = "jjala.ssgac@gmail.com"
-OTHER_CORRESPONDENCE_EMAIL = "paturley@broadinstitute.org" # TODO(jonbjala) Change this?
+OTHER_CORRESPONDENCE_EMAIL = "pturley@usc.edu"
 
 # Logging banner to use at the top of the log file
 HEADER = f"""
@@ -50,6 +48,13 @@ HEADER = f"""
 <> All other correspondence: {OTHER_CORRESPONDENCE_EMAIL}
 <><>
 """
+
+# Map of rel degree to numeric value to subset king output
+REL_TO_DEG_MAP = {"FS": 0, "1": 1, "2": 2, "3": 3}
+
+# List of inputs to accept as flags to specify degree of relation allowed
+REL_DEG_INPUTS = list(REL_TO_DEG_MAP.keys())
+
 
 # Relatedness degree constants
 MIN_RELATEDNESS = 1
@@ -69,7 +74,6 @@ BED_FILES = "Bed files"
 BIM_FILES = "Bim files"
 FAM_FILES = "Fam files"
 REL_FILE = "Relatedness File"
-REL_INFO_FILE = "Rel info File"
 PHENO_FILE = "Phenotype File"
 COVAR_FILE = "Covariate File"
 REL_DEG = "Relatedness Degree"
@@ -85,15 +89,15 @@ ParserFunc = Callable[[str], argp.ArgumentParser]
 # Functions ##################################
 
 #################################
-def numpy_err_handler(err: str, flag: bytes):
+def numpy_err_handler(err: str, flag: int):
     """
     Function that numpy should call when an error occurs.  This is used to ensure that any errors
     are also logged, as opposed to just going to stderr and not being collected in the log
 
     :param err: String describing the error
-    :param flag: A byte describing the error (see numpy.seterrcall() docs)
+    :param flag: An int describing the error (see numpy.seterrcall() docs)
     """
-    logging.error("Received Numpy error: %s (%s)", err, flag)
+    logging.error(f"Received Numpy error: {err} ({flag})")
 
 
 #################################
@@ -136,52 +140,28 @@ def output_prefix(s_input: str) -> str:
                            f"an existing file or directory")
 
     s_dir = os.path.dirname(stripped_p)
-    if not os.path.exists(s_dir):
+    if s_dir != "" and not os.path.exists(s_dir):
         raise ValueError(f"The designated output directory [{s_dir}] does not exist.")
 
     return stripped_p
 
 #################################
-def rel_thresh_type(s_input: str) -> Union[str, float]:
+def rel_thresh_type(s_input: str) -> int:
     """
     Used for parsing some inputs to this program, namely relatedness thresholds.
     Whitespace is removed, but no case-changing occurs.
 
     :param s_input: String passed in by argparse
 
-    :return float: The relatedness threshold
+    :return int: The relatedness degree threshold
     """
 
     stripped_thresh = s_input.strip().upper()
 
-    if stripped_thresh in lib.REL_DEG_INPUTS:
-        return stripped_thresh
+    if stripped_thresh in REL_DEG_INPUTS:
+        return REL_TO_DEG_MAP[stripped_thresh]
 
-
-    # Kinship value currently not supported.  TODO(jonbjala) Implement that in GRMA lib and then
-    # remove this exception
-    raise ValueError("Specifying kinship value for relatedness threshold not supported yet.")
-
-    float_thresh = float(stripped_thresh)
-    if not (lib.MIN_KINSHIP_THRESH <= float_thresh <= lib.MAX_KINSHIP_THRESH):
-        raise ValueError(f"Expected threshold value of {lib.REL_DEG_INPUTS} or "
-                         f"float between {lib.MIN_KINSHIP_THRESH} and {lib.MAX_KINSHIP_THRESH}")
-
-    return float_thresh
-
-
-#################################
-def to_flag(arg_str: str) -> str:
-    """
-    Utility method to convert from the name of an argparse Namespace attribute / variable
-    (which often is adopted elsewhere in this code, as well) to the corresponding flag
-
-    :param arg_str: Name of the arg
-
-    :return: The name of the flag (sans "--")
-    """
-
-    return arg_str.replace("_", "-")
+    raise ValueError(f"Invalid input ({stripped_thresh}) for relatedness threshold.")
 
 
 def to_arg(flag_str: str) -> str:
@@ -224,7 +204,7 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
     :return: argparse ArgumentParser
     """
 
-    # Create the initally blank parser
+    # Create the initially blank parser
     parser = argp.ArgumentParser(prog=progname)
 
 
@@ -251,24 +231,15 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
                             help="Optional input to specify a (Plink-style) covariates file: "
                                  "https://www.cog-genomics.org/plink/2.0/input#covar")
 
-    rel_opt = infile_opt.add_mutually_exclusive_group(required=True)
-    rel_opt.add_argument("--rel-grma", metavar="FILE", type=input_file,
-                         help="Mutually exclusive with --rel-pedigree.  Required.  "
-                              "Path to serialized relatedness information that has been "
-                              "pre-processed by GRMA.")
-    
-    rel_opt.add_argument("--rel-pedigree", metavar="FILE", type=input_file,
-                         help=f"Mutually exclusive with --rel-grma.  Required.  "
-                              f"Path to KING-formatted relatedness file (ASCII). "
-                              f"Needs the following columns: {lib.NEEDED_KING_COLS}")
+    infile_opt.add_argument("--rel-pedigree", metavar="FILE", type=input_file,
+                            help=f"Path to KING-formatted relatedness file (ASCII). "
+                                 f"Needs the following columns: {lib.NEEDED_KING_COLS}")
 
 
     a_opt = parser.add_argument_group(title="Analysis Options")
     a_opt.add_argument("--rel-thresh", metavar="THRESHOLD",
                        default=DEFAULT_REL_DEG, type=rel_thresh_type,
-                       help=f"Relatedness threshold (required with --rel-pedigree). Ignored if "
-                            f"--rel-grma is specified. Can be one of {lib.REL_DEG_INPUTS} or a "
-                            f"number in [{lib.MIN_KINSHIP_THRESH}, {lib.MAX_KINSHIP_THRESH}].")
+                       help=f"Relatedness threshold.  Can be one of {REL_DEG_INPUTS}.")
 
     
     infilt_opt = parser.add_argument_group(title="Input Filtering Options")
@@ -330,7 +301,7 @@ def format_terminal_call(cmd: List[str]) -> str:
 
 
 #################################
-def get_user_inputs(argv: List[str], parsed_args: argp.Namespace) -> str:
+def get_user_inputs(argv: List[str], parsed_args: argp.Namespace) -> Dict[str, Any]:
     """
     Create dictionary of user-specified options/flags and their values.  Leverages the argparse
     parsing output to glean the actual value, but checks for actual user-set flags in the input
@@ -412,7 +383,7 @@ def setup_func(argv: List[str], get_parser: ParserFunc,
     # Set up the logger
     log_file = parsed_args.out + ".log"
     if parsed_args.quiet:
-        log_level = logging.WARN
+        log_level = logging.WARNING
     elif parsed_args.verbose:
         log_level = logging.DEBUG
     else:
@@ -421,8 +392,8 @@ def setup_func(argv: List[str], get_parser: ParserFunc,
 
     # Log header and other information
     logging.info(header)
-    logging.info("See full log at: %s\n", os.path.abspath(log_file))
-    logging.info("\nProgram executed via:\n%s\n", format_terminal_call(argv))
+    logging.info(f"See full log at: {os.path.abspath(log_file)}\n\n")
+    logging.info(f"Program executed via:\n{format_terminal_call(argv)}\n")
 
     return parsed_args, user_args
 
@@ -442,32 +413,33 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     """
 
     # Log user-specified arguments
-    logging.debug("\nProgram was called with the following arguments:\n%s", user_args)
+    logging.debug(f"Program was called with the following arguments: {user_args}\n")
 
     # Make sure bed/bim/fam files are specified
-    logging.debug("Checking whether bed/bim/fam files were specified.")
+    logging.debug("Checking whether bed/bim/fam files were specified.\n")
     bfiles = set.union(*pargs.bfile)
     bed_files = [f"{bfile}{BED_SUFFIX}" for bfile in bfiles]
     bim_files = [f"{bfile}{BIM_SUFFIX}" for bfile in bfiles]
     fam_files = [pargs.fam] if pargs.fam else [f"{bfile}{FAM_SUFFIX}" for bfile in bfiles]
+    file_list = bed_files + bim_files + fam_files
     
-    missing_files = [file for file in (bed_files + bim_files + fam_files)
-                     if not os.path.exists(file)]
+    missing_files = [file for file in file_list if not os.path.exists(file)]
     
     if missing_files:
         raise FileNotFoundError(f"Missing the following files: {missing_files}")
 
+    if len(fam_files) == 1:
+        fam_files = fam_files * len(bed_files)
+
     # Prepare dictionary that will hold internal values for this program
-    logging.debug("Constructing dictionary of values from flags passed in.")
+    logging.debug("Constructing dictionary of values from flags passed in.\n")
     internal_values = {
         OUT_PREFIX : pargs.out,
         OUT_DIR : os.path.dirname(pargs.out),
         BED_FILES : bed_files,
         BIM_FILES : bim_files,
-        FAM_FILES : [pargs.fam]*len(bfiles) if pargs.fam else [f"{bfile}{FAM_SUFFIX}"
-                                                               for bfile in bfiles],
+        FAM_FILES : fam_files,
         REL_FILE : pargs.rel_pedigree,
-        REL_INFO_FILE : pargs.rel_grma,
         PHENO_FILE : pargs.pheno,
         COVAR_FILE : pargs.covar,
         REL_DEG : pargs.rel_thresh,
@@ -487,7 +459,7 @@ def write_results_to_file(filename: str, results: pd.DataFrame):
 
     results.to_csv(filename, index = False, header=True, sep='\t')
     logging.info(f"Time taken to write results is {time.time() - res_start_time}")
-    return results
+
     
 
 
@@ -511,24 +483,30 @@ def main_func(argv: List[str]):
         logging.debug("Printing Pandas' version summary:")
         with contextlib.redirect_stdout(StringIO()) as f:
             pd.show_versions()
-        logging.debug("%s\n", f.getvalue())
+        logging.debug(f"{f.getvalue()}\n")
 
     # Execute the rest of the program, but catch and log exceptions before failing
     try:
 
         # Validate user inputs and create internal dictionary
-        logging.info("Performing additional validation of inputs.")
+        logging.info("Performing additional validation of inputs.\n")
         iargs = validate_inputs(parsed_args, user_args)
 
+
         # Run the GRMA pipeline
-        logging.info("Calling main GRMA function")
+        logging.info("Calling main GRMA function\n")
         for bed_file, bim_file, fam_file in zip(iargs[BED_FILES], iargs[BIM_FILES], iargs[FAM_FILES]):
             results = lib.grma(
-                rel_input=iargs[REL_FILE], rel_info_file=iargs[REL_INFO_FILE],
-                bed_file=bed_file, bim_file=bim_file,
-                fam_file=fam_file, pheno_file=iargs[PHENO_FILE], covar_file=iargs[COVAR_FILE],
-                rel_degree=iargs[REL_DEG], snps_per_block=iargs[SNPS_PER_BLOCK],
-                id_list=iargs[ID_LIST], snp_list=iargs[SNP_LIST]
+                rel_file=iargs[REL_FILE],
+                bed_file=bed_file,
+                bim_file=bim_file,
+                fam_file=fam_file,
+                rel_degree=iargs[REL_DEG],
+                pheno_file=iargs[PHENO_FILE],
+                covar_file=iargs[COVAR_FILE],
+                snps_per_block=iargs[SNPS_PER_BLOCK],
+                id_list=iargs[ID_LIST],
+                snp_list=iargs[SNP_LIST]
             )
 
             # Write out the results to disk per chromosome
@@ -538,7 +516,7 @@ def main_func(argv: List[str]):
             logging.debug(f"\t{filename}")
             write_results_to_file(filename, results)
 
-        # Log any remaining information TODO(jonbjala) Timing info?
+        # Log any remaining information
         logging.info("\nExecution complete.\n")
 
     # Disable pylint error since we do actually want to capture all exceptions here

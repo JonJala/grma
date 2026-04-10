@@ -6,7 +6,15 @@ import pandas as pd
 
 main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(main_directory)
-import grma_lib
+
+import bedbimfam as bbf
+import grma_lib as lib
+
+import tc_simple
+import tc_2fam
+import tc_varied
+import tc_pt
+
 
 
 NAME = 'TC_NAME'
@@ -18,41 +26,38 @@ P = 'PHENOTYPE'
 OUTPUT = 'EXPECTED_OUTPUT'
 
 
-TC_DATA = [
-    {
-        NAME : "TC1",
-        REL_THRESH : "FS",
-        KING_DF : pd.DataFrame(
-            {
-                grma_lib.KING_FID1_COL : 0,
-                grma_lib.KING_IID1_COL : [0, 0, 1, 3, 5],
-                grma_lib.KING_FID2_COL : 0,
-                grma_lib.KING_IID2_COL : [1, 2, 2, 4, 6],
-                grma_lib.KING_KINSHIP_COL : [0.25, 0.25, 0.25, 0.25, 0.0],
-                grma_lib.KING_REL_COL : ['FS', 'FS', 'FS', 'FS', 'UN']
-            }
-        ),
-        REL_INFO : [[0, 1, 2], [0, 1, 2], [0, 1, 2], [3, 4], [3, 4], [5], [6]],
-        G : np.array([[0.0, 1.0, 2.0, 0.0, 2.0, 0.0, 2.0]]),
-        P : np.array([[0.0, 1.0, 2.0, 0.0, 2.0, 2.0, 0.0]]),
 
-    },
-    {
-        NAME : "TC2",
-        REL_THRESH : "2",
-        KING_DF : pd.DataFrame(
-            {
-                grma_lib.KING_FID1_COL : 0,
-                grma_lib.KING_IID1_COL : [0, 0, 1, 3, 3, 5],
-                grma_lib.KING_FID2_COL : 0,
-                grma_lib.KING_IID2_COL : [1, 2, 2, 4, 5, 6],
-                grma_lib.KING_KINSHIP_COL : [0.25, 0.25, 0.25, 0.25, 0.5, 0.5],
-                grma_lib.KING_REL_COL : ['FS', 'FS', 'FS', 'FS', '2nd', '2nd']
-            }
-        ),
-        REL_INFO : [[0, 1, 2], [0, 1, 2], [0, 1, 2], [3, 4], [3, 4], [3, 5, 6], [5, 6]],
-        G : np.array([[0.0, 1.0, 2.0, 0.0, 2.0, 0.0, 2.0]]),
-        P : np.array([[0.0, 1.0, 2.0, 0.0, 2.0, 2.0, 0.0]]),
+KEY_SIMPLE = "SIMPLE"
+KEY_2FAM = "TWO_FAMILY"
+KEY_VARIED = "VARIED"
+KEY_PT = "PT"
 
-    },
-]
+KEY_MOD_DICT = {
+    KEY_SIMPLE : tc_simple,
+    KEY_2FAM : tc_2fam,
+    KEY_VARIED : tc_varied, 
+    KEY_PT : tc_pt
+}
+
+KEYS = list(KEY_MOD_DICT.keys())
+
+
+GROUPNAME_SUBNAME_DICT = {
+    "BIM_DFS" : "BIM_DF",
+    "SNP_LISTS" : "SNP_LIST",
+    "SNP_FILTERS" : "SNP_FILTER",
+    "SAMPLE_LISTS" : "SAMPLE_LIST",
+    "SAMPLE_FILTERS" : "SAMPLE_FILTER",
+    "FAM_DFS" : "FAM_DF",
+    "REL_DFS" : "REL_DF",
+    "R_MATRICES" : "R_MATRICES",
+    "G" : "G",
+    "DEMEANED_P" : "DEMEANED_P",
+    "DEMEANED_G" : "DEMEANED_G",
+    "BETAS" : "BETAS",
+    "SES" : "SES"
+}
+
+for groupname, subname in GROUPNAME_SUBNAME_DICT.items():
+    globals()[groupname] = {key : getattr(mod_name, subname, None)
+                            for key, mod_name in KEY_MOD_DICT.items()}

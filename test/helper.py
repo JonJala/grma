@@ -3,10 +3,14 @@ import sys
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 
 main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(main_directory)
+import grma
 import grma_lib
+import bedbimfam as bbf
 
 '''
 This contains a straightforward, unscalable version of GRMA to use to test against in small enough
@@ -15,67 +19,138 @@ examples.
 '''
 
 # Assumes IDs are integers in the range of 0 to N (and that FID is unused)
-def mock_create_rel_info(king_df: pd.DataFrame, rel_thresh: str):
+def mock_create_rel_info(king_df: pd.DataFrame, fam_df: pd.DataFrame, rel_deg: int, N: int):
     ids = sorted(set(king_df[grma_lib.KING_IID1_COL].tolist()).union(
                  set(king_df[grma_lib.KING_IID2_COL].tolist())))
-    N = len(ids)
-    rel_thresh_val = grma_lib.REL_TO_DEG_MAP[rel_thresh]
+
+    rel_thresh_val = rel_deg
+
+    fam_df_copy = fam_df.copy()
+    fam_df_copy["INDEX"] = list(range(N))
+
+    rel_df = king_df.copy()
+    rel_df = pd.merge(left=rel_df, right=fam_df_copy, left_on=[grma_lib.KING_FID1_COL, grma_lib.KING_IID1_COL],
+                      right_on=[bbf.FAM_FID_COL, bbf.FAM_IID_COL])
+    rel_df.rename(columns={"INDEX": "INDEX1"}, inplace=True)
+    rel_df = pd.merge(left=rel_df, right=fam_df_copy, left_on=[grma_lib.KING_FID2_COL, grma_lib.KING_IID2_COL],
+                      right_on=[bbf.FAM_FID_COL, bbf.FAM_IID_COL])
+    rel_df.rename(columns={"INDEX": "INDEX2"}, inplace=True)
 
     # Find the closest relationship levels for everyone
     lowest_rel = [5] * N
-    for index, row in king_df.iterrows():
-        cur_rel = grma_lib.INF_TO_DEG_MAP[row[grma_lib.KING_REL_COL]]
-        id1 = row[grma_lib.KING_IID1_COL]
-        id2 = row[grma_lib.KING_IID2_COL]
 
-        if cur_rel < lowest_rel[id1]:
-            lowest_rel[id1] = cur_rel
-        if cur_rel < lowest_rel[id2]:
-            lowest_rel[id2] = cur_rel
+    for index, row in rel_df.iterrows():
+        cur_rel = grma_lib.INFTYPE_TO_DEG_MAP[row[grma_lib.KING_REL_COL]]
+
+        if cur_rel < lowest_rel[row["INDEX1"]]:
+            lowest_rel[row["INDEX1"]] = cur_rel
+        if cur_rel < lowest_rel[row["INDEX2"]]:
+            lowest_rel[row["INDEX2"]] = cur_rel
 
 
-    # Construct the rel_info object
+    # Construct the rel_info object and se_info objects
     rel_info = [[i] for i in range(N)]
-    for index, row in king_df.iterrows():
-        cur_rel = grma_lib.INF_TO_DEG_MAP[row[grma_lib.KING_REL_COL]]
-        id1 = row[grma_lib.KING_IID1_COL]
-        id2 = row[grma_lib.KING_IID2_COL]
+    for index, row in rel_df.iterrows():
+        cur_rel = grma_lib.INFTYPE_TO_DEG_MAP[row[grma_lib.KING_REL_COL]]
 
+        if cur_rel == lowest_rel[row["INDEX1"]] and cur_rel <= rel_thresh_val:
+            rel_info[row["INDEX1"]].append(row["INDEX2"])
 
-        if cur_rel == lowest_rel[id1] and cur_rel <= rel_thresh_val:
-            rel_info[id1].append(id2)
-
-        if cur_rel == lowest_rel[id2] and cur_rel <= rel_thresh_val:
-            rel_info[id2].append(id1)
-
+        if cur_rel == lowest_rel[row["INDEX2"]] and cur_rel <= rel_thresh_val:
+            rel_info[row["INDEX2"]].append(row["INDEX1"])
 
     # Sort the rel_info entries
     for i, rel in enumerate(rel_info):
         rel_info[i] = sorted(rel)
 
-
     return rel_info
 
 
 
-def mock_calc_duplicates(rel_input: list):
-    N = len(rel_input)
-    dups = [False] * N
+def mock_shrink_offdiag(matrix: sp.csr_array, weight: float = 0.75):
 
-    for cur_rownum, cur_row in enumerate(rel_input):
-        maybe_dup = all(rel_input[i] == cur_row for i in cur_row)
-        if not maybe_dup:
-            continue
+    lam_min = spla.eigsh(matrix, k=1, which="SA", return_eigenvectors=False)[0]
+    if lam_min > 0.0:
+        return matrix
 
-        false_alarm = any(i in row for i in cur_row
-                                   for row_num, row in enumerate(rel_input)
-                                       if row_num not in cur_row)
-        if false_alarm:
-            continue
 
-        dups[cur_rownum] = True
+    D = sp.diags(matrix.diagonal())
+    off_diag = matrix.copy()
+    off_diag.setdiag(0)
+    off_diag.eliminate_zeros()
 
-    return np.array(dups)
+    alpha_min = 0.0
+    alpha_max = 1.0
+
+    num_iterations = 35
+    for iter_num in range(num_iterations):
+        alpha = weight * alpha_max + (1.0 - weight) * alpha_min
+
+        result = D + alpha * off_diag
+        lam_min = spla.eigsh(result, k=1, which="SA", return_eigenvectors=False)[0]
+        if lam_min > 0:
+            alpha_min = alpha
+        else:
+            alpha_max = alpha
+
+    lam_min = spla.eigsh(result, k=1, which="SA", return_eigenvectors=False)[0]
+    if lam_min < 0:
+        result = D + alpha_min * off_diag
+
+
+    return result
+
+
+def mock_calc_omega(fam_df: pd.DataFrame, N: int, rel_df: pd.DataFrame,
+                    unresidualized_phenotypes: np.ndarray):
+
+    FAM_INDEX1_COL = "Fam Index 1"
+    FAM_INDEX2_COL = "Fam Index 2"
+
+    master_df = rel_df.copy()
+
+
+    fam_idx = pd.MultiIndex.from_frame(fam_df[[bbf.FAM_FID_COL, bbf.FAM_IID_COL]])
+
+    master_df[FAM_INDEX1_COL] = fam_idx.get_indexer(
+        pd.MultiIndex.from_arrays([rel_df[grma_lib.KING_FID1_COL], rel_df[grma_lib.KING_IID1_COL]])
+    )
+    master_df[FAM_INDEX2_COL] = fam_idx.get_indexer(
+        pd.MultiIndex.from_arrays([rel_df[grma_lib.KING_FID2_COL], rel_df[grma_lib.KING_IID2_COL]])
+    )
+
+    master_df[grma_lib.KING_REL_COL] = master_df[grma_lib.KING_REL_COL].map(grma_lib.INFTYPE_TO_DEG_MAP)
+
+    master_df = master_df[[FAM_INDEX1_COL, FAM_INDEX2_COL, grma_lib.KING_REL_COL]]
+    master_df = master_df[master_df[grma_lib.KING_REL_COL] <= grma_lib.SE_RELATEDNESS]
+
+    rel_to_cov_dict = dict()
+    for rel_deg in range(grma_lib.SE_RELATEDNESS + 1):
+        temp_df = master_df[master_df[grma_lib.KING_REL_COL] == rel_deg]
+
+        ind1 = np.concatenate([temp_df[FAM_INDEX1_COL].to_numpy(int), temp_df[FAM_INDEX2_COL].to_numpy(int)])
+        ind2 = np.concatenate([temp_df[FAM_INDEX2_COL].to_numpy(int), temp_df[FAM_INDEX1_COL].to_numpy(int)])
+
+        covar = np.cov(unresidualized_phenotypes[ind1], unresidualized_phenotypes[ind2], ddof=0)[0, 1] \
+            if len(temp_df) > 0 else np.nan
+
+        rel_to_cov_dict[rel_deg] = covar
+
+
+    master_df["COV"] = master_df[grma_lib.KING_REL_COL].map(rel_to_cov_dict)
+
+    variance = np.var(unresidualized_phenotypes)
+
+    rows = np.concatenate([master_df[FAM_INDEX1_COL].to_numpy(int), master_df[FAM_INDEX2_COL].to_numpy(int), np.arange(N)])
+    cols = np.concatenate([master_df[FAM_INDEX2_COL].to_numpy(int), master_df[FAM_INDEX1_COL].to_numpy(int), np.arange(N)])
+    data = np.concatenate([master_df["COV"].to_numpy(), master_df["COV"].to_numpy(), variance * np.ones(N)])
+
+    omega = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
+    shrunk_omega = mock_shrink_offdiag(omega)
+
+    return shrunk_omega
+
+
 
 
 def mock_construct_R(rel_input: list):
@@ -85,7 +160,7 @@ def mock_construct_R(rel_input: list):
     for row_num, row in enumerate(rel_input):
         result[row_num, row] -= np.reciprocal(float(len(row)))
 
-    return result
+    return sp.csr_array(result)
 
 
 # Assume K x N (where K is likely M or 1 depending on whether this is G or the phenotypes)
@@ -95,11 +170,21 @@ def mock_demean(rel_input: list, arr: np.ndarray):
     for person_num, row in enumerate(rel_input):
         result[:, person_num] -= np.mean(arr[:, row], axis=1)
 
+    result[np.isnan(result)] = 0.0
+
     return result
+
+
+def mock_calc_xtx(G: np.ndarray):
+    XtX = np.sum(np.square(G), axis=1)
+    XtX[XtX == 0.0] = np.finfo(XtX.dtype).eps
+    return XtX
 
 
 def mock_run_regressions(demeaned_G: np.ndarray, demeaned_P: np.ndarray):
     M, N = demeaned_G.shape
+
+    XtX = mock_calc_xtx(demeaned_G)
 
     betas = np.zeros(M)
     for snp in range(M):
@@ -108,38 +193,46 @@ def mock_run_regressions(demeaned_G: np.ndarray, demeaned_P: np.ndarray):
     return betas
 
 
-def mock_calc_se(demeaned_G: np.ndarray, demeaned_P: np.ndarray, R: np.ndarray):
+def mock_calc_ses(demeaned_G: np.ndarray, se_matrix: np.ndarray):
     M, N = demeaned_G.shape
-
-    RR = R @ R.T
-    tRR = np.trace(RR)
-    ESSR = np.sum(np.square(demeaned_P))
 
     ses = np.zeros(M, dtype=float)
 
+
     for snp in range(M):
         X = demeaned_G[snp].T
-        XXinv = np.reciprocal(np.dot(X, X))
+        XtX = np.dot(X, X)
+        if XtX == 0.0:
+            XtX = np.finfo(XtX.dtype).eps
+        XXinv = np.reciprocal(XtX)
 
-        XRRX = X.T @ RR @ X
+        central_value = X.T @ se_matrix @ X
 
-        ses[snp] = np.sqrt(ESSR * XXinv * XRRX * XXinv / (tRR - XRRX * XXinv))
+        ses[snp] = XXinv * np.sqrt(central_value)
+
+    ses[ses == 0.0] = np.finfo(ses.dtype).eps
 
     return ses
 
 
+def mock_grma(rel_df: pd.DataFrame, fam_df: pd.DataFrame, G: np.ndarray, pheno: np.ndarray, rel_deg: int):
+    M, N = G.shape
 
-def mock_grma(rel_input: list, G: np.ndarray, pheno: np.ndarray):
+    rel_info = mock_create_rel_info(rel_df, fam_df, rel_deg, N)
 
-    R = mock_construct_R(rel_input)
+    R = mock_construct_R(rel_info)
 
-    demeaned_geno = mock_demean(rel_input, G)
-    demeaned_pheno = mock_demean(rel_input, pheno)
+    demeaned_geno = mock_demean(rel_info, G)
+    demeaned_pheno = mock_demean(rel_info, pheno.reshape(1,-1))
+
+    omega = mock_calc_omega(fam_df=fam_df, N=N, rel_df=rel_df, unresidualized_phenotypes=pheno)
+
+    se_matrix = R @ omega @ R.T
 
     betas = mock_run_regressions(demeaned_G=demeaned_geno, demeaned_P=demeaned_pheno)
-    ses = mock_calc_se(demeaned_G=demeaned_geno, demeaned_P=demeaned_pheno, R=R)
+    ses = mock_calc_ses(demeaned_G=demeaned_geno, se_matrix=se_matrix)
 
-    return betas, ses
+    return -betas, ses
 
 
 
