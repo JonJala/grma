@@ -231,7 +231,7 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
                             help="Optional input to specify a (Plink-style) covariates file: "
                                  "https://www.cog-genomics.org/plink/2.0/input#covar")
 
-    infile_opt.add_argument("--rel-pedigree", metavar="FILE", type=input_file,
+    infile_opt.add_argument("--rel-pedigree", metavar="FILE", type=input_file, required=True,
                             help=f"Path to KING-formatted relatedness file (ASCII). "
                                  f"Needs the following columns: {lib.NEEDED_KING_COLS}")
 
@@ -239,7 +239,8 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
     a_opt = parser.add_argument_group(title="Analysis Options")
     a_opt.add_argument("--rel-thresh", metavar="THRESHOLD",
                        default=DEFAULT_REL_DEG, type=rel_thresh_type,
-                       help=f"Relatedness threshold.  Can be one of {REL_DEG_INPUTS}.")
+                       help=f"Relatedness threshold.  Can be one of {REL_DEG_INPUTS}.  "
+                            f"Default is {DEFAULT_REL_DEG}")
 
     
     infilt_opt = parser.add_argument_group(title="Input Filtering Options")

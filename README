@@ -1,9 +1,18 @@
 GRMA tutorial:
 
+You can use the provided requirements.txt file (run "pip install -r requirements.txt") to have the
+needed versions of packages installed on your system.  If this conflicts with packages or their
+needed versions already on your system, you could try using a virtual environment to run GRMA.
+See virtualenv (https://virtualenv.pypa.io/en/latest/) or conda
+(https://anaconda.org/channels/anaconda/packages/conda/overview), for example, or use whichever
+other similar tool you like best.
+
 See below for full usage (or run "grma.py -h"), but for the purposes of a simple demonstration of GRMA and verifying
 that it works on your system, run:
 
 grma.py --bfile tutorial/tutorial --rel-pedigree tutorial/tutorial.kin --rel-thresh FS --out tutorial/user_FS
+
+If grma.py is not found, try using "./grma.py" or make sure the current working directory is added to your PATH.
 
 This should produce files user_FS.res and user_FS.log in the tutorial directory.  The log file will show
 some status and processing steps that GRMA went through during the analysis.  For a more extended log, you can
@@ -30,8 +39,8 @@ provide information about what portions of the code might be running into issues
 
 Usage info:
 
-grma.py [-h] --bfile GLOB_PATH [GLOB_PATH ...] [--fam FILE] [--pheno FILE] [--covar FILE] [--rel-pedigree FILE] [--rel-thresh THRESHOLD] [--id-list FILE]
-             [--snp-list FILE] [--out FILE_PREFIX] [--snps-per-block SNPS_PER_BLOCK] [--quiet | --verbose]
+usage: ./grma.py [-h] --bfile GLOB_PATH [GLOB_PATH ...] [--fam FILE] [--pheno FILE] [--covar FILE] --rel-pedigree FILE [--rel-thresh THRESHOLD] [--id-list FILE] [--snp-list FILE]
+                 [--out FILE_PREFIX] [--snps-per-block SNPS_PER_BLOCK] [--quiet | --verbose]
 
 options:
   -h, --help            show this help message and exit
@@ -47,21 +56,20 @@ Input Specifications:
 
 Analysis Options:
   --rel-thresh THRESHOLD
-                        Relatedness threshold. Can be one of ['FS', '1', '2', '3'].
+                        Relatedness threshold. Can be one of ['FS', '1', '2', '3']. Default is 1
 
 Input Filtering Options:
-  --id-list FILE        Optional input to specify a whitespace-delimited sample ID file of sample FIDs and IIDs to include.  No header allowed.  See Plink flag 
-                        --keep.
-  --snp-list FILE       Optional input to specify a whitespace-delimited variant ID file of variant IDs to include.  No header allowed.  See Plink flag --extract.
+  --id-list FILE        Optional input to specify a whitespace-delimited sample ID file of sample FIDs and IIDs to include. No header allowed. See Plink flag --keep.
+  --snp-list FILE       Optional input to specify a whitespace-delimited variant ID file of variant IDs to include. No header allowed. See Plink flag --extract.
 
 Output Specifications:
-  --out FILE_PREFIX     Full prefix of output files (logs, sumstats results, etc.). If not set, "[current working directory]/grma" will be used. Note: The
-                        containing directory specified must already exist.
+  --out FILE_PREFIX     Full prefix of output files (logs, sumstats results, etc.). If not set, [current working directory]/grma will
+                        be used. Note: The containing directory specified must already exist.
 
 General Options:
   --snps-per-block SNPS_PER_BLOCK
                         Number of SNPs to process at a time. Default is 100
-  --quiet               This option will cause the program to limit logging and terminal output to warnings and errors and reduce output compared to the
-                        default/standard logging mode. It is mutually exclusive with the --verbose option.
-  --verbose             This option will greatly increase the logging and terminal output of the program compared to the default/standard logging mode.
-                        This is useful for debugging and greater visibility into the processing that is occurring. It is mutually exclusive with the --quiet option.
+  --quiet               This option will cause the program to limit logging and terminal output to warnings and errors and reduce output compared to the default/standard logging mode. It
+                        is mutually exclusive with the --verbose option.
+  --verbose             This option will greatly increase the logging and terminal output of the program compared to the default/standard logging mode. This is useful for debugging and
+                        greater visibility into the processing that is occurring. It is mutually exclusive with the --quiet option.
