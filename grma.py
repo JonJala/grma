@@ -512,7 +512,7 @@ def main_func(argv: List[str]):
             # Write out the results to disk per chromosome
             logging.info("Writing results to disk.")
             bfile_basename = os.path.splitext(os.path.basename(bed_file))[0]
-            filename = f"{iargs[OUT_PREFIX]}_{bfile_basename}.res"
+            filename = f"{iargs[OUT_PREFIX]}.res"
             logging.debug(f"\t{filename}")
             write_results_to_file(filename, results)
 

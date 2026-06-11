@@ -1,0 +1,67 @@
+GRMA tutorial:
+
+See below for full usage (or run "grma.py -h"), but for the purposes of a simple demonstration of GRMA and verifying
+that it works on your system, run:
+
+grma.py --bfile tutorial/tutorial --rel-pedigree tutorial/tutorial.kin --rel-thresh FS --out tutorial/user_FS
+
+This should produce files user_FS.res and user_FS.log in the tutorial directory.  The log file will show
+some status and processing steps that GRMA went through during the analysis.  For a more extended log, you can
+add the --verbose option.  The .res file has the actual GRMA results, in this case using the full sibling
+relationship threshold.
+
+Next, try running:
+
+grma.py --bfile tutorial/tutorial --rel-pedigree tutorial/tutorial.kin --rel-thresh 3 --out tutorial/user_3
+
+This should produce files user_3.res and user_3.log in the tutorial directory.
+In this case, the .res file has results using the degree 3 relationship threshold.
+
+
+Compare the "user" files with the provided "tutorial" files to make sure things are running correctly.
+The results should be very close (different package versions and hardware could introduce negligible deviations).
+
+You can also run "pytest" in the main GRMA folder to run through the suite of GRMA tests (especially
+useful if the results of the previous steps differ too much from the provided results, since it could
+provide information about what portions of the code might be running into issues)
+
+
+========================================================
+
+Usage info:
+
+grma.py [-h] --bfile GLOB_PATH [GLOB_PATH ...] [--fam FILE] [--pheno FILE] [--covar FILE] [--rel-pedigree FILE] [--rel-thresh THRESHOLD] [--id-list FILE]
+             [--snp-list FILE] [--out FILE_PREFIX] [--snps-per-block SNPS_PER_BLOCK] [--quiet | --verbose]
+
+options:
+  -h, --help            show this help message and exit
+
+Input Specifications:
+  --bfile GLOB_PATH [GLOB_PATH ...]
+                        Paths to PLINK 1 binary files. See python glob module for documentation on the string(s) to be provided here (full path with support for "*", "?", and "[]").
+                        These strings should be encased in quotes.
+  --fam FILE            Optional input to specify full path and filename of input fam file. Overrides --bfile flag if specified
+  --pheno FILE          Optional input to specify a (Plink-style) phenotype file: https://www.cog-genomics.org/plink/1.9/input#pheno
+  --covar FILE          Optional input to specify a (Plink-style) covariates file: https://www.cog-genomics.org/plink/2.0/input#covar
+  --rel-pedigree FILE   Path to KING-formatted relatedness file (ASCII). Needs the following columns: ['FID1', 'ID1', 'FID2', 'ID2', 'Kinship', 'InfType']
+
+Analysis Options:
+  --rel-thresh THRESHOLD
+                        Relatedness threshold. Can be one of ['FS', '1', '2', '3'].
+
+Input Filtering Options:
+  --id-list FILE        Optional input to specify a whitespace-delimited sample ID file of sample FIDs and IIDs to include.  No header allowed.  See Plink flag 
+                        --keep.
+  --snp-list FILE       Optional input to specify a whitespace-delimited variant ID file of variant IDs to include.  No header allowed.  See Plink flag --extract.
+
+Output Specifications:
+  --out FILE_PREFIX     Full prefix of output files (logs, sumstats results, etc.). If not set, "[current working directory]/grma" will be used. Note: The
+                        containing directory specified must already exist.
+
+General Options:
+  --snps-per-block SNPS_PER_BLOCK
+                        Number of SNPs to process at a time. Default is 100
+  --quiet               This option will cause the program to limit logging and terminal output to warnings and errors and reduce output compared to the
+                        default/standard logging mode. It is mutually exclusive with the --verbose option.
+  --verbose             This option will greatly increase the logging and terminal output of the program compared to the default/standard logging mode.
+                        This is useful for debugging and greater visibility into the processing that is occurring. It is mutually exclusive with the --quiet option.
