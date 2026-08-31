@@ -80,6 +80,7 @@ REL_DEG = "Relatedness Degree"
 SNPS_PER_BLOCK = "SNPs Per Block"
 ID_LIST = "ID List"
 SNP_LIST = "SNP List"
+PER_BLOCK_ALPHA = "Per Block Alpha"
 
 
 # Type declaration
@@ -243,6 +244,14 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
                             f"Default is {DEFAULT_REL_DEG}")
 
     
+    a_opt.add_argument("--per-block-alpha", action="store_true",
+                       help="Shrink omega's off-diagonal separately for each connected "
+                            "component of the relatedness graph, rather than applying a "
+                            "single global factor. Positive-definiteness is a per-block "
+                            "property, so this preserves it identically while preventing "
+                            "one pedigree from setting the shrinkage for the whole "
+                            "sample. Default is the single global factor.")
+
     infilt_opt = parser.add_argument_group(title="Input Filtering Options")
     infilt_opt.add_argument("--id-list", metavar="FILE", type=input_file,
                             help="Optional input to specify a whitespace-delimited sample ID file "
@@ -446,7 +455,8 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         REL_DEG : pargs.rel_thresh,
         SNPS_PER_BLOCK : pargs.snps_per_block,
         ID_LIST : pargs.id_list,
-        SNP_LIST : pargs.snp_list
+        SNP_LIST : pargs.snp_list,
+        PER_BLOCK_ALPHA : pargs.per_block_alpha
     }
 
 
@@ -507,7 +517,8 @@ def main_func(argv: List[str]):
                 covar_file=iargs[COVAR_FILE],
                 snps_per_block=iargs[SNPS_PER_BLOCK],
                 id_list=iargs[ID_LIST],
-                snp_list=iargs[SNP_LIST]
+                snp_list=iargs[SNP_LIST],
+                per_block_alpha=iargs[PER_BLOCK_ALPHA]
             )
 
             # Write out the results to disk per chromosome
