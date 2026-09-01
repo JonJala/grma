@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from scipy.sparse.csgraph import connected_components
 from scipy.stats import norm
 
 from bedbimfam import (
@@ -354,8 +355,84 @@ def get_rel_covariances(rel_df: pd.DataFrame,
     return rel_to_cov
 
 
+def get_block_alphas(off_diag: sp.csr_array, pheno_variance: float,
+                     epsilon=DEFAULT_OMEGA_EPSILON) -> Tuple[np.ndarray, np.ndarray]:
+    """Computes a shrinkage factor for each connected component of off_diag.
+
+    Omega's off-diagonal is block-diagonal over the connected components of the
+    relatedness graph: a pair only ever contributes to the block containing both
+    of its members.  The eigenvalues of a block-diagonal matrix are the union of
+    its blocks', so positive-definiteness is a PER-BLOCK property and there is no
+    mathematical requirement for alpha to be a single global scalar.
+
+    With one global alpha, the single worst component sets the shrinkage for
+    every individual in the sample.  Shrinking each component only as far as that
+    component requires preserves positive-definiteness identically -- every block
+    independently satisfies pheno_variance + alpha_c * lambda_min_c > 0, so the
+    union of the eigenvalues is positive -- while leaving unaffected blocks
+    untouched.
+
+    Args:
+        off_diag: The unshrunk off-diagonal, as built by calculate_omega
+        pheno_variance: Variance of the unresidualized phenotypes
+        epsilon: Small positive constant keeping the result strictly definite
+
+    Returns:
+        A tuple (alphas, labels) where alphas[c] is the shrinkage factor for
+        component c and labels[i] is the component index of sample i.
+    """
+
+    n_comp, labels = connected_components(off_diag, directed=False)
+    alphas = np.ones(n_comp, dtype=float)
+    sizes = np.bincount(labels, minlength=n_comp)
+
+    # Gershgorin's circle theorem bounds every eigenvalue of a symmetric matrix
+    # by its largest absolute row sum, so a block whose bound is already below
+    # pheno_variance cannot break positive-definiteness and needs no
+    # eigendecomposition.  This skips the overwhelming majority of blocks --
+    # ordinary nuclear families -- and keeps the cost close to the single global
+    # call it replaces.
+    row_abs_sum = np.abs(off_diag).sum(axis=1)
+    row_abs_sum = np.asarray(row_abs_sum).ravel()
+    block_bound = np.zeros(n_comp, dtype=float)
+    np.maximum.at(block_bound, labels, row_abs_sum)
+    candidates = np.nonzero((sizes > 1) & (block_bound >= pheno_variance))[0]
+    logging.debug(f"\t{n_comp} components; {len(candidates)} need an "
+                  f"eigendecomposition after the Gershgorin screen")
+
+    if len(candidates) == 0:
+        return alphas, labels
+
+    order = np.argsort(labels, kind="stable")
+    starts = np.searchsorted(labels[order], np.arange(n_comp))
+    ends = np.searchsorted(labels[order], np.arange(n_comp), side="right")
+
+    for c in candidates:
+        idx = order[starts[c]:ends[c]]
+        block = off_diag[idx][:, idx]
+        # eigsh needs k < n-1, and tiny blocks are cheaper and exact as dense
+        if block.shape[0] <= 3:
+            block_lambda_min = float(np.linalg.eigvalsh(block.toarray()).min())
+        else:
+            block_lambda_min = float(get_lambda_min(block))
+        if block_lambda_min < 0.0:
+            alphas[c] = min((epsilon - pheno_variance) / block_lambda_min, 1.0)
+
+    shrunk = alphas < 1.0
+    if np.any(shrunk):
+        logging.info(f"\tPer-block shrinkage: {int(shrunk.sum())} of {n_comp} "
+                     f"components shrunk; smallest alpha {alphas.min():.6f}, "
+                     f"{int(sizes[shrunk].sum())} of {off_diag.shape[0]} samples "
+                     f"affected")
+    else:
+        logging.info("\tPer-block shrinkage: no component required shrinking")
+
+    return alphas, labels
+
+
 def calculate_omega(rel_df: pd.DataFrame, N: int, unresidualized_phenotypes: np.ndarray,
-                    epsilon=DEFAULT_OMEGA_EPSILON) -> sp.csr_array:
+                    epsilon=DEFAULT_OMEGA_EPSILON,
+                    per_block_alpha: bool = False) -> sp.csr_array:
 
     rel_to_cov = get_rel_covariances(rel_df=rel_df,
                                      unresidualized_phenotypes=unresidualized_phenotypes)
@@ -371,11 +448,21 @@ def calculate_omega(rel_df: pd.DataFrame, N: int, unresidualized_phenotypes: np.
 
     off_diag = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
 
+    pheno_variance = np.var(unresidualized_phenotypes)
+    logging.debug(f"\t{pheno_variance=}")
+
+    if per_block_alpha:
+        # Scale each entry by the alpha of the component it belongs to.  Both
+        # members of a pair are in the same component by construction, so
+        # labels[rows] is the component of every entry in data.
+        alphas, labels = get_block_alphas(off_diag, pheno_variance, epsilon)
+        scaled = data * alphas[labels[rows]]
+        off_diag = sp.coo_array((scaled, (rows, cols)), shape=(N, N)).tocsr()
+        return pheno_variance * sp.eye(N) + off_diag
+
     lambda_min = get_lambda_min(off_diag)
     logging.debug(f"\t{lambda_min=}")
 
-    pheno_variance = np.var(unresidualized_phenotypes)
-    logging.debug(f"\t{pheno_variance=}")
     alpha = min((epsilon - pheno_variance) / lambda_min, 1.0) if lambda_min < 0.0 else 1.0
     logging.debug(f"\t{alpha=}\n")
 
@@ -410,7 +497,8 @@ def process_relatedness(
     rel_file: Union[str, pd.DataFrame],
     fam_df: pd.DataFrame,
     rel_degree: Union[str, int],
-    unresidualized_phenotypes: np.ndarray
+    unresidualized_phenotypes: np.ndarray,
+    per_block_alpha: bool = False
     ) -> Tuple[sp.csr_array, sp.csr_array, np.ndarray]:
     """Performs processing of the KING-formatted relatedness / pedigree file
 
@@ -482,7 +570,9 @@ def process_relatedness(
 
 
     # Create omega matrix
-    omega = calculate_omega(rel_df=rel_df, N=N, unresidualized_phenotypes=unresidualized_phenotypes)
+    omega = calculate_omega(rel_df=rel_df, N=N,
+                            unresidualized_phenotypes=unresidualized_phenotypes,
+                            per_block_alpha=per_block_alpha)
 
     # Create R matrix
     rel_df = rel_df[rel_df[KING_REL_COL] <= rel_degree]
@@ -825,7 +915,8 @@ def grma(
     covar_file: Union[str, pd.DataFrame] = None,
     snps_per_block: int = DEFAULT_SNPS_PER_BLOCK,
     id_list: Union[str, pd.DataFrame] = None,
-    snp_list: Union[str, pd.DataFrame] = None
+    snp_list: Union[str, pd.DataFrame] = None,
+    per_block_alpha: bool = False
 ) -> pd.DataFrame:
 
     logging.debug(f"GRMA called with: {locals()}\n\n")
@@ -855,7 +946,8 @@ def grma(
         rel_file=rel_file,
         fam_df=fam_df,
         rel_degree=rel_degree,
-        unresidualized_phenotypes=unresidualized_phenotypes
+        unresidualized_phenotypes=unresidualized_phenotypes,
+        per_block_alpha=per_block_alpha
     )
     del unresidualized_phenotypes
     logging.info(f"Processing relatedness info took {time.time() - rel_time} seconds\n")

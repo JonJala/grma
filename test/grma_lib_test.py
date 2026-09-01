@@ -429,6 +429,150 @@ class TestCalculateOmega:
         )
         assert np.allclose(actual_omega.toarray(), expected_omega.toarray(), atol=1e-3)
 
+    def test__per_block_alpha__single_component__matches_global(self):
+        # With only one multi-person component there is nothing to separate, so
+        # per-block shrinkage must reproduce the global result exactly.
+        N = 5
+        pheno = np.array([1.0, -1.0, 0.1, 0.1, 0.1])
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: [0],
+            sut.FAM_INDEX_2: [1],
+            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING],
+        })
+
+        global_omega = sut.calculate_omega(rel_df=rel_df, N=N,
+                                           unresidualized_phenotypes=pheno)
+        block_omega = sut.calculate_omega(rel_df=rel_df, N=N,
+                                          unresidualized_phenotypes=pheno,
+                                          per_block_alpha=True)
+
+        assert np.allclose(global_omega.toarray(), block_omega.toarray())
+
+    def test__per_block_alpha__default_is_unchanged(self):
+        # The flag must be opt-in: omitting it has to give the same output as
+        # the released behaviour.
+        #
+        # allclose rather than array_equal: get_lambda_min calls ARPACK, which
+        # seeds itself randomly, so repeated calls on the SAME matrix differ in
+        # the last ULP or two (-1.0 vs -0.99999999999999989 observed).  That
+        # non-determinism predates this change and affects the global path too.
+        N = 6
+        pheno = np.array([1.0, -1.0, 0.9, -0.8, 0.1, 0.1])
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: [0, 2],
+            sut.FAM_INDEX_2: [1, 3],
+            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING, sut.DEG_3RD],
+        })
+
+        default_omega = sut.calculate_omega(rel_df=rel_df, N=N,
+                                            unresidualized_phenotypes=pheno)
+        explicit_omega = sut.calculate_omega(rel_df=rel_df, N=N,
+                                             unresidualized_phenotypes=pheno,
+                                             per_block_alpha=False)
+
+        assert np.allclose(default_omega.toarray(), explicit_omega.toarray(),
+                           rtol=0, atol=1e-12)
+
+    def test__per_block_alpha__innocent_block_not_shrunk(self):
+        # Two disjoint components carrying the SAME relatedness degree, so both
+        # get the same covariance rho, and any difference in their shrinkage is
+        # due to STRUCTURE alone:
+        #
+        #   block A, a star 0-1 / 0-2 / 0-3   lambda_min = -rho*sqrt(3)
+        #   block B, a single pair 4-5        lambda_min = -rho
+        #
+        # The phenotypes below put var(y) between the two, so the star breaks
+        # positive-definiteness and the pair does not.  Under a global alpha the
+        # innocent pair is shrunk anyway; under per-block alpha it is untouched.
+        N = 10
+        pheno = np.array([0.680193, -0.845163, -0.010330, 0.699210, -1.368729,
+                          -1.756903, 0.215909, 0.036958, -0.204671, 0.032086])
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: [0, 0, 0, 4],
+            sut.FAM_INDEX_2: [1, 2, 3, 5],
+            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING] * 4,
+        })
+
+        rel_to_cov = sut.get_rel_covariances(rel_df=rel_df,
+                                             unresidualized_phenotypes=pheno)
+        rho = rel_to_cov[sut.DEG_PARENT_OFFSPRING]
+        pheno_var = float(np.var(pheno))
+        # the premise of the test
+        assert rho < pheno_var < rho * np.sqrt(3.0)
+
+        global_omega = sut.calculate_omega(rel_df=rel_df, N=N,
+                                           unresidualized_phenotypes=pheno).toarray()
+        block_omega = sut.calculate_omega(rel_df=rel_df, N=N,
+                                          unresidualized_phenotypes=pheno,
+                                          per_block_alpha=True).toarray()
+
+        # Global: the star's shrinkage is imposed on the innocent pair too.
+        assert np.isclose(global_omega[0, 1], global_omega[4, 5])
+        assert abs(global_omega[4, 5]) < abs(rho)
+
+        # Per block: the pair keeps its unshrunk covariance, the star does not.
+        assert np.isclose(block_omega[4, 5], rho)
+        assert abs(block_omega[0, 1]) < abs(rho)
+        assert not np.isclose(block_omega[0, 1], block_omega[4, 5])
+
+        # And the whole matrix is still positive semi-definite.
+        assert np.all(np.linalg.eigvalsh(block_omega) >= -1e-8)
+
+    def test__per_block_alpha__result_is_psd(self):
+        # The guarantee that matters: shrinking per block must still leave the
+        # whole matrix positive semi-definite.
+        rng = np.random.default_rng(20260831)
+        N = 40
+        pheno = rng.normal(size=N)
+        pairs = [(i, i + 1) for i in range(0, N - 1, 2)] + [(0, 2), (4, 6), (8, 10)]
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: [p[0] for p in pairs],
+            sut.FAM_INDEX_2: [p[1] for p in pairs],
+            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING] * len(pairs),
+        })
+
+        omega = sut.calculate_omega(rel_df=rel_df, N=N,
+                                    unresidualized_phenotypes=pheno,
+                                    per_block_alpha=True)
+
+        assert np.all(np.linalg.eigvalsh(omega.toarray()) >= -1e-8)
+
+    def test__get_block_alphas__gershgorin_screen_is_safe(self):
+        # The Gershgorin screen skips blocks it can prove are definite.  Verify
+        # it never skips one that needed shrinking, by checking every returned
+        # alpha against a direct per-block eigendecomposition.
+        rng = np.random.default_rng(1234)
+        N = 60
+        pheno = rng.normal(size=N)
+        pairs = [(i, i + 1) for i in range(0, N - 1, 3)] + [(0, 3), (6, 9)]
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: [p[0] for p in pairs],
+            sut.FAM_INDEX_2: [p[1] for p in pairs],
+            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING] * len(pairs),
+        })
+        rel_to_cov = sut.get_rel_covariances(rel_df=rel_df,
+                                             unresidualized_phenotypes=pheno)
+        i1 = rel_df[sut.FAM_INDEX_1].to_numpy(np.int64)
+        i2 = rel_df[sut.FAM_INDEX_2].to_numpy(np.int64)
+        data = np.tile(rel_df[sut.KING_REL_COL].map(rel_to_cov).to_numpy(), 2)
+        off_diag = sp.coo_array((data, (np.concatenate([i1, i2]),
+                                        np.concatenate([i2, i1]))),
+                                shape=(N, N)).tocsr()
+        pheno_var = float(np.var(pheno))
+
+        alphas, labels = sut.get_block_alphas(off_diag, pheno_var)
+
+        n_comp = labels.max() + 1
+        for c in range(n_comp):
+            idx = np.flatnonzero(labels == c)
+            if len(idx) < 2:
+                continue
+            block = off_diag[idx][:, idx].toarray()
+            lmin = float(np.linalg.eigvalsh(block).min())
+            expected = (min((sut.DEFAULT_OMEGA_EPSILON - pheno_var) / lmin, 1.0)
+                        if lmin < 0.0 else 1.0)
+            assert np.isclose(alphas[c], expected, atol=1e-6)
+
 
 
 
