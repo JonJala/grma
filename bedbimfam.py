@@ -92,8 +92,7 @@ def get_num_snps_from_bim_file(bim_filename: str):
     return M
 
 # -------------------------
-# TODO(jonbjala) Allow for float64?
-def read_bed_file(bed_filename: str, N: int, M: int, M_start: int = 0, num_snps: int = -1):
+def read_bed_file(bed_filename: str, *, M: int, N: int, M_start: int = 0, num_snps: int = -1):
 
     num_snps = num_snps if num_snps >= 0 else M - M_start
     M_end = M_start + num_snps
@@ -105,8 +104,6 @@ def read_bed_file(bed_filename: str, N: int, M: int, M_start: int = 0, num_snps:
     # Amount of bytes to read in for each SNP
     bed_block_size_in_bytes = math.ceil(N / _BED_SAMPLES_PER_BYTE)
 
-    G = np.zeros((num_snps, N), dtype=np.float32)
-    
     with open(bed_filename, 'rb') as bed_file:
 
         # Read in the first 3 bytes and check against expected .bed file prefix
@@ -151,7 +148,7 @@ read_bed_file._BED_BINARY_TO_VALUE_MAP = {
 read_bed_file._BED_BYTE_TO_VALARR_MAP = {
     int("%s%s%s%s" % tup, base=2) :
         np.array([read_bed_file._BED_BINARY_TO_VALUE_MAP[element] for element in reversed(tup)],
-                 dtype=np.float32) for tup in it.product(
+                 dtype=np.float64) for tup in it.product(
                      read_bed_file._BED_BINARY_TO_VALUE_MAP.keys(),
                      repeat=_BED_SAMPLES_PER_BYTE)
 }

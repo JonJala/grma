@@ -490,6 +490,57 @@ class TestProcessRelatedness:
         assert np.allclose(expected_se_matrix.toarray(), actual_se_matrix.toarray(), atol=0.001)
 
 
+    @pytest.mark.parametrize("rel_degree", ["FS", "AbCd", ""])
+    def test__rel_degree_nonint_str__expected_error(self, rel_degree):
+
+        tc_key = tcs.KEY_SIMPLE
+        rel_df, fam_df = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
+        unres_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy()
+
+        with pytest.raises(ValueError) as ex_info:
+            actual_R, actual_se_matrix, actual_res_pheno = \
+                sut.process_relatedness(rel_file=rel_df, fam_df=fam_df, rel_degree=rel_degree,
+                                        unresidualized_phenotypes=unres_pheno)
+
+        assert str(rel_degree) in str(ex_info.value)
+        assert str(0) in str(ex_info.value)
+        assert str(sut.MAX_GRMA_RELATEDNESS) in str(ex_info.value)
+        
+
+    @pytest.mark.parametrize("rel_degree", [1.0, {1, 2, 3}])
+    def test__rel_degree_wrong_type__expected_error(self, rel_degree):
+
+        tc_key = tcs.KEY_SIMPLE
+        rel_df, fam_df = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
+        unres_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy()
+
+        with pytest.raises(TypeError) as ex_info:
+            actual_R, actual_se_matrix, actual_res_pheno = \
+                sut.process_relatedness(rel_file=rel_df, fam_df=fam_df, rel_degree=rel_degree,
+                                        unresidualized_phenotypes=unres_pheno)
+
+        assert "str" in str(ex_info.value)
+        assert "int" in str(ex_info.value)
+        assert str(type(rel_degree)) in str(ex_info.value)
+
+
+    @pytest.mark.parametrize("rel_degree", [-1, sut.MAX_GRMA_RELATEDNESS + 1])
+    def test__rel_degree_out_of_range__expected_error(self, rel_degree):
+
+        tc_key = tcs.KEY_SIMPLE
+        rel_df, fam_df = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
+        unres_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy()
+
+        with pytest.raises(ValueError) as ex_info:
+            actual_R, actual_se_matrix, actual_res_pheno = \
+                sut.process_relatedness(rel_file=rel_df, fam_df=fam_df, rel_degree=rel_degree,
+                                        unresidualized_phenotypes=unres_pheno)
+
+        assert str(rel_degree) in str(ex_info.value)
+        assert str(0) in str(ex_info.value)
+        assert str(sut.MAX_GRMA_RELATEDNESS) in str(ex_info.value)
+
+
     @pytest.mark.parametrize("rng_seed", [1, 34])
     def test__permute_rel_file__same_results(self, rng_seed):
         rng = np.random.default_rng(seed=rng_seed)

@@ -217,7 +217,8 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
                             help="Paths to PLINK 1 binary files. See python glob module for "
                                  "documentation on the string(s) to be provided here "
                                  "(full path with support for \"*\", \"?\", and \"[]\").  "
-                                 "These strings should be encased in quotes.  ")
+                                 "These strings should be encased in quotes.  Files must "
+                                 "be split by chromosome (one and only one chromosome per file)")
 
     infile_opt.add_argument("--fam", metavar="FILE", type=input_file, required=False,
                             help="Optional input to specify full path and filename of "
@@ -424,10 +425,18 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     fam_files = [pargs.fam] if pargs.fam else [f"{bfile}{FAM_SUFFIX}" for bfile in bfiles]
     file_list = bed_files + bim_files + fam_files
     
+    # Check for missing files
     missing_files = [file for file in file_list if not os.path.exists(file)]
-    
     if missing_files:
         raise FileNotFoundError(f"Missing the following files: {missing_files}")
+
+    # Check for duplicate bfile basenames (causes collisions in results reporting)
+    basenames = [os.path.splitext(os.path.basename(bed_file))[0] for bed_file in bed_files]
+    duplicates = sorted({basename for basename in basenames if basenames.count(basename) > 1})
+    if duplicates:
+        raise ValueError(f"Multiple filesets specified by --bfile share a basename, which would "
+                         f"cause their output files to overwrite each other: {duplicates}.  "
+                         f"Rename the inputs or run them separately with distinct --out prefixes.")
 
     if len(fam_files) == 1:
         fam_files = fam_files * len(bed_files)
@@ -513,7 +522,7 @@ def main_func(argv: List[str]):
             # Write out the results to disk per chromosome
             logging.info("Writing results to disk.")
             bfile_basename = os.path.splitext(os.path.basename(bed_file))[0]
-            filename = f"{iargs[OUT_PREFIX]}.res"
+            filename = f"{iargs[OUT_PREFIX]}_{bfile_basename}.res"
             logging.debug(f"\t{filename}")
             write_results_to_file(filename, results)
 

@@ -14,7 +14,7 @@ grma.py --bfile tutorial/tutorial --rel-pedigree tutorial/tutorial.kin --rel-thr
 
 If grma.py is not found, try using "./grma.py" or make sure the current working directory is added to your PATH.
 
-This should produce files user_FS.res and user_FS.log in the tutorial directory.  The log file will show
+This should produce files user_FS_tutorial.res and user_FS.log in the tutorial directory.  The log file will show
 some status and processing steps that GRMA went through during the analysis.  For a more extended log, you can
 add the --verbose option.  The .res file has the actual GRMA results, in this case using the full sibling
 relationship threshold.
@@ -23,7 +23,7 @@ Next, try running:
 
 grma.py --bfile tutorial/tutorial --rel-pedigree tutorial/tutorial.kin --rel-thresh 3 --out tutorial/user_3
 
-This should produce files user_3.res and user_3.log in the tutorial directory.
+This should produce files user_3_tutorial.res and user_3.log in the tutorial directory.
 In this case, the .res file has results using the degree 3 relationship threshold.
 
 
@@ -48,7 +48,8 @@ options:
 Input Specifications:
   --bfile GLOB_PATH [GLOB_PATH ...]
                         Paths to PLINK 1 binary files. See python glob module for documentation on the string(s) to be provided here (full path with support for "*", "?", and "[]").
-                        These strings should be encased in quotes.
+                        These strings should be encased in quotes.  Files must
+                            be split by chromosome (one and only one chromosome per file)
   --fam FILE            Optional input to specify full path and filename of input fam file. Overrides --bfile flag if specified
   --pheno FILE          Optional input to specify a (Plink-style) phenotype file: https://www.cog-genomics.org/plink/1.9/input#pheno
   --covar FILE          Optional input to specify a (Plink-style) covariates file: https://www.cog-genomics.org/plink/2.0/input#covar

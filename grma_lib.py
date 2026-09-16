@@ -5,6 +5,7 @@ Library / core code for GRMA method
 """
 
 import logging
+import operator
 import textwrap
 import time
 from typing import Tuple, Union
@@ -16,21 +17,15 @@ import scipy.sparse.linalg as spla
 from scipy.stats import norm
 
 from bedbimfam import (
-    BED_SUFFIX,
     BIM_COLS,
     BIM_RSID_COL,
-    BIM_SUFFIX,
     FAM_COLS,
     FAM_FID_COL,
     FAM_IID_COL,
     FAM_IIDF_COL,
     FAM_IIDM_COL,
-    FAM_SEX_COL,
     FAM_PHENO_COL,
-    FAM_SUFFIX,
-    get_num_snps_from_bim_file,
-    get_sample_size_from_fam_file,
-    read_bed_file,
+    read_bed_file
 )
 
 # Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to increase clarity
@@ -107,11 +102,6 @@ INFTYPE_TO_DEG_MAP = {
 
 MAX_GRMA_RELATEDNESS = 3  # Maximum degree of relatedness GRMA currently handles
 SE_RELATEDNESS = 3  # Relatedness to include in SE calculations
-
-
-# Kinship thresholds
-MIN_KINSHIP_THRESH = 0.0
-MAX_KINSHIP_THRESH = 0.0625
 
 
 # Default number of SNPs to process at a time
@@ -440,10 +430,24 @@ def process_relatedness(
 
     # Make sure the relatedness threshold is of the correct type
     if isinstance(rel_degree, str):
-        rel_degree = int(rel_degree)
-    elif not isinstance(rel_degree, int):
-        raise TypeError(f"Expected str or int for parameter rel_degree, but "
-                        f"received {type(rel_degree)}")
+        try:
+            rel_degree = int(rel_degree)
+        except ValueError as exc:
+            raise ValueError(f"Could not interpret rel_degree ({rel_degree!r}) as an integer.  "
+                             f"Expected a value from 0 to {MAX_GRMA_RELATEDNESS} (note that KING "
+                             f"InfTypes such as \"FS\" are not valid for this parameter).") from exc
+    else:
+        try:
+            rel_degree = operator.index(rel_degree)
+        except TypeError as exc:
+            raise TypeError(f"Expected str or int for parameter rel_degree, but "
+                            f"received {type(rel_degree)}") from exc
+
+    # Make sure the relatedness threshold is in range.
+    if not 0 <= rel_degree <= MAX_GRMA_RELATEDNESS:
+        raise ValueError(f"Received rel_degree = {rel_degree}, but it must be between 0 and "
+                         f"{MAX_GRMA_RELATEDNESS} (inclusive).")
+
 
     # Read in relatedness file (should be in KING format)
     rel_df, _ = get_df(rel_file, "rel_file", {"header":0})
@@ -636,6 +640,8 @@ def get_residualized_genotype_data(bed_file: Union[str, np.ndarray], M_orig: int
 
 def calculate_betas(genotypes: np.ndarray, phenotypes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     XtX = np.einsum('ij,ij->i', genotypes, genotypes)
+
+    # TODO(jonbjala) Do we want this line in the long run??
     XtX[XtX == 0.0] = np.finfo(XtX.dtype).eps  # Replace 0.0 with something incredibly small
 
     betas = np.einsum('ij,j->i', genotypes, phenotypes) / XtX
@@ -648,6 +654,8 @@ def calculate_ses(genotypes: np.ndarray, se_matrix: sp.csr_array, XtX: np.ndarra
     product2 = np.einsum('ij,ij->j', product1, genotypes.T)
 
     ses = np.sqrt(product2) / XtX
+
+    # TODO(jonbjala) Do we want this line in the long run??
     ses[ses == 0.0] = np.finfo(ses.dtype).eps  # Replace 0.0 with something incredibly small
 
     return ses
@@ -768,7 +776,7 @@ def calculate_chisqs(betas: np.ndarray, ses: np.ndarray) -> np.ndarray:
     return np.square(betas / ses)
 
 
-def create_output(bim_file: Union[str, np.ndarray], snp_filter: np.ndarray,
+def create_output(bim_file: Union[str, pd.DataFrame], snp_filter: np.ndarray,
                   betas: np.ndarray, ses: np.ndarray, sum_sq_x: np.ndarray) -> pd.DataFrame:
 
     # Read in bim file
