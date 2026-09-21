@@ -430,6 +430,128 @@ class TestCalculateOmega:
         assert np.allclose(actual_omega.toarray(), expected_omega.toarray(), atol=1e-3)
 
 
+    def test__multiple_components__only_guilty_block_shrunk(self):
+        # Two disjoint components carrying the SAME relatedness degree, so both get the same
+        # covariance rho and any difference in their shrinkage is due to STRUCTURE alone:
+        #
+        #   block A, a star 0-1 / 0-2 / 0-3   lambda_min = -rho*sqrt(3)
+        #   block B, a single pair 4-5        lambda_min = -rho
+        #
+        # The phenotypes below put var(y) between the two, so the star breaks
+        # positive-definiteness and the pair does not.  A single global alpha would shrink the
+        # innocent pair anyway; per-block leaves it untouched.
+        N = 10
+        pheno = np.array([0.680193, -0.845163, -0.010330, 0.699210, -1.368729,
+                          -1.756903, 0.215909, 0.036958, -0.204671, 0.032086])
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: [0, 0, 0, 4],
+            sut.FAM_INDEX_2: [1, 2, 3, 5],
+            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING] * 4,
+        })
+
+        rel_to_cov = sut.get_rel_covariances(rel_df=rel_df, unresidualized_phenotypes=pheno)
+        rho = rel_to_cov[sut.DEG_PARENT_OFFSPRING]
+        pheno_var = float(np.var(pheno))
+
+        # The premise of the test: the star breaks PD, the pair does not
+        assert rho < pheno_var < rho * np.sqrt(3.0)
+
+        omega = sut.calculate_omega(rel_df=rel_df, N=N,
+                                    unresidualized_phenotypes=pheno).toarray()
+
+        # The pair keeps its unshrunk covariance; the star does not
+        assert np.isclose(omega[4, 5], rho)
+        assert abs(omega[0, 1]) < abs(rho)
+        assert not np.isclose(omega[0, 1], omega[4, 5])
+
+        # What a single global alpha would have done to the innocent pair, for contrast
+        global_alpha = min((sut.DEFAULT_OMEGA_EPSILON - pheno_var) / (-rho * np.sqrt(3.0)), 1.0)
+        assert not np.isclose(omega[4, 5], global_alpha * rho)
+
+        # And the whole matrix is still positive semi-definite
+        assert np.all(np.linalg.eigvalsh(omega) >= -1e-8)
+
+
+    def test__per_block_shrinkage__result_is_psd(self):
+        # The guarantee that matters: shrinking per block must still leave the whole matrix
+        # positive semi-definite.
+        rng = np.random.default_rng(20260831)
+        N = 40
+        pheno = rng.normal(size=N)
+        pairs = [(i, i + 1) for i in range(0, N - 1, 2)] + [(0, 2), (4, 6), (8, 10)]
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: [p[0] for p in pairs],
+            sut.FAM_INDEX_2: [p[1] for p in pairs],
+            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING] * len(pairs),
+        })
+
+        omega = sut.calculate_omega(rel_df=rel_df, N=N, unresidualized_phenotypes=pheno)
+
+        assert np.all(np.linalg.eigvalsh(omega.toarray()) >= -1e-8)
+
+
+    def test__no_related_pairs__omega_is_diagonal(self):
+        # With no pairs at all every sample is its own component, off_diag is empty, and omega
+        # should come back as pheno_variance on the diagonal and nothing else.
+        N = 6
+        pheno = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: pd.Series(dtype=np.int64),
+            sut.FAM_INDEX_2: pd.Series(dtype=np.int64),
+            sut.KING_REL_COL: pd.Series(dtype=np.int64),
+        })
+
+        omega = sut.calculate_omega(rel_df=rel_df, N=N,
+                                    unresidualized_phenotypes=pheno).toarray()
+
+        assert np.allclose(omega, np.var(pheno) * np.eye(N))
+
+
+    def test__all_blocks_pass_gershgorin_screen__no_shrinkage(self):
+        # When every block's largest absolute row sum is below pheno_variance, the screen proves
+        # all of them definite and no eigendecomposition happens at all.  Exercises the
+        # early-return path in get_block_alphas().
+        N = 8
+        pheno = np.array([12.0, -11.0, 9.0, -13.0, 10.0, -9.0, 11.0, -12.0])
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: [0, 2, 4],
+            sut.FAM_INDEX_2: [1, 3, 5],
+            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING] * 3,
+        })
+
+        rel_to_cov = sut.get_rel_covariances(rel_df=rel_df, unresidualized_phenotypes=pheno)
+        rho = rel_to_cov[sut.DEG_PARENT_OFFSPRING]
+
+        # Premise: each block is a bare pair, so its row sum is |rho|, comfortably under var(y)
+        assert abs(rho) < float(np.var(pheno))
+
+        omega = sut.calculate_omega(rel_df=rel_df, N=N,
+                                    unresidualized_phenotypes=pheno).toarray()
+
+        # No shrinkage anywhere -- every off-diagonal entry is the raw covariance
+        assert np.isclose(omega[0, 1], rho)
+        assert np.isclose(omega[2, 3], rho)
+        assert np.isclose(omega[4, 5], rho)
+
+
+    def test__degree_without_covariance__expected_error(self):
+        # get_rel_covariances() keys rel_to_cov over range(SE_RELATEDNESS + 1), so a degree above
+        # that maps to NaN.  process_relatedness() filters those out before calling this function,
+        # so it is unreachable in normal use -- but a NaN must not pass silently, because the
+        # Gershgorin screen compares against a row sum and every comparison against NaN is False.
+        # The block would keep alpha=1, skip its eigendecomposition, and poison omega.
+        N = 4
+        pheno = np.array([1.0, 2.0, 3.0, 4.0])
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: [0, 2],
+            sut.FAM_INDEX_2: [1, 3],
+            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING, sut.DEG_4TH],
+        })
+
+        with pytest.raises(ValueError) as ex_info:
+            sut.calculate_omega(rel_df=rel_df, N=N, unresidualized_phenotypes=pheno)
+
+        assert str(sut.DEG_4TH) in str(ex_info.value)
 
 
 class TestProcessRelatedness:
@@ -505,7 +627,7 @@ class TestProcessRelatedness:
         assert str(rel_degree) in str(ex_info.value)
         assert str(0) in str(ex_info.value)
         assert str(sut.MAX_GRMA_RELATEDNESS) in str(ex_info.value)
-        
+
 
     @pytest.mark.parametrize("rel_degree", [1.0, {1, 2, 3}])
     def test__rel_degree_wrong_type__expected_error(self, rel_degree):
@@ -669,6 +791,77 @@ class TestProcessRelatedness:
 
     def test__fully_randomized__expected_results(self):
         pass
+
+
+class TestGetBlockAlphas:
+
+    def test__gershgorin_screen_is_safe(self):
+        # The Gershgorin screen skips blocks it can prove are definite.  Verify it never skips one
+        # that needed shrinking, by checking every returned alpha against a direct per-block
+        # eigendecomposition.
+        rng = np.random.default_rng(1234)
+        N = 60
+        pheno = rng.normal(size=N)
+        pairs = [(i, i + 1) for i in range(0, N - 1, 3)] + [(0, 3), (6, 9)]
+        rel_df = pd.DataFrame({
+            sut.FAM_INDEX_1: [p[0] for p in pairs],
+            sut.FAM_INDEX_2: [p[1] for p in pairs],
+            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING] * len(pairs),
+        })
+        rel_to_cov = sut.get_rel_covariances(rel_df=rel_df, unresidualized_phenotypes=pheno)
+        i1 = rel_df[sut.FAM_INDEX_1].to_numpy(np.int64)
+        i2 = rel_df[sut.FAM_INDEX_2].to_numpy(np.int64)
+        data = np.tile(rel_df[sut.KING_REL_COL].map(rel_to_cov).to_numpy(), 2)
+        off_diag = sp.coo_array((data, (np.concatenate([i1, i2]),
+                                        np.concatenate([i2, i1]))), shape=(N, N)).tocsr()
+        pheno_var = float(np.var(pheno))
+
+        alphas, labels = sut.get_block_alphas(off_diag, pheno_var)
+
+        for c in range(labels.max() + 1):
+            idx = np.flatnonzero(labels == c)
+            if len(idx) < 2:
+                continue
+            block = off_diag[idx][:, idx].toarray()
+            lmin = float(np.linalg.eigvalsh(block).min())
+            expected = (min((sut.DEFAULT_OMEGA_EPSILON - pheno_var) / lmin, 1.0)
+                        if lmin < 0.0 else 1.0)
+            assert np.isclose(alphas[c], expected, atol=1e-6)
+
+
+class TestGetLambdaMin:
+
+    @staticmethod
+    def _banded_matrix(N: int, seed: int):
+        rng = np.random.default_rng(seed)
+        vals = rng.normal(size=N - 1)
+        rows = np.concatenate([np.arange(N - 1), np.arange(1, N)])
+        cols = np.concatenate([np.arange(1, N), np.arange(N - 1)])
+        return sp.coo_array((np.concatenate([vals, vals]), (rows, cols)), shape=(N, N)).tocsr()
+
+    @pytest.mark.parametrize("N", [sut.DENSE_LAMBDA_MIN_MAX_SIZE,
+                                   sut.DENSE_LAMBDA_MIN_MAX_SIZE + 1,
+                                   sut.DENSE_LAMBDA_MIN_MAX_SIZE + 100])
+    def test__both_paths_agree_with_dense_truth(self, N):
+        # get_lambda_min routes small matrices to a dense eigendecomposition and larger ones to
+        # ARPACK.  Both sides of that boundary must agree with the dense answer, otherwise a
+        # mistaken comparison would silently send everything down one path.
+        B = self._banded_matrix(N, seed=99)
+
+        expected = float(np.linalg.eigvalsh(B.toarray()).min())
+
+        assert np.isclose(sut.get_lambda_min(B), expected, atol=1e-6)
+
+
+    def test__repeated_calls_are_deterministic(self):
+        # ARPACK starts from a random vector unless given one, which made repeated runs differ at
+        # the ULP level.  get_lambda_min fixes the start vector; this pins that down.
+        B = self._banded_matrix(sut.DENSE_LAMBDA_MIN_MAX_SIZE + 200, seed=7)
+
+        results = [sut.get_lambda_min(B) for _ in range(5)]
+
+        assert len(set(results)) == 1
+
 
 
 class TestProcessBimFile:

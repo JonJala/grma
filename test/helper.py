@@ -4,6 +4,7 @@ import sys
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+from scipy.sparse.csgraph import connected_components
 import scipy.sparse.linalg as spla
 
 main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -68,37 +69,55 @@ def mock_create_rel_info(king_df: pd.DataFrame, fam_df: pd.DataFrame, rel_deg: i
 
 
 def mock_shrink_offdiag(matrix: sp.csr_array, weight: float = 0.75):
+    """Independent per-block reimplementation of the shrinkage applied in calculate_omega().
 
-    lam_min = spla.eigsh(matrix, k=1, which="SA", return_eigenvectors=False)[0]
-    if lam_min > 0.0:
-        return matrix
+    Deliberately does NOT use the closed form (epsilon - variance) / lambda_min that production
+    uses.  Instead it binary-searches, within each connected component, for the largest alpha
+    that keeps that component positive definite.  Agreement between the two is therefore a real
+    cross-check rather than a restatement of the same formula.
 
+    Note that this makes no attempt to replicate the Gershgorin screen in get_block_alphas().
+    That screen only decides which blocks can skip an eigendecomposition -- it never changes an
+    alpha -- so examining every block here is equivalent by construction, and means a faulty
+    screen shows up as a disagreement rather than being replicated into the expected value.
+    The same reasoning applies to the dense/ARPACK routing in get_lambda_min(): this uses a dense
+    eigendecomposition throughout, so a mistake in that routing is also visible here.
+    """
 
-    D = sp.diags(matrix.diagonal())
+    diag = matrix.diagonal()
     off_diag = matrix.copy()
     off_diag.setdiag(0)
     off_diag.eliminate_zeros()
 
-    alpha_min = 0.0
-    alpha_max = 1.0
+    n_comp, labels = connected_components(off_diag, directed=False)
+    dense_off = off_diag.toarray()
+    alphas = np.ones(n_comp)
 
-    num_iterations = 35
-    for iter_num in range(num_iterations):
-        alpha = weight * alpha_max + (1.0 - weight) * alpha_min
+    for c in range(n_comp):
+        idx = np.nonzero(labels == c)[0]
+        if len(idx) < 2:
+            continue
 
-        result = D + alpha * off_diag
-        lam_min = spla.eigsh(result, k=1, which="SA", return_eigenvectors=False)[0]
-        if lam_min > 0:
-            alpha_min = alpha
-        else:
-            alpha_max = alpha
+        block_off = dense_off[np.ix_(idx, idx)]
+        block_diag = np.diag(diag[idx])
 
-    lam_min = spla.eigsh(result, k=1, which="SA", return_eigenvectors=False)[0]
-    if lam_min < 0:
-        result = D + alpha_min * off_diag
+        if np.linalg.eigvalsh(block_diag + block_off).min() > 0.0:
+            continue
 
+        alpha_min = 0.0
+        alpha_max = 1.0
+        for _ in range(35):
+            alpha = weight * alpha_max + (1.0 - weight) * alpha_min
+            if np.linalg.eigvalsh(block_diag + alpha * block_off).min() > 0.0:
+                alpha_min = alpha
+            else:
+                alpha_max = alpha
 
-    return result
+        alphas[c] = alpha_min
+
+    # Both members of a pair are in the same component, so scaling row i by its own component's
+    # alpha scales every entry correctly.
+    return sp.csr_array(np.diag(diag) + dense_off * alphas[labels][:, None])
 
 
 def mock_calc_omega(fam_df: pd.DataFrame, N: int, rel_df: pd.DataFrame,

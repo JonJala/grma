@@ -13,6 +13,7 @@ from typing import Tuple, Union
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+from scipy.sparse.csgraph import connected_components
 import scipy.sparse.linalg as spla
 from scipy.stats import norm
 
@@ -111,6 +112,12 @@ DEFAULT_SNPS_PER_BLOCK = 100
 DEFAULT_OMEGA_EPSILON = 1e-10
 DEFAULT_EIGSH_TOL = 1e-8
 
+# Matrices at or below this size use a dense eigendecomposition instead of ARPACK (exact,
+# deterministic, and faster at this scale).  Relatedness blocks are nearly always well under this.
+DENSE_LAMBDA_MIN_MAX_SIZE = 500
+
+# Fixed seed for the ARPACK start vector, so repeated runs give identical results
+EIGSH_START_VECTOR_SEED = 8675309
 
 # Output columns
 OUTPUT_BETA_COL = 'BETA'
@@ -316,16 +323,104 @@ def get_lambda_min(B: Union[np.ndarray, sp.csr_array], tol=DEFAULT_EIGSH_TOL) ->
 
     N = B.shape[0]
 
+    # For small matrices a dense eigendecomposition is exact, deterministic, and avoids ARPACK's
+    # convergence failures entirely.  Relatedness blocks are almost always families of a handful
+    # of people, so in practice this is the path taken.
+    if N <= DENSE_LAMBDA_MIN_MAX_SIZE:
+        return float(np.linalg.eigvalsh(B.toarray() if sp.issparse(B) else B).min())
+
+    # ARPACK is iterative and starts from a random vector unless told otherwise, which makes
+    # results differ between runs at the ULP level.  A fixed start vector makes them repeatable.
+    # (A vector of ones is a poor choice here -- it is exactly orthogonal to the smallest
+    # eigenvector of a bipartite-like block, which is precisely the structure that needs shrinking.)
+    v0 = np.random.default_rng(EIGSH_START_VECTOR_SEED).standard_normal(N)
+
     for ncv_factor_exp in range(5):
         ncv = min(N, 20 * 2 ** (ncv_factor_exp + 1))
 
         try:
-            eigenvalues, _ = spla.eigsh(B, k=1, which='SA', tol=tol, ncv=ncv)
+            eigenvalues, _ = spla.eigsh(B, k=1, which='SA', tol=tol, ncv=ncv, v0=v0)
             return eigenvalues[0]
         except spla.ArpackNoConvergence:
             continue
 
     raise RuntimeError("Eigsh failed to converge.  Not possible to compute omega.")
+
+
+def get_block_alphas(off_diag: sp.csr_array, pheno_variance: float,
+                     epsilon=DEFAULT_OMEGA_EPSILON) -> Tuple[np.ndarray, np.ndarray]:
+    """Computes a shrinkage factor for each connected component of off_diag.
+
+    Omega's off-diagonal is block-diagonal over the connected components of the relatedness
+    graph: a pair only ever contributes to the block containing both of its members.  The
+    eigenvalues of a block-diagonal matrix are the union of its blocks', so positive-definiteness
+    is a PER-BLOCK property and there is no mathematical requirement for alpha to be a single
+    global scalar.
+
+    With one global alpha, the single worst component sets the shrinkage for every individual in
+    the sample.  Shrinking each component only as far as that component requires preserves
+    positive-definiteness identically -- every block independently satisfies
+    pheno_variance + alpha_c * lambda_min_c >= epsilon, so the union of the eigenvalues is
+    positive -- while leaving unaffected blocks untouched.
+
+    Args:
+        off_diag: The unshrunk off-diagonal, as built by calculate_omega
+        pheno_variance: Variance of the unresidualized phenotypes
+        epsilon: Small positive constant keeping the result strictly definite
+
+    Returns:
+        A tuple (alphas, labels) where alphas[c] is the shrinkage factor for component c and
+        labels[i] is the component index of sample i.
+    """
+
+    n_comp, labels = connected_components(off_diag, directed=False)
+    alphas = np.ones(n_comp, dtype=float)
+    sizes = np.bincount(labels, minlength=n_comp)
+
+    # Gershgorin's circle theorem bounds every eigenvalue of a symmetric matrix by its largest
+    # absolute row sum.  off_diag has a zero diagonal, so lambda_min >= -max_row_sum, and a block
+    # whose bound is already below pheno_variance cannot break positive-definiteness -- no
+    # eigendecomposition needed.  This skips the overwhelming majority of blocks (ordinary
+    # families) and keeps the cost close to the single global call it replaces.  The threshold is
+    # pheno_variance - epsilon rather than pheno_variance because alpha targets a smallest
+    # eigenvalue of epsilon, not of zero.
+    row_abs_sum = np.asarray(np.abs(off_diag).sum(axis=1)).ravel()
+    block_bound = np.zeros(n_comp, dtype=float)
+    np.maximum.at(block_bound, labels, row_abs_sum)
+
+    candidates = np.nonzero((sizes > 1) & (block_bound >= pheno_variance - epsilon))[0]
+    logging.debug(f"\t{n_comp} relatedness components; {len(candidates)} need an "
+                  f"eigendecomposition after the Gershgorin screen")
+
+    if len(candidates) > 0:
+        order = np.argsort(labels, kind="stable")
+        starts = np.searchsorted(labels[order], np.arange(n_comp))
+        ends = np.searchsorted(labels[order], np.arange(n_comp), side="right")
+
+        for c in candidates:
+            idx = order[starts[c]:ends[c]]
+            block_lambda_min = get_lambda_min(off_diag[idx][:, idx])
+
+            if block_lambda_min < 0.0:
+                alphas[c] = min((epsilon - pheno_variance) / block_lambda_min, 1.0)
+
+                # |lambda_min| / max_row_sum separates a densely interconnected family (ratio near
+                # 1/degree) from a triangle-free hub (ratio near 1).  The latter often indicates a
+                # data problem rather than a real pedigree.
+                logging.debug(f"\t\tComponent {c}: size={sizes[c]}, alpha={alphas[c]:.6f}, "
+                              f"lambda_min={block_lambda_min:.6g}, "
+                              f"max_row_sum={block_bound[c]:.6g}, "
+                              f"ratio={abs(block_lambda_min) / block_bound[c]:.4f}")
+
+    shrunk = alphas < 1.0
+    if np.any(shrunk):
+        logging.info(f"\tPer-block shrinkage: {int(shrunk.sum())} of {n_comp} components shrunk; "
+                     f"smallest alpha {alphas.min():.6f}, {int(sizes[shrunk].sum())} of "
+                     f"{off_diag.shape[0]} samples affected")
+    else:
+        logging.info("\tPer-block shrinkage: no component required shrinking")
+
+    return alphas, labels
 
 
 def get_rel_covariances(rel_df: pd.DataFrame,
@@ -359,17 +454,31 @@ def calculate_omega(rel_df: pd.DataFrame, N: int, unresidualized_phenotypes: np.
     cols = np.concatenate([i2, i1])
     data = np.tile(rel.map(rel_to_cov).to_numpy(), 2)
 
-    off_diag = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
+    # get_rel_covariances() returns NaN for any degree with no pairs, so a degree present in
+    # rel_df but absent from rel_to_cov maps to NaN here.  That should be unreachable (rel_df is
+    # filtered to <= SE_RELATEDNESS before this point, and rel_to_cov is keyed over that same
+    # range), but it must not pass silently: the Gershgorin screen in get_block_alphas() compares
+    # against a row sum, and every comparison against NaN is False, so a NaN block would fail the
+    # candidate test, keep alpha=1 without an eigendecomposition, and propagate NaN into omega.
+    if not np.all(np.isfinite(data)):
+        bad_degrees = sorted(rel[~np.isfinite(rel.map(rel_to_cov))].unique())
+        raise ValueError(f"No covariance could be computed for relatedness degree(s) "
+                         f"{bad_degrees}, which are present in the relatedness data.  This "
+                         f"would silently produce a NaN omega.")
 
-    lambda_min = get_lambda_min(off_diag)
-    logging.debug(f"\t{lambda_min=}")
+    off_diag = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
 
     pheno_variance = np.var(unresidualized_phenotypes)
     logging.debug(f"\t{pheno_variance=}")
-    alpha = min((epsilon - pheno_variance) / lambda_min, 1.0) if lambda_min < 0.0 else 1.0
-    logging.debug(f"\t{alpha=}\n")
 
-    omega = pheno_variance * sp.eye(N) + alpha * off_diag
+    alphas, labels = get_block_alphas(off_diag, pheno_variance, epsilon)
+
+    # Scale each entry by the alpha of the component it belongs to.  Both members of a pair are in
+    # the same component by construction, so a nonzero's column index identifies its component
+    # just as well as its row index does.
+    off_diag.data *= alphas[labels[off_diag.indices]]
+
+    omega = pheno_variance * sp.eye(N) + off_diag
 
     return omega
 
