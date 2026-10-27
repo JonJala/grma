@@ -21,3 +21,6 @@
 .coverage*
 **/htmlcov
 
+# Ignore results files
+*.res
+

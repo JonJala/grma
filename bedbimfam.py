@@ -91,6 +91,19 @@ def get_num_snps_from_bim_file(bim_filename: str):
 
     return M
 
+
+# -------------------------
+def get_chromosome_from_bim_file(bim_filename: str):
+    """
+    Reads the chromosome of a bim file's first variant.  Only the first line is read, since this
+    is used to pair filesets with other per-chromosome inputs before any processing begins.  It
+    does not confirm that the file holds only one chromosome -- that check needs the whole column
+    and belongs where the bim is read in full.
+    """
+
+    with open(bim_filename) as f:
+        return f.readline().split()[BIM_COLS.index(BIM_CHR_COL)]
+
 # -------------------------
 def read_bed_file(bed_filename: str, *, M: int, N: int, M_start: int = 0, num_snps: int = -1):
 

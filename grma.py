@@ -7,6 +7,7 @@ Python tool for genetic association analyses
 import argparse as argp
 import contextlib
 import glob
+import hashlib
 from io import StringIO
 import logging
 import os
@@ -17,8 +18,9 @@ from typing import Any, Callable, Dict, List, Set, Tuple, Union
 import numpy as np
 import pandas as pd
 
-from bedbimfam import (BED_SUFFIX, BIM_SUFFIX, FAM_SUFFIX)
+import bedbimfam as bbf
 import grma_lib as lib
+import snipar_hdf5 as snipar
 
 
 # Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to
@@ -67,6 +69,12 @@ DEFAULT_SHORT_PREFIX = "grma"
 # Default prefix to use for output when not specified
 DEFAULT_FULL_OUT_PREFIX = os.path.join(os.getcwd(), DEFAULT_SHORT_PREFIX)
 
+# Suffix of the per-fileset results file
+RES_SUFFIX = ".res"
+
+# Suffix expected on imputed parental genotype files (snipar `impute.py` output)
+IMPUTED_PARENTAL_SUFFIX = ".hdf5"
+
 # Dictionary keys for internal usage
 OUT_DIR = "Output Directory"
 OUT_PREFIX = "Output Prefix"
@@ -80,7 +88,7 @@ REL_DEG = "Relatedness Degree"
 SNPS_PER_BLOCK = "SNPs Per Block"
 ID_LIST = "ID List"
 SNP_LIST = "SNP List"
-
+IMPUTED_PARENTAL_FILES = "Imputed Parental Files"
 
 # Type declaration
 ParserFunc = Callable[[str], argp.ArgumentParser]
@@ -185,7 +193,7 @@ def bfile_glob_path(s_input: str) -> Set[str]:
 
     :return: Set of file paths
     """
-    files_to_find = f"{s_input}{BED_SUFFIX}"
+    files_to_find = f"{s_input}{bbf.BED_SUFFIX}"
     file_path_list = glob.glob(files_to_find)  
     
     if not file_path_list:
@@ -235,7 +243,19 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
     infile_opt.add_argument("--rel-pedigree", metavar="FILE", type=input_file, required=True,
                             help=f"Path to KING-formatted relatedness file (ASCII). "
                                  f"Needs the following columns: {lib.NEEDED_KING_COLS}")
-
+    infile_opt.add_argument("--imputed-parents", type=bfile_glob_path, required=False,
+                            metavar="GLOB_PATH", nargs="+",
+                            help="Optional input to specify imputed parental genotype files "
+                                 "(HDF5, as written by snipar's impute.py).  One file per "
+                                 "chromosome, matched to the --bfile filesets by the chromosome "
+                                 "recorded inside each file.  See python glob module for "
+                                 "documentation on the string(s) to be provided here (full path "
+                                 "with support for \"*\", \"?\", and \"[]\").  These strings should "
+                                 "be encased in quotes.  When supplied, parental relationships and "
+                                 "IMPUTED parental genotypes come from these files.  The fam "
+                                 "file's parental ID columns are not consulted.  However, any "
+                                 "parents whose genotypes are OBSERVED (i.e. are part of the "
+                                 "sample) have genotypes read from the bed file(s).")
 
     a_opt = parser.add_argument_group(title="Analysis Options")
     a_opt.add_argument("--rel-thresh", metavar="THRESHOLD",
@@ -400,6 +420,124 @@ def setup_func(argv: List[str], get_parser: ParserFunc,
     return parsed_args, user_args
 
 
+
+#################################
+def results_filename(out_prefix: str, bed_file: str) -> str:
+    """
+    Derives the results filename for a given bed file.  Single source of truth for the output
+    naming rule: validate_inputs() relies on this to detect collisions before any processing
+    begins, rather than discovering them after the last fileset has been written.
+
+    :param out_prefix: Full output prefix, as given by --out
+    :param bed_file: Full path of the bed file for this fileset
+
+    :return str: Full path of the results file for this fileset
+    """
+
+    bfile_basename = os.path.splitext(os.path.basename(bed_file))[0]
+
+    return f"{out_prefix}_{bfile_basename}{RES_SUFFIX}"
+
+
+#################################
+def hash_file(filename: str) -> str:
+    """
+    Returns a hash of a file's contents.
+
+    :param filename: Full path of the file to hash
+
+    :return str: Hex digest of the file's contents
+    """
+
+    with open(filename, "rb") as f:
+        return hashlib.blake2b(f.read()).hexdigest()
+
+
+#################################
+def validate_fam_file_agreement(fam_files: List[str]):
+    """
+    Confirms that every fileset's fam file is identical.  PLINK does not require per-chromosome
+    fam files to match, but GRMA's statistics assume a single sample set: if they differ, the
+    sample set, R, omega and the standard errors all differ per chromosome and results are not
+    comparable between them.  Four of the six fam columns matter -- FID and IID for sample
+    keying, IIDF and IIDM for trio determination, and PHENO when no --pheno file is given.
+
+    Comparison is by hash rather than by field, because detection is cheap where reconciliation
+    is not: a hash catches membership, parental IDs, phenotypes and ordering at once, without
+    having to decide which file's value would win for a conflicting row.  Users who intend a
+    single sample set can say so explicitly with --fam.
+
+    :param fam_files: Full paths of the fam files, one per fileset
+
+    :raises ValueError: If the fam files are not all identical
+    """
+
+    if len(fam_files) < 2:
+        return
+
+    logging.debug("Confirming that the fam file of every fileset is identical, including ordering.\n")
+
+    digests = {}
+    for fam_file in fam_files:
+        digests.setdefault(hash_file(fam_file), []).append(fam_file)
+
+    if len(digests) > 1:
+        groups = "; ".join(f"[{', '.join(sorted(g))}]" for g in digests.values())
+        raise ValueError(f"The fam files of the specified filesets are not identical, so the "
+                         f"sample set would differ between chromosomes and the results would not "
+                         f"be comparable.  Distinct groups found: {groups}.  Note that line "
+                         f"ordering is included in this comparison.  Use --fam to specify a "
+                         f"single fam file for every fileset.")
+
+
+#################################
+def pair_imputed_parental_files(bim_files: List[str],
+                                imputed_parental_files: List[str]) -> List[str]:
+    """
+    Reorders imputed parental genotype files to correspond to the filesets, pairing them by the
+    chromosome each describes.  Position is not usable for this: the --bfile and --imputed-parents
+    globs are expanded independently, so nothing guarantees they produce corresponding orders, and
+    a mismatch would silently subtract one chromosome's parental genotypes from another's.
+
+    Only the chromosome is read from each file -- the first line of each bim, and a single element
+    of each HDF5 -- so this is cheap enough to do before any processing begins.
+
+    :param bim_files: Full paths of the bim files, one per fileset
+    :param imputed_parental_files: Full paths of the imputed parental genotype files
+
+    :raises ValueError: If either set of files covers a chromosome more than once, or if the two
+                        sets do not describe the same chromosomes
+
+    :return List[str]: The imputed parental genotype files, ordered to match bim_files
+    """
+
+    logging.debug("Pairing imputed parental genotype files to filesets by chromosome.\n")
+
+    bim_chromosomes = [bbf.get_chromosome_from_bim_file(bim_file) for bim_file in bim_files]
+    imputed_chromosomes = [snipar.get_snipar_chromosome(imputed_file)
+                           for imputed_file in imputed_parental_files]
+
+    for description, chromosomes in (("--bfile filesets", bim_chromosomes),
+                                     ("imputed parental genotype files", imputed_chromosomes)):
+        duplicates = sorted({chrom for chrom in chromosomes if chromosomes.count(chrom) > 1})
+        if duplicates:
+            raise ValueError(f"More than one of the {description} covers the same chromosome: "
+                             f"{duplicates}.  GRMA requires one chromosome per file and one file "
+                             f"per chromosome.")
+
+    if set(bim_chromosomes) != set(imputed_chromosomes):
+        missing = sorted(set(bim_chromosomes) - set(imputed_chromosomes))
+        extra = sorted(set(imputed_chromosomes) - set(bim_chromosomes))
+        raise ValueError(f"The chromosomes covered by the imputed parental genotype files do not "
+                         f"match those of the --bfile filesets.  Missing imputed parental "
+                         f"genotypes for: {missing}.  Imputed parental genotypes supplied for "
+                         f"chromosomes with no corresponding fileset: {extra}.")
+
+    chrom_to_imputed_file = dict(zip(imputed_chromosomes, imputed_parental_files))
+
+    return [chrom_to_imputed_file[chrom] for chrom in bim_chromosomes]
+
+
 #################################
 def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     """
@@ -417,12 +555,15 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
     # Log user-specified arguments
     logging.debug(f"Program was called with the following arguments: {user_args}\n")
 
-    # Make sure bed/bim/fam files are specified
+    # Make sure bed/bim/fam files are specified.  Sorted because set.union() returns a set,
+    # whose iteration order varies between runs: without this the filesets are processed in an
+    # arbitrary order, error messages come out differently each time, and anything that pairs
+    # another input to the filesets positionally would be unreliable.
     logging.debug("Checking whether bed/bim/fam files were specified.\n")
-    bfiles = set.union(*pargs.bfile)
-    bed_files = [f"{bfile}{BED_SUFFIX}" for bfile in bfiles]
-    bim_files = [f"{bfile}{BIM_SUFFIX}" for bfile in bfiles]
-    fam_files = [pargs.fam] if pargs.fam else [f"{bfile}{FAM_SUFFIX}" for bfile in bfiles]
+    bfiles = sorted(set.union(*pargs.bfile))
+    bed_files = [f"{bfile}{bbf.BED_SUFFIX}" for bfile in bfiles]
+    bim_files = [f"{bfile}{bbf.BIM_SUFFIX}" for bfile in bfiles]
+    fam_files = [pargs.fam] if pargs.fam else [f"{bfile}{bbf.FAM_SUFFIX}" for bfile in bfiles]
     file_list = bed_files + bim_files + fam_files
     
     # Check for missing files
@@ -438,8 +579,35 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
                          f"cause their output files to overwrite each other: {duplicates}.  "
                          f"Rename the inputs or run them separately with distinct --out prefixes.")
 
+    # Every fileset's fam file must describe the same sample set.  Only meaningful when the fam
+    # files are per-fileset: --fam supplies one for all of them by construction.
+    if not pargs.fam:
+        validate_fam_file_agreement(fam_files)
+
     if len(fam_files) == 1:
         fam_files = fam_files * len(bed_files)
+
+    # Imputed parental genotype files, if supplied, must correspond one-to-one with the filesets.
+    # Pairing is by the chromosome each file describes rather than by position, because the two
+    # globs are independent and nothing guarantees they expand in a corresponding order.
+    imputed_parental_files = None
+    if pargs.imputed_parents:
+        logging.debug("Checking imputed parental genotype files.\n")
+        imputed_parental_files = sorted(set.union(*pargs.imputed_parents))
+
+        missing_imputed = [file for file in imputed_parental_files if not os.path.exists(file)]
+        if missing_imputed:
+            raise FileNotFoundError(f"Missing the following imputed parental genotype files: "
+                                    f"{missing_imputed}")
+
+        if len(imputed_parental_files) != len(bed_files):
+            raise ValueError(f"The number of imputed parental genotype files "
+                             f"({len(imputed_parental_files)}) does not match the number of "
+                             f"filesets specified by --bfile ({len(bed_files)}).  Each fileset "
+                             f"must have exactly one corresponding file.")
+
+        imputed_parental_files = pair_imputed_parental_files(bim_files, imputed_parental_files)
+
 
     # Prepare dictionary that will hold internal values for this program
     logging.debug("Constructing dictionary of values from flags passed in.\n")
@@ -455,7 +623,8 @@ def validate_inputs(pargs: argp.Namespace, user_args: Dict[str, Any]):
         REL_DEG : pargs.rel_thresh,
         SNPS_PER_BLOCK : pargs.snps_per_block,
         ID_LIST : pargs.id_list,
-        SNP_LIST : pargs.snp_list
+        SNP_LIST : pargs.snp_list,
+        IMPUTED_PARENTAL_FILES : imputed_parental_files
     }
 
 
@@ -502,6 +671,9 @@ def main_func(argv: List[str]):
         logging.info("Performing additional validation of inputs.\n")
         iargs = validate_inputs(parsed_args, user_args)
 
+        # One imputed parental genotype file per fileset, or None throughout when the flag was
+        # not given, so that a single zip() covers both modes
+        imputed_parental_files = iargs[IMPUTED_PARENTAL_FILES] or [None] * len(iargs[BED_FILES])
 
         # Run the GRMA pipeline
         logging.info("Calling main GRMA function\n")

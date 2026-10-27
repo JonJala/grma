@@ -34,7 +34,13 @@ FAM_DF = pd.DataFrame(
         bbf.FAM_IIDF_COL : 0,
         bbf.FAM_IIDM_COL : 0,
         bbf.FAM_SEX_COL : 0,
-        bbf.FAM_PHENO_COL : [-1.0, 1.0, -2.0, 2.0, 10.0, 20.0, 30.0, -10.0, -20.0, -30.0]
+        # Within-family correlation is positive and moderate (FS and PO both r = 0.44 by the
+        # omega estimator), so omega is positive definite without any shrinkage.  The previous
+        # values put every child of family 0 far above the mean and every child of family 1 far
+        # below it, which made the full-sib covariance EXCEED the variance (r = 1.30).  Shrinkage
+        # then left the sib blocks nearly rank-1 along exactly the direction R removes, so
+        # R omega R' held nothing but floor-level noise.  See notes §7.4j.
+        bbf.FAM_PHENO_COL : [3.5, 0.5, -5.0, 2.0, 0.0, 1.0, 3.0, -2.5, -1.5, -3.5]
     },
     columns=bbf.FAM_COLS
 )

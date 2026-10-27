@@ -170,8 +170,6 @@ def mock_calc_omega(fam_df: pd.DataFrame, N: int, rel_df: pd.DataFrame,
     return shrunk_omega
 
 
-
-
 def mock_construct_R(rel_input: list):
     N = len(rel_input)
 
@@ -194,44 +192,33 @@ def mock_demean(rel_input: list, arr: np.ndarray):
     return result
 
 
-def mock_calc_xtx(G: np.ndarray):
-    XtX = np.sum(np.square(G), axis=1)
-    XtX[XtX == 0.0] = np.finfo(XtX.dtype).eps
-    return XtX
+#################################
+def mock_gls_estimates(genotypes, gls_weights, weighted_phenotypes):
+    """Works the GLS estimates out one SNP at a time
 
+    The library does this with two einsums over a whole block at once, so the obvious scalar form
+    is a genuinely separate route rather than a restatement of it.
 
-def mock_run_regressions(demeaned_G: np.ndarray, demeaned_P: np.ndarray):
-    M, N = demeaned_G.shape
+    Args:
+        genotypes: (snps, samples) residualized genotypes
+        gls_weights: (samples, samples) weight matrix, sparse or dense
+        weighted_phenotypes: (samples,) phenotypes already multiplied by the weights
 
-    XtX = mock_calc_xtx(demeaned_G)
+    Returns:
+        A tuple (betas, ses, XtWX) of (snps,) arrays, matching the library's return order
+    """
 
-    betas = np.zeros(M)
-    for snp in range(M):
-        betas[snp] = np.linalg.lstsq(demeaned_G[snp].reshape((1,-1)).T, demeaned_P.T)[0].item()
+    weights = gls_weights.toarray() if sp.issparse(gls_weights) else gls_weights
 
-    return betas
+    XtWX, ses, betas = [], [], []
+    for snp in genotypes:
+        denominator = snp @ weights @ snp
+        XtWX.append(denominator)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ses.append(1.0 / np.sqrt(denominator))
+            betas.append((snp @ weighted_phenotypes) / denominator)
 
-
-def mock_calc_ses(demeaned_G: np.ndarray, se_matrix: np.ndarray):
-    M, N = demeaned_G.shape
-
-    ses = np.zeros(M, dtype=float)
-
-
-    for snp in range(M):
-        X = demeaned_G[snp].T
-        XtX = np.dot(X, X)
-        if XtX == 0.0:
-            XtX = np.finfo(XtX.dtype).eps
-        XXinv = np.reciprocal(XtX)
-
-        central_value = X.T @ se_matrix @ X
-
-        ses[snp] = XXinv * np.sqrt(central_value)
-
-    ses[ses == 0.0] = np.finfo(ses.dtype).eps
-
-    return ses
+    return np.array(betas), np.array(ses), np.array(XtWX)
 
 
 def mock_grma(rel_df: pd.DataFrame, fam_df: pd.DataFrame, G: np.ndarray, pheno: np.ndarray, rel_deg: int):
@@ -246,14 +233,85 @@ def mock_grma(rel_df: pd.DataFrame, fam_df: pd.DataFrame, G: np.ndarray, pheno: 
 
     omega = mock_calc_omega(fam_df=fam_df, N=N, rel_df=rel_df, unresidualized_phenotypes=pheno)
 
-    se_matrix = R @ omega @ R.T
+    # The covariance of the residualized phenotypes, whose pseudo-inverse weights the regression.
+    # Production inverts this block by block over the relatedness components, which is exact
+    # rather than approximate; taking one pinv over the whole matrix is a separate route to the
+    # same answer.
+    resid_pheno_cov = (R @ omega @ R.T).toarray() if sp.issparse(R) else R @ omega @ R.T
+    gls_weights = np.linalg.pinv(resid_pheno_cov)
 
-    betas = mock_run_regressions(demeaned_G=demeaned_geno, demeaned_P=demeaned_pheno)
-    ses = mock_calc_ses(demeaned_G=demeaned_geno, se_matrix=se_matrix)
+    betas, ses, _ = mock_gls_estimates(
+        genotypes=demeaned_geno, gls_weights=gls_weights,
+        weighted_phenotypes=gls_weights @ np.ravel(demeaned_pheno))
 
     return -betas, ses
 
+#################################
+def mock_snipar_imputation(rng: np.random.Generator, num_snps: int, neither_observed: np.ndarray,
+                           frequency_range: tuple = (0.05, 0.45)):
+    """Builds imputed parental values the way snipar builds them
 
+    This runs the construction FORWARDS -- start from the parental alleles snipar managed to
+    observe, fill the rest in with the population frequency -- so that GRMA's correction, which
+    runs it backwards, can be checked against the alleles it ought to recover.  Writing it out
+    independently rather than reusing the library's arithmetic is the point: agreement then means
+    the inversion is right, where a restatement of the same expression would prove nothing.
+
+    What snipar stores depends on how many parents it had, and the two forms count different
+    alleles.  Both were confirmed against a file generated from snipar's own example data.
+
+        neither parent genotyped: imputed_par_gts holds the AVERAGE of the two parents, so all
+            four parental alleles are in scope and the frequency contribution is halved along
+            with everything else
+
+        one parent genotyped: imputed_par_gts holds only the OTHER parent's genotype.  Two of the
+            k observed alleles belong to the genotyped parent and are not in it at all, so only
+            the remaining k - 2 are, and nothing is halved
+
+    Either way the result is a genotype on a 0 to 2 scale, which is worth checking: a model that
+    produced something outside that range would not be describing snipar.
+
+    Args:
+        rng: Seeded generator, so that a failure can be reproduced
+        num_snps: Number of SNPs to generate
+        neither_observed: Per family, whether snipar had no genotyped parent to work from
+        frequency_range: Bounds to draw allele frequencies from.  The default stays clear of 0
+            and of 0.5 so that a correction which was dropped, halved or doubled shows up as a
+            clear difference rather than a marginal one.  Anything testing behaviour that depends
+            on the frequency itself -- resolving a palindromic SNP, say, where values near 0.5
+            are the hard case -- will want to say so explicitly.
+
+    Returns:
+        A tuple (imputed_gts, num_obs_par_alleles, standard_f, expected_contribution) where the
+        first three are what the file would hold and the last is what
+        calculate_imputed_contribution() should return for them
+    """
+
+    num_families = len(neither_observed)
+
+    standard_f = rng.uniform(frequency_range[0], frequency_range[1], num_snps)
+
+    # Where neither parent was genotyped, snipar can see as few as two of the four parental
+    # alleles.  Where one was, its two alleles are always seen, so the count starts at three.
+    num_obs_par_alleles = np.where(neither_observed[:, None],
+                                   rng.choice([2.0, 3.0, 4.0], size=(num_families, num_snps)),
+                                   rng.choice([3.0, 4.0], size=(num_families, num_snps)))
+
+    # How many of the alleles that went INTO the imputed value carried the counted allele: all
+    # four for an averaged pair, but only the ones belonging to the ungenotyped parent otherwise
+    alleles_in_scope = np.where(neither_observed[:, None],
+                                num_obs_par_alleles, num_obs_par_alleles - 2.0)
+    observed_alleles = rng.integers(0, alleles_in_scope.astype(int) + 1).astype(float)
+
+    # The alleles snipar could not see contribute the population frequency instead
+    divisor = np.where(neither_observed, 2.0, 1.0)[:, None]
+    imputed_gts = (observed_alleles + standard_f[None, :] * (4.0 - num_obs_par_alleles)) / divisor
+
+    # GRMA removes the frequency and, for an averaged pair, doubles what is left so that it counts
+    # for both parents.  What should come back is the allele count it started from.
+    expected_contribution = observed_alleles.T
+
+    return imputed_gts, num_obs_par_alleles, standard_f, expected_contribution
 
 
 ##################################
