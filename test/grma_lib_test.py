@@ -2,6 +2,7 @@
 Testing of grma_lib.py
 """
 
+import copy
 import itertools as it
 import logging
 import os
@@ -26,7 +27,6 @@ import grma_lib as sut
 import snipar_hdf5
 
 import helper
-import tcs
 import tcs  # The case registry and harness; see its docstring for the format
 
 
@@ -592,14 +592,21 @@ class TestCalculateOmega:
 
 class TestProcessRelatedness:
 
-    @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
-    @pytest.mark.parametrize("tc_key", [tcs.KEY_SIMPLE, tcs.KEY_2FAM, tcs.KEY_VARIED, tcs.KEY_PT])
-    def test__precanned_tcs__expected_results(self, rel_degree, tc_key):
-        rel_df, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
+    @pytest.mark.parametrize("tc_key, rel_degree", tcs.params("process_relatedness"))
+    def test__precanned_tcs__expected_results(self, tc_key, rel_degree, tmp_path):
+        rel_df, full_fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
+
+        # The analysis sample as the case states or the mocks derive it, in the form
+        # process_phenotypes() hands on -- rather than produced by production's process_phenotypes()
+        analysis = tcs.get(tc_key, "ANALYSIS_IIDS")
+        fam_df = full_fam_df[full_fam_df[bbf.FAM_IID_COL].astype(str).isin(analysis)].reset_index(
+            drop=True)
         unres_pheno = tcs.get(tc_key, "PHENOTYPES")
 
         expected_R = tcs.get(tc_key, "R_MATRICES", rel_degree)
+        expected_R = expected_R.toarray() if sp.issparse(expected_R) else expected_R
         expected_res_pheno = tcs.get(tc_key, "RESID_PHENOS", rel_degree)
+        expected_affected = sorted(a for a in tcs.get(tc_key, "AFFECTED") if a in analysis)
 
         # gls_weights is the pseudo-inverse of R @ omega @ R.T.  Production inverts it block by
         # block over the relatedness components; the mocks take one pinv over the whole matrix, a
@@ -612,10 +619,14 @@ class TestProcessRelatedness:
 
         actual_R, actual_gls_weights, actual_res_pheno, actual_parental = \
             sut.process_relatedness(rel_file=rel_df, fam_df=fam_df, rel_degree=rel_degree,
-                                    unresidualized_phenotypes=unres_pheno, fam_file=fam_df)
+                                    unresidualized_phenotypes=unres_pheno, fam_file=full_fam_df,
+                                    imputed_parental_file=tcs.write_imputed_file(tc_key, tmp_path))
 
 
-        assert np.allclose(expected_R.toarray(), actual_R.toarray(), atol=0.001)
+        # affected_samples are positions in the full, unfiltered fam file
+        all_iids = full_fam_df[bbf.FAM_IID_COL].astype(str).to_numpy()
+        assert sorted(all_iids[actual_parental.affected_samples]) == expected_affected
+        assert np.allclose(expected_R, actual_R.toarray(), atol=0.001)
         assert np.allclose(expected_res_pheno, actual_res_pheno, atol=0.001)
         assert np.allclose(expected_gls_weights, actual_gls_weights.toarray(), atol=1e-6)
 
@@ -911,16 +922,27 @@ class TestGetLambdaMin:
 
 class TestProcessBimFile:
 
-    @pytest.mark.parametrize("tc_key", [tcs.KEY_SIMPLE, tcs.KEY_2FAM, tcs.KEY_VARIED])
-    def test__precanned_tcs__expected_results(self, tc_key):
+    @pytest.mark.parametrize("tc_key", tcs.key_params("process_bim_file"))
+    def test__precanned_tcs__expected_results(self, tc_key, tmp_path):
         bim_df = tcs.get(tc_key, "BIM_DF")
+
+        # In imputed mode the SNPs are aligned against the imputed file, which is the only thing
+        # process_bim_file() reads from the parental sources -- so only its metadata is filled in
+        parental_sources = None
+        imputed_file = tcs.write_imputed_file(tc_key, tmp_path)
+        if imputed_file is not None:
+            parental_sources = sut.ParentalSources(
+                affected_samples=np.array([], dtype=int),
+                observed_parent_cols=np.empty((0, 2), dtype=int),
+                imputed_rows=np.array([], dtype=int), imputed_file=imputed_file,
+                snipar_metadata=snipar_hdf5.read_snipar_metadata(imputed_file))
 
         expected_M_orig = len(bim_df)
         expected_snp_filter = tcs.snp_filter(tc_key)
         expected_M = len(expected_snp_filter) if expected_snp_filter is not None else expected_M_orig
 
         actual_M_orig, actual_M, actual_snp_filter, _ = sut.process_bim_file(
-            bim_file=bim_df, snp_list=tcs.get(tc_key, "SNP_LIST"))
+            bim_file=bim_df, snp_list=tcs.get(tc_key, "SNP_LIST"), parental_sources=parental_sources)
 
         assert expected_M_orig == actual_M_orig
         assert expected_M == actual_M
@@ -4770,18 +4792,201 @@ class TestCreateOutput:
 
 
 
+# -------------------------
+# Running a case with modified inputs, for the tests below that compare a case's results with those
+# of a modified copy.  The modifications themselves live in the tests.
+
+def _case_inputs(key):
+    """Copies of a case's inputs that a test can modify freely: grma()'s data plus the snipar data"""
+
+    case = tcs.REGISTRY[key]
+    return dict(fam=case["FAM_DF"].copy(), rel=case["REL_DF"].copy(),
+                bim=case["BIM_DF"].copy(), G=case["G"].copy(),
+                pheno=copy.deepcopy(case["PHENO_DF"]), covar=copy.deepcopy(case["COVAR_DF"]),
+                id_list=copy.deepcopy(case["ID_LIST"]), snp_list=copy.deepcopy(case["SNP_LIST"]),
+                snps_per_block=case["SNPS_PER_BLOCK"], imputed=copy.deepcopy(case["IMPUTED_FILE"]))
+
+
+def _run_inputs(inputs, degree, directory, name):
+    """Runs grma() on inputs from _case_inputs(), writing the snipar data to a file if there is any"""
+
+    imputed_file = None
+    if inputs["imputed"] is not None:
+        imputed_file = os.path.join(directory, name + snipar_hdf5.SNIPAR_FILE_SUFFIX)
+        snipar_hdf5.write_snipar_file(imputed_file, **inputs["imputed"])
+
+    kwargs = dict(rel_file=inputs["rel"], bed_file=inputs["G"], bim_file=inputs["bim"],
+                  fam_file=inputs["fam"], rel_degree=degree, pheno_file=inputs["pheno"],
+                  covar_file=inputs["covar"], id_list=inputs["id_list"],
+                  snp_list=inputs["snp_list"], imputed_parental_file=imputed_file)
+    if inputs["snps_per_block"] is not None:
+        kwargs["snps_per_block"] = inputs["snps_per_block"]
+    return sut.grma(**kwargs)
+
+
+def _assert_same_results(original, modified, rsid_map=None, negated_rsids=()):
+    """The two runs agree SNP for SNP, to rounding
+
+    Args:
+        rsid_map: original rsid -> the name it has in the modified run, if SNPs were renamed
+        negated_rsids: SNPs whose beta should have changed sign (reported for the other allele)
+    """
+
+    original_rsids = original[bbf.BIM_RSID_COL].astype(str).tolist()
+    expected_rsids = [rsid_map[r] for r in original_rsids] if rsid_map else original_rsids
+    assert modified[bbf.BIM_RSID_COL].astype(str).tolist() == expected_rsids
+
+    sign = np.array([-1.0 if r in negated_rsids else 1.0 for r in original_rsids])
+    assert np.allclose(modified[sut.OUTPUT_BETA_COL].to_numpy(),
+                       sign * original[sut.OUTPUT_BETA_COL].to_numpy(), atol=1e-10, rtol=0.0)
+    assert np.allclose(modified[sut.OUTPUT_SE_COL].to_numpy(),
+                       original[sut.OUTPUT_SE_COL].to_numpy(), atol=1e-10, rtol=0.0)
+
+
+def _permuted_names(values, prefix, rng):
+    """New names for values, assigned by a random permutation of their sorted order
+
+    The permutation is redrawn until it is not the identity, so the new names never sort in the same
+    order as the old -- anything that depends on IDs being sorted then shows up.
+    """
+
+    values = sorted(set(values))
+    perm = rng.permutation(len(values))
+    while len(values) > 1 and np.array_equal(perm, np.arange(len(values))):
+        perm = rng.permutation(len(values))
+    width = len(str(len(values)))
+    return {v: f"{prefix}{p:0{width}d}" for v, p in zip(values, perm)}
+
+
+def _new_ids(existing, count, prefix):
+    """IDs for added samples, of the same kind as the existing ones so the column keeps its type"""
+
+    if pd.api.types.is_integer_dtype(existing):
+        start = int(existing.max()) + 1
+        return list(range(start, start + count))
+    return [f"{prefix}{n}" for n in range(count)]
+
+
 class TestGRMA:
 
-    def test__add_singletons__same_results(self):
-        pass
+    @pytest.mark.parametrize("key, degree", tcs.params("add_singletons", default_xfail=tcs.XFAIL_13_6))
+    def test__add_singletons__same_results(self, key, degree, tmp_path):
+        """Unrelated samples are not in the regression, so adding them changes nothing (notes
+        §13.6).  xfailed until §13.6 is fixed: today omega's variance includes them, and with
+        anyone affected so does the phenotype centering mean."""
+
+        original = _run_inputs(_case_inputs(key), degree, tmp_path, "original")
+
+        inputs = _case_inputs(key)
+        fam, num_new = inputs["fam"], 3
+        new_fids = _new_ids(fam[bbf.FAM_FID_COL], num_new, "singleton_fam")
+        new_iids = _new_ids(fam[bbf.FAM_IID_COL], num_new, "singleton")
+        no_parent = 0 if pd.api.types.is_integer_dtype(fam[bbf.FAM_IIDF_COL]) else "0"
+        new_phenos = [1.7, -2.3, 0.4]
+        added = pd.DataFrame({bbf.FAM_FID_COL : new_fids, bbf.FAM_IID_COL : new_iids,
+                              bbf.FAM_IIDF_COL : no_parent, bbf.FAM_IIDM_COL : no_parent,
+                              bbf.FAM_SEX_COL : fam[bbf.FAM_SEX_COL].iloc[0],
+                              bbf.FAM_PHENO_COL : new_phenos}, columns=bbf.FAM_COLS)
+        inputs["fam"] = pd.concat([fam, added], ignore_index=True)
+
+        num_snps = inputs["G"].shape[0]
+        new_genotypes = np.array([[(snp + n) % 3 for n in range(num_new)]
+                                  for snp in range(num_snps)], dtype=float)
+        inputs["G"] = np.hstack([inputs["G"], new_genotypes])
+
+        # Wherever the case filters samples, the singletons must pass the filter to reach the
+        # analysis at all
+        ids = added[[bbf.FAM_FID_COL, bbf.FAM_IID_COL]]
+        if inputs["id_list"] is not None:
+            inputs["id_list"] = pd.concat([inputs["id_list"], ids.set_axis(
+                inputs["id_list"].columns, axis=1)], ignore_index=True)
+        if inputs["pheno"] is not None:
+            rows = ids.copy(); rows[2] = new_phenos
+            inputs["pheno"] = pd.concat([inputs["pheno"], rows.set_axis(
+                inputs["pheno"].columns, axis=1)], ignore_index=True)
+        if inputs["covar"] is not None:
+            rows = ids.copy()
+            for n, col in enumerate(inputs["covar"].columns[2:]):
+                rows[col] = inputs["covar"][col].mean() + np.arange(num_new) - 1.0 + n
+            inputs["covar"] = pd.concat([inputs["covar"], rows.set_axis(
+                inputs["covar"].columns, axis=1)], ignore_index=True)
+
+        _assert_same_results(original, _run_inputs(inputs, degree, tmp_path, "modified"))
 
 
-    def test__rename_samples__same_results(self):
-        pass
+    @pytest.mark.parametrize("key, degree", tcs.params("rename_samples"))
+    def test__rename_samples__same_results(self, key, degree, tmp_path):
+        """Sample IDs are labels: renaming every one consistently, in an order unrelated to the
+        original, changes nothing"""
+
+        original = _run_inputs(_case_inputs(key), degree, tmp_path, "original")
+        rng = np.random.default_rng(seed=1206)
+        inputs = _case_inputs(key)
+        fam, rel, imputed = inputs["fam"], inputs["rel"], inputs["imputed"]
+        id_files = [df for df in (inputs["id_list"], inputs["pheno"], inputs["covar"]) if df is not None]
+
+        # Every IID, including parents named only in parent columns or in snipar's pedigree, but not
+        # the missing-parent code
+        iids = [*fam[bbf.FAM_IID_COL], *fam[bbf.FAM_IIDF_COL], *fam[bbf.FAM_IIDM_COL],
+                *rel[sut.KING_IID1_COL], *rel[sut.KING_IID2_COL], *[v for df in id_files for v in df.iloc[:, 1]]]
+        if imputed is not None:
+            iids += list(imputed["pedigree"][:, 1:4].ravel())
+        iid_map = _permuted_names([str(i) for i in iids if str(i) != "0"], "iid", rng)
+        iid_map["0"] = "0"
+
+        fids = [*fam[bbf.FAM_FID_COL], *rel[sut.KING_FID1_COL], *rel[sut.KING_FID2_COL],
+                *[v for df in id_files for v in df.iloc[:, 0]]]
+        fid_map = _permuted_names([str(f) for f in fids], "fid", rng)
+
+        for col in (bbf.FAM_IID_COL, bbf.FAM_IIDF_COL, bbf.FAM_IIDM_COL):
+            fam[col] = [iid_map[str(v)] for v in fam[col]]
+        fam[bbf.FAM_FID_COL] = [fid_map[str(v)] for v in fam[bbf.FAM_FID_COL]]
+        for col in (sut.KING_IID1_COL, sut.KING_IID2_COL):
+            rel[col] = [iid_map[str(v)] for v in rel[col]]
+        for col in (sut.KING_FID1_COL, sut.KING_FID2_COL):
+            rel[col] = [fid_map[str(v)] for v in rel[col]]
+        for df in id_files:
+            df[df.columns[0]] = [fid_map[str(v)] for v in df.iloc[:, 0]]
+            df[df.columns[1]] = [iid_map[str(v)] for v in df.iloc[:, 1]]
+
+        # snipar's own family IDs link its pedigree to its imputed rows, so they are renamed too
+        if imputed is not None:
+            family_map = _permuted_names(list(imputed["families"]), "family", rng)
+            pedigree = imputed["pedigree"].astype(object)
+            pedigree[:, 0] = [family_map.get(str(f), str(f)) for f in pedigree[:, 0]]
+            pedigree[:, 1:4] = np.vectorize(lambda v: iid_map[str(v)])(pedigree[:, 1:4])
+            imputed["pedigree"] = pedigree.astype(str)
+            imputed["families"] = np.array([family_map[str(f)] for f in imputed["families"]])
+
+        _assert_same_results(original, _run_inputs(inputs, degree, tmp_path, "modified"))
 
 
-    def test__rename_snps__same_results(self):
-        pass
+    @pytest.mark.parametrize("key, degree", tcs.params("rename_snps"))
+    def test__rename_snps__same_results(self, key, degree, tmp_path):
+        """rsids are labels: renaming every one consistently changes nothing but the rsid column,
+        and the output keeps the bim file's order whatever the names"""
+
+        original = _run_inputs(_case_inputs(key), degree, tmp_path, "original")
+        rng = np.random.default_rng(seed=1207)
+        inputs = _case_inputs(key)
+        bim, imputed = inputs["bim"], inputs["imputed"]
+
+        rsids = [*bim[bbf.BIM_RSID_COL]]
+        if imputed is not None:
+            rsids += list(imputed["bim_values"][:, 1])
+        rsid_map = _permuted_names([str(r) for r in rsids], "snp", rng)
+
+        bim[bbf.BIM_RSID_COL] = [rsid_map[str(r)] for r in bim[bbf.BIM_RSID_COL]]
+        if inputs["snp_list"] is not None:
+            snp_list = inputs["snp_list"]
+            snp_list[snp_list.columns[0]] = [rsid_map[str(r)] for r in snp_list.iloc[:, 0]]
+        if imputed is not None:
+            bim_values = imputed["bim_values"].astype(object)
+            bim_values[:, 1] = [rsid_map[str(r)] for r in bim_values[:, 1]]
+            imputed["bim_values"] = bim_values.astype(str)
+
+        _assert_same_results(original, _run_inputs(inputs, degree, tmp_path, "modified"),
+                             rsid_map=rsid_map)
 
 
     # TODO(jonbjala) Definitely need error cases
@@ -4860,7 +5065,7 @@ class TestCaseInvariance:
     production -- as notes §13.5 was: the mocks did not center phenotypes either, so they agreed.
     """
 
-    @pytest.mark.parametrize("key, degree", tcs.params("invariance"))
+    @pytest.mark.parametrize("key, degree", tcs.params("phenotype_shift"))
     def test__phenotypes_shifted_by_a_constant__results_unchanged(self, key, degree, tmp_path):
         kwargs = tcs.grma_kwargs(key, degree, tmp_path)
         baseline = sut.grma(**kwargs)
@@ -4877,3 +5082,49 @@ class TestCaseInvariance:
         for col in (sut.OUTPUT_BETA_COL, sut.OUTPUT_SE_COL):
             assert np.allclose(shifted[col], baseline[col], atol=1e-9, rtol=0.0), \
                 f"{key}: {col} depends on the phenotype's origin"
+
+
+    @pytest.mark.parametrize("key, degree", tcs.params("allele_swap",
+                                                       default_xfail=tcs.coding_dependence_xfail))
+    def test__alleles_swapped__betas_negated(self, key, degree, tmp_path):
+        """Swapping A1 and A2 in the bim, and recoding the genotypes to match, describes the same
+        data with the other allele counted.  Betas are reported for A2, so a swapped SNP's beta
+        changes sign and nothing else changes.
+
+        For an imputed case the snipar file is left alone, so on the swapped SNPs it now disagrees
+        with the bim and must be flipped -- the flip path, checked against exact truth.  Only
+        non-palindromic SNPs are swapped: for A/T or C/G a swap looks like a strand difference,
+        which is the unimplemented palindromic rescue (notes §12.1), not something to test here.
+        """
+
+        original = _run_inputs(_case_inputs(key), degree, tmp_path, "original")
+        inputs = _case_inputs(key)
+        bim = inputs["bim"]
+
+        retained = set(tcs.get(key, "RETAINED_RSIDS"))
+        palindromic = [{a1, a2} in sut.PALINDROMIC_ALLELE_PAIRS
+                       for a1, a2 in zip(bim[bbf.BIM_A1_COL], bim[bbf.BIM_A2_COL])]
+        candidates = [n for n, r in enumerate(bim[bbf.BIM_RSID_COL].astype(str))
+                      if r in retained and not palindromic[n]]
+        swap = candidates[::2]
+        assert swap, f"{key} has no retained non-palindromic SNP to swap"
+
+        bim.loc[swap, [bbf.BIM_A1_COL, bbf.BIM_A2_COL]] = \
+            bim.loc[swap, [bbf.BIM_A2_COL, bbf.BIM_A1_COL]].to_numpy()
+        inputs["G"][swap] = 2.0 - inputs["G"][swap]
+
+        _assert_same_results(original, _run_inputs(inputs, degree, tmp_path, "modified"),
+                             negated_rsids=set(bim[bbf.BIM_RSID_COL].astype(str).iloc[swap]))
+
+
+class TestCaseEquivalence:
+    """Cases that must give exactly the results of another case (EQUIVALENT_TO): the same data run
+    a different way that should make no difference -- imputed rather than observed parents
+    (notes §15.3), a different block size, parents named but absent"""
+
+    @pytest.mark.parametrize("key, degree", tcs.params("equivalence", keys=tcs.equivalent_keys()))
+    def test__results__identical_to_the_equivalent_case(self, key, degree, tmp_path):
+        other = tcs.REGISTRY[key]["EQUIVALENT_TO"]
+        actual = sut.grma(**tcs.grma_kwargs(key, degree, tmp_path))
+        expected = sut.grma(**tcs.grma_kwargs(other, degree, tmp_path))
+        _assert_same_results(expected, actual)

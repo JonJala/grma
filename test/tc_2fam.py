@@ -4,8 +4,8 @@ sibling pair listed.  Degrees 1-3 give the same R, since nobody's closest relati
 degree.
 
 The parent columns are empty (0), so parental residualization is a no-op here (AFFECTED is empty),
-even though the families are trios in KING's eyes.  Note IID 0 is a parent: filling in the parent
-columns would need the IIDs moved off 0 first, which is the fam file's missing-parent code.
+even though the families are trios in KING's eyes.  tc_2fam_trios.py is the same data with the parent
+columns filled in.  IIDs run 1 to 10, not 0 to 9, so that no parent has the missing-parent code.
 R_MATRICES and the residualized values below are hand-derived; TestCaseSelfConsistency checks them
 against the mocks.
 """
@@ -23,8 +23,10 @@ BIM_DF = pd.DataFrame(
         bbf.BIM_RSID_COL : ['rs1', 'rs2', 'rs3'],
         bbf.BIM_CM_COL : [2.0, 4.0, 6.0],
         bbf.BIM_BP_COL : [50, 100, 150],
-        bbf.BIM_A1_COL : 'A',
-        bbf.BIM_A2_COL : 'T'
+        # Arbitrary labels, chosen so that all but one SNP is non-palindromic (the one A/T SNP
+        # keeps the palindromic path covered).  Allele labels do not affect any computed value.
+        bbf.BIM_A1_COL : ['A', 'G', 'A'],
+        bbf.BIM_A2_COL : ['C', 'T', 'T']
     },
     columns=bbf.BIM_COLS
 )
@@ -32,7 +34,9 @@ BIM_DF = pd.DataFrame(
 FAM_DF = pd.DataFrame(
     {
         bbf.FAM_FID_COL : [0, 0, 1, 1, 0, 0, 0, 1, 1, 1],
-        bbf.FAM_IID_COL : list(range(10)),
+        # 1 to 10 rather than 0 to 9: "0" is the fam file's missing-parent code, so a parent with
+        # IID 0 could never be named in a parent column (see tc_2fam_trios.py, which does)
+        bbf.FAM_IID_COL : list(range(1, 11)),
         bbf.FAM_IIDF_COL : 0,
         bbf.FAM_IIDM_COL : 0,
         bbf.FAM_SEX_COL : 0,
@@ -56,9 +60,9 @@ G = np.array([[(i + j) % 3  for j in range(_N)] for i in range(_M)], dtype=float
 REL_DF = pd.DataFrame(
     {
         lib.KING_FID1_COL : [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        lib.KING_IID1_COL : [0, 0, 0, 1, 1, 1, 4, 4, 5, 2, 2, 2, 3, 3, 3, 7, 7, 8],
+        lib.KING_IID1_COL : [1, 1, 1, 2, 2, 2, 5, 5, 6, 3, 3, 3, 4, 4, 4, 8, 8, 9],
         lib.KING_FID2_COL : [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-        lib.KING_IID2_COL : [4, 5, 6, 4, 5, 6, 5, 6, 6, 7, 8, 9, 7, 8, 9, 8, 9, 9],
+        lib.KING_IID2_COL : [5, 6, 7, 5, 6, 7, 6, 7, 7, 8, 9, 10, 8, 9, 10, 9, 10, 10],
         lib.KING_KINSHIP_COL : 0.0, # Don't need right now
         lib.KING_REL_COL : [
                         lib.INF_PARENT_OFFSPRING,

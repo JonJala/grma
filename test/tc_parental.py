@@ -18,6 +18,13 @@ difference is itself part of what is tested:
     k3a, k3b         NOT a trio                    affected: imputed row "C", neither genotyped
     k4a, k4b         NOT a trio                    NOT usable: no imputed row, no genotyped parent
     u1               singleton
+    un3              uncle of k3a and k3b: his ONLY relatives are 2nd-degree, so he is in the regression
+                     from degree 2 -- in imputed mode centered on k3a and k3b's DIFFERENCED values
+    cz4              cousin of k4a and k4b: her only relatives are 3rd-degree, so she enters at degree 3
+
+Without un3 and cz4, degrees 2 and 3 gave the same R as degree 1, since nobody else's closest
+relative is 2nd or 3rd degree (notes §15.4).  They are listed last so that every other sample keeps
+its position.
 
 fa1 is both affected and a parent, so his children must be differenced against his RAW genotypes,
 not against his own Mendelian residual.
@@ -36,13 +43,15 @@ import grma_lib as lib
 # Samples ===========================================================================================
 
 _IIDS = ["X", "gf", "gm", "fa1", "mo1", "k1a", "k1b", "k1c", "fa2", "k2a", "k2b",
-        "k3a", "k3b", "k4a", "k4b", "u1"]
-_FIDS = ["FX", "A", "A", "A", "A", "A", "A", "A", "B", "B", "B", "C", "C", "D", "D", "U"]
+        "k3a", "k3b", "k4a", "k4b", "u1", "un3", "cz4"]
+_FIDS = ["FX", "A", "A", "A", "A", "A", "A", "A", "B", "B", "B", "C", "C", "D", "D", "U", "C",
+         "D"]
 _FATHERS = ["0", "0", "0", "gf", "0", "fa1", "fa1", "fa1", "0", "fa2", "fa2",
-           "pa3", "pa3", "pa4", "pa4", "0"]
+           "pa3", "pa3", "pa4", "pa4", "0", "0", "0"]
 _MOTHERS = ["0", "0", "0", "gm", "0", "mo1", "mo1", "mo1", "0", "mo2", "mo2",
-           "ma3", "ma3", "ma4", "ma4", "0"]
-_SEXES = ["0", "1", "2", "1", "2", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0"]
+           "ma3", "ma3", "ma4", "ma4", "0", "0", "0"]
+_SEXES = ["0", "1", "2", "1", "2", "0", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "1",
+          "2"]
 
 # Chosen by a seeded search (seed 123 of a parents-plus-noise model, rounded to one decimal) so
 # that omega is positive definite WITHOUT shrinkage (smallest eigenvalue 0.57 x variance) and
@@ -52,7 +61,11 @@ _SEXES = ["0", "1", "2", "1", "2", "0", "0", "0", "1", "0", "0", "0", "0", "0", 
 # The grandparent-grandchild correlation comes out near zero (-0.02) for every seed tried, not by
 # chance: omega pairs each relationship both ways round and centers on the POOLED mean, so a
 # difference between the two generations' means contributes -(a - b)^2 / 4.  See notes §13.3.
-_PHENOS = [-1.5, -0.6, 1.9, -1.1, 0.3, 1.0, -1.2, 0.8, 1.4, 1.3, 3.0, -0.9, -0.4, -0.1, -3.1, 0.1]
+#
+# un3's and cz4's values (the last two) were chosen afterwards, by a grid search over both with the
+# first 16 held fixed: smallest unshrunk eigenvalue 0.71 x variance, worst condition number 12.1.
+_PHENOS = [-1.5, -0.6, 1.9, -1.1, 0.3, 1.0, -1.2, 0.8, 1.4, 1.3, 3.0, -0.9, -0.4, -0.1, -3.1, 0.1,
+           -1.8, -3.0]
 
 _N_ORIG = len(_IIDS)
 _POS = {iid: i for i, iid in enumerate(_IIDS)}
@@ -73,7 +86,9 @@ _KING_ROWS = (
            [("k1a", "k1b"), ("k1a", "k1c"), ("k1b", "k1c"),
             ("k2a", "k2b"), ("k3a", "k3b"), ("k4a", "k4b")]) +
     _pairs(lib.INF_2ND, [(g, k) for g in ("gf", "gm") for k in _K1]) +
-    _pairs(lib.INF_3RD, [("k3a", "k4a")])  # Cousins, linking families C and D into one component
+    _pairs(lib.INF_2ND, [("un3", "k3a"), ("un3", "k3b")]) +
+    _pairs(lib.INF_3RD, [("k3a", "k4a")]) +  # Cousins, linking families C and D into one component
+    _pairs(lib.INF_3RD, [("cz4", "k4a"), ("cz4", "k4b")])
 )
 
 REL_DF = pd.DataFrame(_KING_ROWS, columns=[lib.KING_FID1_COL, lib.KING_IID1_COL,
@@ -116,8 +131,11 @@ SNPS_PER_BLOCK = 3
 
 # Genotypes ========================================================================================
 
+# The first 16 samples' genotypes come from the original generator, which goes on to build the
+# imputed data below; un3's and cz4's come from their own, so adding them changed none of that
 _rng = np.random.default_rng(seed=20261026)
-G = _rng.integers(0, 3, size=(_M_ORIG, _N_ORIG)).astype(float)
+G = _rng.integers(0, 3, size=(_M_ORIG, 16)).astype(float)
+G = np.hstack([G, np.random.default_rng(seed=20261028).integers(0, 3, size=(_M_ORIG, 2)).astype(float)])
 
 # A missing grandparental genotype makes fa1's parental mean missing at that SNP, which must then
 # propagate to fa1 and to everyone centered against him

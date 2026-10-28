@@ -244,7 +244,8 @@ def write_snipar_file(imputed_filename: str, imputed_gts: np.ndarray,
     Writes a file in this format.  Exists for building test fixtures, mirroring the write_*
     functions in bedbimfam.py, and reproduces the structure observed in a real file: byte string
     datasets, a header row prepended to pedigree, float16 per-SNP arrays, and families sorted
-    lexicographically.
+    lexicographically -- the per-family arrays are reordered with them, so the caller may give
+    families in any order.
 
     chunk_snps lets a test force a chunk width narrower than its block size, so that the block
     loop's chunk-crossing path is exercised.  Left unset, h5py chooses, which at fixture sizes
@@ -265,7 +266,18 @@ def write_snipar_file(imputed_filename: str, imputed_gts: np.ndarray,
     if bim_columns is None:
         bim_columns = ("Chr", "id", "morgans", "coordinate", "allele1", "allele2")
 
-    chunks = None if chunk_snps is None else (imputed_gts.shape[0], chunk_snps)
+    # chunks=True lets h5py choose the shape, as snipar's own writer does.  None would mean NO
+    # chunking, which the reader cannot handle (get_snipar_chunk_width() needs .chunks).
+    chunks = True if chunk_snps is None else (imputed_gts.shape[0], chunk_snps)
+
+    # snipar lists families in lexicographic order.  The per-family arrays are reordered with them,
+    # so that row i still belongs to family i whatever order the caller gave them in.
+    families = np.asarray(families)
+    order = np.argsort(families, kind="stable")
+    families = families[order]
+    imputed_gts = np.asarray(imputed_gts)[order]
+    num_obs_par_alleles = np.asarray(num_obs_par_alleles)[order]
+    parental_status = np.asarray(parental_status)[order]
 
     with h5py.File(imputed_filename, "w") as hdf5_file:
         hdf5_file.create_dataset(SNIPAR_IMPUTED_GTS_KEY, data=imputed_gts.astype("float16"),
@@ -277,7 +289,7 @@ def write_snipar_file(imputed_filename: str, imputed_gts: np.ndarray,
         hdf5_file.create_dataset(SNIPAR_PEDIGREE_KEY,
                                  data=np.vstack([np.array(SNIPAR_PED_COLS), np.asarray(pedigree)]
                                                 ).astype("S"))
-        hdf5_file.create_dataset(SNIPAR_FAMILIES_KEY, data=np.sort(np.asarray(families)).astype("S"))
+        hdf5_file.create_dataset(SNIPAR_FAMILIES_KEY, data=families.astype("S"))
         hdf5_file.create_dataset(SNIPAR_BIM_VALUES_KEY, data=np.asarray(bim_values).astype("S"))
         hdf5_file.create_dataset(SNIPAR_BIM_COLUMNS_KEY, data=np.array(bim_columns).astype("S"))
 

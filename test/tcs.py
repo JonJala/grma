@@ -50,8 +50,12 @@ Meta, optional
                           rounded to 4 decimals wants about 1e-4.
     XFAIL                 dict(reason=..., raises=...) for a case that hits a known bug, applied
                           strictly.  Optionally applies_to=(kinds...) to limit it to some of the
-                          generic tests that run production -- "end_to_end", "invariance" -- since a
-                          bug need not break every property.  Default: all of them.
+                          tests that run production on cases -- see TEST_KINDS -- since a bug need
+                          not break every property.  Default: all of them.  xfails are for known
+                          bugs only, each tied to an item in notes §16 (notes §15.6).
+    EQUIVALENT_TO         the key of another case whose rsids, betas and SEs this one must match
+                          exactly (to about 1e-12), e.g. a case run a different way that should
+                          make no difference
     EXPECTED_LOG_COUNTS   log message substring -> exact number of occurrences in a DEBUG-level
                           run, for confirming the case exercises a code path at all
 
@@ -79,11 +83,15 @@ import snipar_hdf5
 
 import helper
 import tc_2fam
+import tc_2fam_trios
 import tc_parental
 import tc_parental_imputed
 import tc_pt
 import tc_simple
 import tc_varied
+import tc_varied_absent_parents
+import tc_varied_options
+import tc_varied_unusable_imputed
 
 
 # Format ===========================================================================================
@@ -94,7 +102,7 @@ INPUTS_OPTIONAL = ("PHENO_DF", "COVAR_DF", "ID_LIST", "SNP_LIST", "SNPS_PER_BLOC
 FACTS = ("AFFECTED", "PARENTAL_MEANS", "RETAINED_RSIDS")
 INTERMEDIATES = ("ANALYSIS_IIDS", "PHENOTYPES", "OMEGA")
 PER_DEGREE = ("R_MATRICES", "RESID_PHENOS", "GLS_WEIGHTS", "RESID_GENOS", "BETAS", "SES")
-META = ("DEGREES", "TOLERANCE", "XFAIL", "EXPECTED_LOG_COUNTS")
+META = ("DEGREES", "TOLERANCE", "XFAIL", "EXPECTED_LOG_COUNTS", "EQUIVALENT_TO")
 
 FORMAT_NAMES = INPUTS_REQUIRED + INPUTS_OPTIONAL + FACTS + INTERMEDIATES + PER_DEGREE + META
 
@@ -126,31 +134,55 @@ def _drop_sample(case_module, iid):
     return fam[fam[bbf.FAM_IID_COL] != iid][[bbf.FAM_FID_COL, bbf.FAM_IID_COL]]
 
 
-_XFAIL_13_1 = dict(raises=ValueError,
+# The kinds of test that run production on cases, which an XFAIL may be limited to
+TEST_KINDS = ("end_to_end", "equivalence", "phenotype_shift", "allele_swap", "rename_samples",
+              "rename_snps", "add_singletons", "process_relatedness", "process_bim_file")
+
+
+def _kinds_except(*excluded):
+    return tuple(k for k in TEST_KINDS if k not in excluded)
+
+
+# process_bim_file() never sees the sample positions, so it is unaffected
+_XFAIL_13_1 = dict(raises=ValueError, applies_to=_kinds_except("process_bim_file"),
                    reason="notes §13.1: parental positions are unfiltered, rel_df and R are "
                           "filtered")
-# The invariance test is NOT affected: the wrong SNP's data is used in both runs, so shifting the
-# phenotypes changes nothing.  Marking it would turn that pass into a strict XPASS failure.
+# Only the end-to-end comparison is affected.  The tests that compare two runs of this case see the
+# same wrong SNP's data in both, so they pass; marking them would turn those passes into strict
+# XPASS failures.
 _XFAIL_13_2 = dict(raises=AssertionError, applies_to=("end_to_end",),
                    reason="notes §13.2: the chunk cache assumes the imputed file lists SNPs in the "
                           "bim's order.  Once a guard lands this case should expect its error "
                           "instead; once out-of-order files are supported it should simply pass.")
 
+# Adding singletons changes omega's variance, and with anyone affected the centering mean too, so
+# results change for every case until §13.6 is fixed.  Applied by the singleton test to any case
+# without an XFAIL of its own covering it.
+XFAIL_13_6 = dict(raises=AssertionError,
+                  reason="notes §13.6: omega's variance, and the phenotype centering mean, are taken "
+                         "over every analysis sample rather than only those in the regression")
+
 KEY_SIMPLE = "SIMPLE"
 KEY_2FAM = "TWO_FAMILY"
+KEY_2FAM_TRIOS = "TWO_FAMILY_TRIOS"
 KEY_VARIED = "VARIED"
 KEY_PT = "PT"
+KEY_VARIED_OPTIONS = "VARIED_OPTIONS"
 
 REGISTRY = {
     KEY_SIMPLE : Case(tc_simple),
     KEY_2FAM : Case(tc_2fam),
+    KEY_2FAM_TRIOS : Case(tc_2fam_trios),
     KEY_VARIED : Case(tc_varied),
     KEY_PT : Case(tc_pt),
+    KEY_VARIED_OPTIONS : Case(tc_varied_options),
+    "VARIED_ABSENT_PARENTS" : Case(tc_varied_absent_parents),
+    "VARIED_UNUSABLE_IMPUTED" : Case(tc_varied_unusable_imputed),
 
     # One SNP per block, so that the five SNPs VARIED's SNP list drops each leave a block with
     # nothing in it.  Covers process_genotypes() skipping such a block, which only the deleted
     # tc_allopt test exercised before (notes §15.5).
-    "VARIED_ONE_SNP_PER_BLOCK" : Case(tc_varied, SNPS_PER_BLOCK=1,
+    "VARIED_ONE_SNP_PER_BLOCK" : Case(tc_varied, SNPS_PER_BLOCK=1, EQUIVALENT_TO=KEY_VARIED,
                                       EXPECTED_LOG_COUNTS={"All SNPs filtered out in this block": 5}),
 
     "PARENTAL_FAM" : Case(tc_parental),
@@ -335,11 +367,36 @@ def grma_kwargs(key, degree, directory):
     return kwargs
 
 
-TEST_KINDS = ("end_to_end", "invariance")
-
-
-def params(kind, keys=None):
+def params(kind, keys=None, default_xfail=None):
     """pytest parameters (key, degree) over every case and degree, for one kind of production test,
+    with each case's XFAIL applied where it covers that kind
+
+    Args:
+        kind: One of TEST_KINDS
+        keys: The cases to run, default all
+        default_xfail: An xfail for a known bug that affects this kind of test, applied where the
+            case's own XFAIL does not cover it -- so that each failure is pinned to the bug that
+            actually causes it.  Either a dict, for every case and degree, or a function of
+            (key, degree) returning a dict or None, for a bug that only some combinations hit.
+    """
+
+    if kind not in TEST_KINDS:
+        raise ValueError(f"Unknown test kind {kind!r}; expected one of {TEST_KINDS}")
+
+    out = []
+    for key in (KEYS if keys is None else keys):
+        xfail = dict(REGISTRY[key]["XFAIL"] or {})
+        applies = xfail.pop("applies_to", TEST_KINDS)
+        for d in degrees(key):
+            mark = xfail if (xfail and kind in applies) else (
+                default_xfail(key, d) if callable(default_xfail) else default_xfail)
+            marks = [pytest.mark.xfail(strict=True, **mark)] if mark else []
+            out.append(pytest.param(key, d, id=f"{key}-{d}", marks=marks))
+    return out
+
+
+def key_params(kind, keys=None):
+    """pytest parameters (key,) over every case, for a test that does not depend on the degree,
     with each case's XFAIL applied where it covers that kind"""
 
     if kind not in TEST_KINDS:
@@ -350,7 +407,7 @@ def params(kind, keys=None):
         xfail = dict(REGISTRY[key]["XFAIL"] or {})
         applies = xfail.pop("applies_to", TEST_KINDS)
         marks = [pytest.mark.xfail(strict=True, **xfail)] if xfail and kind in applies else []
-        out += [pytest.param(key, d, id=f"{key}-{d}", marks=marks) for d in degrees(key)]
+        out.append(pytest.param(key, id=key, marks=marks))
     return out
 
 
@@ -398,6 +455,10 @@ def format_problems(key):
         if iid not in (case["AFFECTED"] or []):
             problems.append(f"PARENTAL_MEANS has an entry for {iid}, who is not AFFECTED")
 
+    equivalent = case["EQUIVALENT_TO"]
+    if equivalent is not None and (equivalent == key or equivalent not in REGISTRY):
+        problems.append(f"EQUIVALENT_TO names {equivalent!r}, which is not another registered case")
+
     for name in PER_DEGREE:
         value = case[name]
         if value is not None and not set(value) <= set(degrees(key)):
@@ -405,3 +466,71 @@ def format_problems(key):
                             f"that are not run")
 
     return problems
+
+
+def coding_dependence_xfail(key, degree):
+    """The xfail for notes §13.7, where a case at a degree hits it: results that depend on which
+    allele is counted.  Two independent sources, each checked from the case itself:
+
+      - an unaffected sample is centered on a group containing an affected one, so raw and
+        differenced genotypes are mixed, and recoding leaves a constant that does not cancel (§8.2)
+      - an imputed family had fewer than 4 parental alleles observed, so the unobserved ones count
+        as zero in whichever coding is used (§6.2.3a)
+    """
+
+    mixed = False
+    affected = set(get(key, "AFFECTED"))
+    if affected:
+        R = get(key, "R_MATRICES", degree)
+        R = R.toarray() if hasattr(R, "toarray") else np.asarray(R)
+        is_affected = np.array([i in affected for i in get(key, "ANALYSIS_IIDS")])
+        mixed = bool(np.any(R[np.ix_(~is_affected, is_affected)] != 0.0))
+
+    imputed = REGISTRY[key]["IMPUTED_FILE"]
+    incomplete = imputed is not None and bool(np.any(imputed["num_obs_par_alleles"] < 4.0))
+
+    if not (mixed or incomplete):
+        return None
+    sources = [s for s, hit in (("raw and differenced genotypes centered together (§8.2)", mixed),
+                                ("parental alleles left unobserved (§6.2.3a)", incomplete)) if hit]
+    return dict(raises=AssertionError,
+                reason=f"notes §13.7: results depend on allele coding -- {'; '.join(sources)}")
+
+
+def equivalent_keys():
+    """The cases that state EQUIVALENT_TO"""
+    return [k for k in KEYS if REGISTRY[k]["EQUIVALENT_TO"] is not None]
+
+
+# Generated cases ==================================================================================
+
+def _snipar_variants():
+    """Two imputed-mode versions of every case with fam-file trios: one parent imputed, and both
+
+    Each is built from the case's true genotypes by helper.mock_snipar_from_trios(), so it must give
+    results identical to the case itself (EQUIVALENT_TO) -- the invariance of notes §15.3.  Cases
+    already in imputed mode, with no one affected, or with an XFAIL are skipped, as are cases that
+    filter samples, since parental processing under sample filtering is the known bug of §13.1.
+    """
+
+    variants = {}
+    for key, case in REGISTRY.items():
+        if (is_imputed(key) or not case["AFFECTED"] or case["XFAIL"] or
+                any(case[n] is not None for n in ("ID_LIST", "PHENO_DF", "COVAR_DF"))):
+            continue
+        for mode, suffix in (("one", "SNIPAR_ONE_PARENT_IMPUTED"),
+                             ("both", "SNIPAR_BOTH_PARENTS_IMPUTED")):
+            overrides = dict(case.overrides)
+            overrides.update(
+                IMPUTED_FILE=helper.mock_snipar_from_trios(case["FAM_DF"], case["G"],
+                                                           case["BIM_DF"], case["AFFECTED"], mode),
+                PARENTAL_MEANS=get(key, "PARENTAL_MEANS"),
+                RETAINED_RSIDS=get(key, "RETAINED_RSIDS"),
+                EQUIVALENT_TO=key)
+            variants[f"{key}__{suffix}"] = Case(case.module, **overrides)
+    return variants
+
+
+REGISTRY.update(_snipar_variants())
+KEYS = list(REGISTRY)
+

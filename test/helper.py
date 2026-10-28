@@ -426,3 +426,76 @@ def mock_resid_genos(G: np.ndarray, fam_df: pd.DataFrame, analysis_df: pd.DataFr
             resid[:, person] = G[:, person] - np.mean(G[:, group], axis=1)
     resid[np.isnan(resid)] = 0.0
     return resid
+
+
+def mock_snipar_from_trios(fam_df: pd.DataFrame, G: np.ndarray, bim_df: pd.DataFrame,
+                           trio_iids: list, mode: str) -> dict:
+    """snipar data describing a case's fam-file trios, built from the TRUE genotypes in the bed
+
+    For the invariance check of notes §15.3: GRMA run on this file must give exactly the results of
+    fam-file trio mode.  That only holds under three conditions, all met here:
+
+      - every family has num_observed_parental_alleles = 4, so production removes no frequency
+        fill-in and recovers the stored truth exactly
+      - an "imputed" parent is named by an ID that resolves to nobody in the fam file, so it is not
+        ALSO taken from the bed (notes §13.4); the parent stays in the fileset, so omega and every
+        other row of R are unchanged
+      - a missing genotype stays missing (NaN), so it propagates as it does in trio mode
+
+    The file describes exactly the given trios and nobody else, since anyone else it described
+    could become affected in imputed mode when they are not in trio mode.
+
+    Args:
+        fam_df: The case's fam file
+        G: (snps, samples) genotypes, every SNP of bim_df and every sample of fam_df
+        bim_df: The case's bim file; the file shares its SNPs, order and alleles
+        trio_iids: IIDs of the children to describe -- the case's fam-mode AFFECTED
+        mode: "one" -- father observed, mother imputed as her true genotype; or
+              "both" -- neither observed, snipar's row holding the parents' true average
+
+    Returns:
+        Keyword arguments for snipar_hdf5.write_snipar_file()
+    """
+
+    if mode not in ("one", "both"):
+        raise ValueError(f"mode must be 'one' or 'both', not {mode!r}")
+
+    pos = {_id_key(f, i): n for n, (f, i) in
+           enumerate(zip(fam_df[bbf.FAM_FID_COL], fam_df[bbf.FAM_IID_COL]))}
+    rows = {str(i): (f, str(d), str(m)) for f, i, d, m in zip(
+        fam_df[bbf.FAM_FID_COL], fam_df[bbf.FAM_IID_COL],
+        fam_df[bbf.FAM_IIDF_COL], fam_df[bbf.FAM_IIDM_COL])}
+
+    # One snipar family per sibship, named so that they cannot collide with any sample ID
+    sibships = {}
+    for iid in trio_iids:
+        fid, dad, mum = rows[str(iid)]
+        sibships.setdefault((str(fid), dad, mum), []).append(str(iid))
+
+    families, imputed, pedigree = [], [], []
+    for (fid, dad, mum), kids in sibships.items():
+        family = f"snipar_{fid}_{dad}_{mum}"
+        g_dad, g_mum = G[:, pos[(fid, dad)]], G[:, pos[(fid, mum)]]
+        if mode == "one":
+            imputed.append(g_mum)
+            named = (dad, f"{mum}_hidden", "True", "False")
+        else:
+            imputed.append((g_dad + g_mum) / 2.0)
+            named = (f"{dad}_hidden", f"{mum}_hidden", "False", "False")
+        families.append(family)
+        pedigree += [[family, kid, *named] for kid in kids]
+
+    imputed = np.array(imputed)
+    status = [True, False, True] if mode == "one" else [False, False, False]
+    bim_values = np.array([["1", r, "0", str(bp), a1, a2] for r, bp, a1, a2 in zip(
+        bim_df[bbf.BIM_RSID_COL], bim_df[bbf.BIM_BP_COL],
+        bim_df[bbf.BIM_A1_COL], bim_df[bbf.BIM_A2_COL])])
+
+    return dict(imputed_gts=imputed,
+                num_obs_par_alleles=np.full(imputed.shape, 4.0),
+                standard_f=np.full(G.shape[0], 0.3),   # Irrelevant at 4 alleles observed
+                parental_status=np.array([status] * len(families)),
+                pedigree=np.array(pedigree), families=np.array(families),
+                bim_values=bim_values,
+                # Narrow, so that a case's blocks cross chunk boundaries
+                chunk_snps=min(2, G.shape[0]))

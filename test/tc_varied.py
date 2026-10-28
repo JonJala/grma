@@ -21,8 +21,10 @@ BIM_DF = pd.DataFrame(
         bbf.BIM_RSID_COL : [f"rs{num+1:02d}" for num in range(_NUM_SNPS)],
         bbf.BIM_CM_COL : [float(num) for num in range(_NUM_SNPS)],
         bbf.BIM_BP_COL : [100*num for num in range(_NUM_SNPS)],
-        bbf.BIM_A1_COL : 'A',
-        bbf.BIM_A2_COL : 'T'
+        # Arbitrary labels, chosen so that all but one SNP is non-palindromic (the one A/T SNP
+        # keeps the palindromic path covered).  Allele labels do not affect any computed value.
+        bbf.BIM_A1_COL : ['A', 'G', 'A', 'C', 'T', 'C', 'G', 'T', 'A', 'A'],
+        bbf.BIM_A2_COL : ['C', 'T', 'G', 'T', 'G', 'A', 'A', 'C', 'T', 'C']
     },
     columns=bbf.BIM_COLS
 )
