@@ -27,7 +27,7 @@ import snipar_hdf5
 
 import helper
 import tcs
-import tc_allopt  # Test case that is really only used once
+import tcs  # The case registry and harness; see its docstring for the format
 
 
 ##############
@@ -89,7 +89,7 @@ make_bed=bbf.write_bed_file
 
 class TestProcessPhenotypes:
 
-    def test__simple_fam_file__return_unchanged(self):
+    def test__simple_fam_file__return_centered(self):
         N = 100
 
         fam_df = make_fam_df(N)
@@ -97,11 +97,16 @@ class TestProcessPhenotypes:
         actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
             sut.process_phenotypes(fam_file=fam_df)
 
+        # Without covariates, phenotypes are still regressed on an intercept, i.e. centered
+        # (notes §13.5)
+        expected_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy(dtype=float)
+        expected_pheno = expected_pheno - expected_pheno.mean()
+
         assert actual_N == actual_N_orig
         assert actual_N == N
         assert np.array_equal(actual_indices, np.arange(N))
         assert fam_df[sut.FAM_KEY].equals(actual_id_df)
-        assert np.allclose(actual_pheno, fam_df[bbf.FAM_PHENO_COL].to_numpy())
+        assert np.allclose(actual_pheno, expected_pheno)
 
 
     @pytest.mark.parametrize("rng_seed", [90, 456])
@@ -121,7 +126,27 @@ class TestProcessPhenotypes:
         assert actual_N == N
         assert np.array_equal(actual_indices, np.arange(N))
         assert fam_df[sut.FAM_KEY].equals(actual_id_df)
-        assert np.allclose(actual_pheno, phenotypes)
+        assert np.allclose(actual_pheno, phenotypes - phenotypes.mean())
+
+
+    @pytest.mark.parametrize("rng_seed", [7, 2024])
+    def test__no_covariates__same_as_regressing_on_intercept_alone(self, rng_seed):
+        """Centering is the covariate regression with no covariate columns.  A covariate that is
+        zero for everyone contributes nothing, so only the intercept is fitted."""
+
+        rng = np.random.default_rng(seed=rng_seed)
+        N = 50 + rng.integers(1, 50)
+
+        fam_df = make_fam_df(N)
+        fam_df[bbf.FAM_PHENO_COL] = 10.0 * rng.random(N) + 5.0
+        zero_covar_df = fam_df[[bbf.FAM_FID_COL, bbf.FAM_IID_COL]].copy()
+        zero_covar_df["COVAR"] = 0.0
+
+        *_, without_covars = sut.process_phenotypes(fam_file=fam_df)
+        *_, with_zero_covar = sut.process_phenotypes(fam_file=fam_df, covar_file=zero_covar_df)
+
+        assert np.allclose(without_covars, with_zero_covar)
+        assert np.isclose(without_covars.mean(), 0.0)
 
 
     @pytest.mark.parametrize("rng_seed", [37, 268])
@@ -193,7 +218,9 @@ class TestProcessPhenotypes:
 
         assert actual_N_orig == N
         assert actual_N == num_phenos
-        assert np.allclose(actual_pheno, pheno_df[bbf.FAM_PHENO_COL].sort_index().to_numpy())
+        # Centered on the mean of the samples kept, not of the whole fam file (notes §13.5)
+        expected_pheno = pheno_df[bbf.FAM_PHENO_COL].sort_index().to_numpy()
+        assert np.allclose(actual_pheno, expected_pheno - expected_pheno.mean())
         assert pheno_df[bbf.FAM_FID_COL].isin(actual_id_df[bbf.FAM_FID_COL]).all()
         assert pheno_df[bbf.FAM_IID_COL].isin(actual_id_df[bbf.FAM_IID_COL]).all()
         assert len(actual_id_df) == num_phenos
@@ -568,19 +595,19 @@ class TestProcessRelatedness:
     @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
     @pytest.mark.parametrize("tc_key", [tcs.KEY_SIMPLE, tcs.KEY_2FAM, tcs.KEY_VARIED, tcs.KEY_PT])
     def test__precanned_tcs__expected_results(self, rel_degree, tc_key):
-        rel_df, fam_df = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
-        N = len(fam_df)
+        rel_df, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
+        unres_pheno = tcs.get(tc_key, "PHENOTYPES")
 
-        expected_R = tcs.R_MATRICES[tc_key][rel_degree]
+        expected_R = tcs.get(tc_key, "R_MATRICES", rel_degree)
+        expected_res_pheno = tcs.get(tc_key, "RESID_PHENOS", rel_degree)
 
-        unres_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy()
-
-
-        expected_omega = helper.mock_calc_omega(fam_df=fam_df, N=N, rel_df=rel_df,
-                                                unresidualized_phenotypes=unres_pheno)
-        expected_se_matrix = expected_R @ expected_omega @ expected_R.T
-
-        expected_res_pheno = tcs.DEMEANED_P[tc_key][rel_degree]
+        # gls_weights is the pseudo-inverse of R @ omega @ R.T.  Production inverts it block by
+        # block over the relatedness components; the mocks take one pinv over the whole matrix, a
+        # separate route to the same answer.  Every input here is well-conditioned (worst condition
+        # number about 25), so the values can be compared directly.  If a case ever makes these
+        # matrices near-singular, fix the case rather than weakening this check -- see notes §7.4j
+        # for what happened last time.
+        expected_gls_weights = tcs.get(tc_key, "GLS_WEIGHTS", rel_degree)
 
 
         actual_R, actual_gls_weights, actual_res_pheno, actual_parental = \
@@ -590,17 +617,7 @@ class TestProcessRelatedness:
 
         assert np.allclose(expected_R.toarray(), actual_R.toarray(), atol=0.001)
         assert np.allclose(expected_res_pheno, actual_res_pheno, atol=0.001)
-
-        # gls_weights is the pseudo-inverse of R @ omega @ R.T.  Its VALUES are not compared
-        # against a reference pinv: these matrices are badly conditioned (TWO_FAMILY's smallest
-        # non-zero eigenvalue is ~3e-7), so the inverse has entries in the millions and any
-        # absolute tolerance is meaningless there.  The defining Moore-Penrose properties hold
-        # regardless of scale, and checking them tests the same thing without that fragility.
-        V = expected_se_matrix.toarray()
-        W = actual_gls_weights.toarray()
-        assert np.allclose(V @ W @ V, V, atol=1e-6 * max(np.abs(V).max(), 1.0))
-        assert np.allclose(W @ V @ W, W, atol=1e-6 * max(np.abs(W).max(), 1.0))
-        assert np.allclose(W, W.T, atol=1e-9 * max(np.abs(W).max(), 1.0))
+        assert np.allclose(expected_gls_weights, actual_gls_weights.toarray(), atol=1e-6)
 
 
     @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
@@ -609,10 +626,10 @@ class TestProcessRelatedness:
     def test__randomized_phenos__expected_results(self, rel_degree, rng_seed, tc_key):
         rng = np.random.default_rng(seed=rng_seed)
 
-        rel_df, fam_df = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
+        rel_df, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
         N = len(fam_df)
 
-        expected_R = tcs.R_MATRICES[tc_key][rel_degree]
+        expected_R = tcs.get(tc_key, "R_MATRICES", rel_degree)
 
         unres_pheno = 10.0 * rng.random(N)
         expected_omega = helper.mock_calc_omega(fam_df=fam_df, N=N, rel_df=rel_df,
@@ -629,23 +646,21 @@ class TestProcessRelatedness:
         assert np.allclose(expected_R.toarray(), actual_R.toarray(), atol=0.001)
         assert np.allclose(expected_res_pheno, actual_res_pheno, atol=0.001)
 
-        # gls_weights is the pseudo-inverse of R @ omega @ R.T.  Its VALUES are not compared
-        # against a reference pinv: these matrices are badly conditioned (TWO_FAMILY's smallest
-        # non-zero eigenvalue is ~3e-7), so the inverse has entries in the millions and any
-        # absolute tolerance is meaningless there.  The defining Moore-Penrose properties hold
-        # regardless of scale, and checking them tests the same thing without that fragility.
-        V = expected_se_matrix.toarray()
-        W = actual_gls_weights.toarray()
-        assert np.allclose(V @ W @ V, V, atol=1e-6 * max(np.abs(V).max(), 1.0))
-        assert np.allclose(W @ V @ W, W, atol=1e-6 * max(np.abs(W).max(), 1.0))
-        assert np.allclose(W, W.T, atol=1e-9 * max(np.abs(W).max(), 1.0))
+        # gls_weights is the pseudo-inverse of R @ omega @ R.T.  Production inverts it block by
+        # block over the relatedness components; one pinv over the whole matrix is a separate
+        # route to the same answer.  Every input here is well-conditioned (worst condition number
+        # about 25), so the values can be compared directly.  If a fixture ever makes these
+        # matrices near-singular, fix the fixture rather than weakening this check -- see notes
+        # §7.4j for what happened last time.
+        expected_gls_weights = np.linalg.pinv(expected_se_matrix.toarray())
+        assert np.allclose(expected_gls_weights, actual_gls_weights.toarray(), atol=1e-6)
 
 
     @pytest.mark.parametrize("rel_degree", ["FS", "AbCd", ""])
     def test__rel_degree_nonint_str__expected_error(self, rel_degree):
 
         tc_key = tcs.KEY_SIMPLE
-        rel_df, fam_df = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
+        rel_df, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
         unres_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy()
 
         with pytest.raises(ValueError) as ex_info:
@@ -662,7 +677,7 @@ class TestProcessRelatedness:
     def test__rel_degree_wrong_type__expected_error(self, rel_degree):
 
         tc_key = tcs.KEY_SIMPLE
-        rel_df, fam_df = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
+        rel_df, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
         unres_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy()
 
         with pytest.raises(TypeError) as ex_info:
@@ -679,7 +694,7 @@ class TestProcessRelatedness:
     def test__rel_degree_out_of_range__expected_error(self, rel_degree):
 
         tc_key = tcs.KEY_SIMPLE
-        rel_df, fam_df = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
+        rel_df, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
         unres_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy()
 
         with pytest.raises(ValueError) as ex_info:
@@ -698,7 +713,7 @@ class TestProcessRelatedness:
         rel_degree = sut.MAX_GRMA_RELATEDNESS
         tc_key = tcs.KEY_VARIED
 
-        rel_df_1, fam_df = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
+        rel_df_1, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
         rel_df_2 = rel_df_1.sample(frac=1, random_state=rng_seed).reset_index(drop=True)
         N = len(fam_df)
 
@@ -725,7 +740,7 @@ class TestProcessRelatedness:
         rel_degree = sut.MAX_GRMA_RELATEDNESS
         tc_key = tcs.KEY_VARIED
 
-        rel_df_1, fam_df = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
+        rel_df_1, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
         cols = sut.NEEDED_KING_COLS.copy()
         fid1_index, iid1_index, fid2_index, iid2_index = \
             cols.index(sut.KING_FID1_COL), cols.index(sut.KING_IID1_COL), \
@@ -757,7 +772,7 @@ class TestProcessRelatedness:
         rel_degree = sut.MAX_GRMA_RELATEDNESS
         tc_key = tcs.KEY_2FAM
 
-        rel_df, fam_df_1 = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
+        rel_df, fam_df_1 = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
 
         N = len(fam_df_1)
         permutation = rng.permutation(N)
@@ -786,7 +801,7 @@ class TestProcessRelatedness:
         rel_degree = sut.MAX_GRMA_RELATEDNESS
         tc_key = tcs.KEY_VARIED
 
-        rel_df_1, fam_df_1 = tcs.REL_DFS[tc_key], tcs.FAM_DFS[tc_key]
+        rel_df_1, fam_df_1 = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
         N = len(fam_df_1)
         permutation = rng.permutation(N)
         mapping = {i : permutation[i] for i in range(N)}
@@ -898,14 +913,14 @@ class TestProcessBimFile:
 
     @pytest.mark.parametrize("tc_key", [tcs.KEY_SIMPLE, tcs.KEY_2FAM, tcs.KEY_VARIED])
     def test__precanned_tcs__expected_results(self, tc_key):
-        bim_df = tcs.BIM_DFS[tc_key]
+        bim_df = tcs.get(tc_key, "BIM_DF")
 
         expected_M_orig = len(bim_df)
-        expected_snp_filter = tcs.SNP_FILTERS[tc_key]
+        expected_snp_filter = tcs.snp_filter(tc_key)
         expected_M = len(expected_snp_filter) if expected_snp_filter is not None else expected_M_orig
 
         actual_M_orig, actual_M, actual_snp_filter, _ = sut.process_bim_file(
-            bim_file=bim_df, snp_list=tcs.SNP_LISTS[tc_key])
+            bim_file=bim_df, snp_list=tcs.get(tc_key, "SNP_LIST"))
 
         assert expected_M_orig == actual_M_orig
         assert expected_M == actual_M
@@ -938,15 +953,15 @@ class TestProcessBimFile:
     def test__shuffle_snp_list__same_results(self, rng_seed):
         rng = np.random.default_rng(seed=rng_seed)
         tc_key = tcs.KEY_VARIED
-        bim_df = tcs.BIM_DFS[tc_key]
+        bim_df = tcs.get(tc_key, "BIM_DF")
 
         expected_M_orig = len(bim_df)
 
-        expected_snp_filter = tcs.SNP_FILTERS[tc_key]
+        expected_snp_filter = tcs.snp_filter(tc_key)
         expected_M = len(expected_snp_filter) if expected_snp_filter is not None else expected_M_orig
 
         actual_M_orig, actual_M, actual_snp_filter, _ = sut.process_bim_file(
-            bim_file=bim_df, snp_list=tcs.SNP_LISTS[tc_key].sample(frac=1, random_state=rng))
+            bim_file=bim_df, snp_list=tcs.get(tc_key, "SNP_LIST").sample(frac=1, random_state=rng))
 
         assert expected_M_orig == actual_M_orig
         assert expected_M == actual_M
@@ -960,19 +975,16 @@ class TestGetResidualizedGenotypeData:
     @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
     @pytest.mark.parametrize("tc_key", [tcs.KEY_SIMPLE, tcs.KEY_2FAM, tcs.KEY_VARIED])
     def test__precanned_tcs__expected_results(self, tc_key, rel_degree):
-        
-        snp_filter = tcs.SNP_FILTERS[tc_key]
-        sample_filter = tcs.SAMPLE_FILTERS[tc_key]
-        expected_resid_G = tcs.DEMEANED_G[tc_key][rel_degree][snp_filter] if snp_filter is not None\
-            else tcs.DEMEANED_G[tc_key][rel_degree]
-        expected_resid_G = expected_resid_G[:, sample_filter] if sample_filter is not None \
-            else expected_resid_G
 
-        orig_G = tcs.G[tc_key]
+        snp_filter = tcs.snp_filter(tc_key)
+        sample_filter = tcs.sample_filter(tc_key)
+        expected_resid_G = tcs.get(tc_key, "RESID_GENOS", rel_degree)
+
+        orig_G = tcs.get(tc_key, "G")
 
         actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=orig_G,
             M_orig=orig_G.shape[0], N_orig=orig_G.shape[1], snp_filter=snp_filter,
-            sample_filter=sample_filter, R=tcs.R_MATRICES[tc_key][rel_degree],
+            sample_filter=sample_filter, R=tcs.get(tc_key, "R_MATRICES", rel_degree),
             M_start=0, num_snps=orig_G.shape[0])
 
         assert actual_resid_G.shape == expected_resid_G.shape
@@ -1224,18 +1236,18 @@ class TestGetResidualizedGenotypeData:
         assert np.allclose(actual[:, [0, 1, 3]], G[:, [0, 1, 3]])
 
 
-    def test__relatives_of_an_affected_sample__centre_against_the_differenced_value(self):
+    def test__relatives_of_an_affected_sample__center_against_the_differenced_value(self):
         # The ordering that matters.  Subtracting the parental means BEFORE multiplying by R, or
         # after, makes no difference to the affected individual -- their identity row passes them
-        # through either way.  It changes the answer for everyone centring against them.
+        # through either way.  It changes the answer for everyone centering against them.
         #
         # Samples 2 and 3 are siblings; 2 is a trio and so is differenced, 3 is not.  Sample 3's
-        # row centres the pair, so what it subtracts depends on whether sample 2 has already had
+        # row centers the pair, so what it subtracts depends on whether sample 2 has already had
         # its parents removed.
         G = np.array([[2.0, 0.0, 1.0, 2.0]])
         parental_sources = self.trio_sources([2], [[0, 1]])
 
-        # Sample 2 gets an identity row; sample 3 centres against both of them
+        # Sample 2 gets an identity row; sample 3 centers against both of them
         R = sut.calculate_R(
             pd.DataFrame({sut.FAM_INDEX_1 : [2], sut.FAM_INDEX_2 : [3],
                           sut.KING_REL_COL : [sut.DEG_FULLSIB]}),
@@ -1246,11 +1258,11 @@ class TestGetResidualizedGenotypeData:
             M_start=0, num_snps=1, parental_sources=parental_sources)
 
         # Parents are 2 and 0, so the mean is 1.0 and sample 2 differences to 0.0.  Sample 3 then
-        # centres against that: 2.0 - (0.0 + 2.0) / 2 = 1.0.
+        # centers against that: 2.0 - (0.0 + 2.0) / 2 = 1.0.
         #
-        # Had R been applied first, sample 3 would have centred against the RAW 1.0, giving
+        # Had R been applied first, sample 3 would have centered against the RAW 1.0, giving
         # 2.0 - (1.0 + 2.0) / 2 = 0.5, and its own parental mean would then have been subtracted
-        # from a value that had already been centred.
+        # from a value that had already been centered.
         assert np.isclose(actual[0, 2], 0.0)
         assert np.isclose(actual[0, 3], 1.0)
 
@@ -1348,7 +1360,7 @@ class TestGetResidualizedGenotypeData:
 
     def test__missing_parental_genotype__knocks_out_the_relatedness_group(self):
         # A parent missing at a SNP makes that SNP missing for the child, and the NaN then spreads
-        # through R to everyone centring against them before being zeroed.  The whole group loses
+        # through R to everyone centering against them before being zeroed.  The whole group loses
         # the SNP rather than just the child.
         #
         # This is conservative rather than wrong: zeroing before R instead would treat the missing
@@ -1364,7 +1376,7 @@ class TestGetResidualizedGenotypeData:
             bed_file=G, M_orig=1, N_orig=4, snp_filter=None, sample_filter=None, R=R,
             M_start=0, num_snps=1, parental_sources=self.trio_sources([2], [[0, 1]]))
 
-        # Sample 2 is missing, and sample 3 centres against it, so both come back as zero
+        # Sample 2 is missing, and sample 3 centers against it, so both come back as zero
         assert np.allclose(actual[0, [2, 3]], [0.0, 0.0])
 
 
@@ -2436,7 +2448,7 @@ class TestCalculateGLSWeights:
     def sibling_pair(variance=2.0, covariance=0.5):
         """Returns (R, omega) for two full siblings and nobody else
 
-        R centres them against each other; omega gives them a shared phenotypic covariance.  Small
+        R centers them against each other; omega gives them a shared phenotypic covariance.  Small
         enough that the result can be worked out by hand.
         """
 
@@ -2607,7 +2619,7 @@ class TestCalculateGLSWeights:
     def test__affected_sample_among_relatives__R_not_treated_as_symmetric(self):
         # R is generally NOT symmetric.  An affected sample's ROW is the identity, since their
         # genotypes were already residualized against their parents -- but their COLUMN keeps the
-        # entries their relatives use to centre against them.  Three siblings with one of them
+        # entries their relatives use to center against them.  Three siblings with one of them
         # affected is the smallest case that shows it.
         #
         # The covariance being inverted is R omega R', and with an asymmetric R the transposes
@@ -4435,11 +4447,11 @@ class TestProcessImputedParents:
 
 class TestCalculateR:
 
-    # Each sample's row centres them within their CLOSEST relatedness group: the minimum degree
+    # Each sample's row centers them within their CLOSEST relatedness group: the minimum degree
     # they appear at, and every relative at that degree.  Multiplying by R subtracts that group's
     # mean, which is what removes the family-level confounding GRMA exists to remove.
     #
-    # Samples residualized against their parents instead get an identity row, since centring them
+    # Samples residualized against their parents instead get an identity row, since centering them
     # a second time would subtract the family effect twice.
 
     @staticmethod
@@ -4453,14 +4465,14 @@ class TestCalculateR:
                              sut.KING_REL_COL : degrees})
 
 
-    def test__a_pair_of_siblings__each_centred_against_the_other(self):
+    def test__a_pair_of_siblings__each_centered_against_the_other(self):
         actual = sut.calculate_R(self.relatedness([(0, 1)]), N=2).toarray()
 
         assert np.allclose(actual, [[0.5, -0.5],
                                     [-0.5, 0.5]])
 
 
-    def test__three_siblings__each_centred_against_the_other_two(self):
+    def test__three_siblings__each_centered_against_the_other_two(self):
         # The weight is 1/k for each of the k relatives at the minimum degree, so a larger sibship
         # spreads the subtraction further rather than subtracting more
         actual = sut.calculate_R(self.relatedness([(0, 1), (0, 2), (1, 2)]), N=3).toarray()
@@ -4487,7 +4499,7 @@ class TestCalculateR:
 
 
     def test__closest_relatives_only__more_distant_ones_ignored(self):
-        # Sample 0 has a sibling and a third-degree relative.  Only the sibling counts: centring
+        # Sample 0 has a sibling and a third-degree relative.  Only the sibling counts: centering
         # against a distant relative as well would mix in exactly the population structure the
         # within-family contrast is meant to avoid.
         actual = sut.calculate_R(
@@ -4516,7 +4528,7 @@ class TestCalculateR:
         # Sample 0 has two second-degree relatives and one third-degree.  Both of the former
         # count; the latter does not.
         #
-        # The group being centred against INCLUDES the sample itself, so two relatives give
+        # The group being centered against INCLUDES the sample itself, so two relatives give
         # thirds rather than halves -- the same arithmetic as a sibship of three.
         actual = sut.calculate_R(
             self.relatedness([(0, 1), (0, 2), (0, 3)],
@@ -4527,7 +4539,7 @@ class TestCalculateR:
 
 
     def test__rows_of_samples_with_relatives__sum_to_zero(self):
-        # What centring means: the row takes a difference, so a constant added to everybody's
+        # What centering means: the row takes a difference, so a constant added to everybody's
         # genotypes passes through it unchanged
         actual = sut.calculate_R(self.relatedness([(0, 1), (0, 2), (1, 2), (3, 4)]),
                                  N=5).toarray()
@@ -4554,7 +4566,7 @@ class TestCalculateR:
         # A repeated pair should change nothing: it says the same thing twice.  What happens
         # instead is that the row weights are built with a sparse constructor that SUMS entries
         # landing in the same cell, so the row sum comes out at 2 rather than 1 and the pair is
-        # centred at two thirds rather than a half.
+        # centered at two thirds rather than a half.
         #
         # The same is true of calculate_omega(), where the two covariances are added together.
         # Both want the relatedness file checked for duplicates, which also has to normalise the
@@ -4569,7 +4581,7 @@ class TestCalculateR:
 
     def test__affected_sample__gets_an_identity_row(self):
         # Their genotypes have already had their parents subtracted, so R passes them through
-        # unchanged rather than centring them a second time
+        # unchanged rather than centering them a second time
         actual = sut.calculate_R(self.relatedness([(0, 1)]), N=2,
                                  affected_samples=np.array([0])).toarray()
 
@@ -4577,7 +4589,7 @@ class TestCalculateR:
 
 
     def test__affected_sample_with_relatives__still_an_identity_row(self):
-        # Parental residualization REPLACES the within-group centring rather than supplementing
+        # Parental residualization REPLACES the within-group centering rather than supplementing
         # it: doing both would subtract the family effect twice.  So having siblings changes
         # nothing for the affected sample itself.
         actual = sut.calculate_R(self.relatedness([(0, 1), (0, 2), (1, 2)]), N=3,
@@ -4586,9 +4598,9 @@ class TestCalculateR:
         assert np.allclose(actual[0], [1.0, 0.0, 0.0])
 
 
-    def test__relatives_of_an_affected_sample__still_centre_against_them(self):
+    def test__relatives_of_an_affected_sample__still_center_against_them(self):
         # Only the affected sample's own ROW changes.  They remain a COLUMN in everybody else's,
-        # and still count towards those samples' group size -- sample 1 below centres against both
+        # and still count towards those samples' group size -- sample 1 below centers against both
         # 0 and 2, not only 2.
         actual = sut.calculate_R(self.relatedness([(0, 1), (0, 2), (1, 2)]), N=3,
                                  affected_samples=np.array([0])).toarray()
@@ -4615,7 +4627,7 @@ class TestCalculateR:
         pytest.param(None, id="none_given"),
         pytest.param(np.array([], dtype=np.int64), id="empty_array"),
     ])
-    def test__nobody_affected__ordinary_centring_throughout(self, affected_samples):
+    def test__nobody_affected__ordinary_centering_throughout(self, affected_samples):
         expected = sut.calculate_R(self.relatedness([(0, 1)]), N=2).toarray()
 
         actual = sut.calculate_R(self.relatedness([(0, 1)]), N=2,
@@ -4632,13 +4644,13 @@ class TestCalculateR:
         assert np.allclose(actual[0], [1.0, 0.0, 0.0])
         assert np.allclose(actual[2], [0.0, 0.0, 1.0])
 
-        # Sample 1 is unaffected and still centres against both of them
+        # Sample 1 is unaffected and still centers against both of them
         third = 1.0 / 3.0
         assert np.allclose(actual[1], [-third, 2 * third, -third])
 
 
     def test__every_sample_affected__the_identity_matrix(self):
-        # Nothing is centred at all, since every genotype has already been differenced against
+        # Nothing is centered at all, since every genotype has already been differenced against
         # its own parents
         actual = sut.calculate_R(self.relatedness([(0, 1), (1, 2)]), N=3,
                                  affected_samples=np.array([0, 1, 2])).toarray()
@@ -4760,67 +4772,6 @@ class TestCreateOutput:
 
 class TestGRMA:
 
-    @pytest.mark.parametrize("tc_key", tcs.KEYS)
-    @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
-    def test__precanned_tcs__expected_results(self, tc_key, rel_degree):
-
-        filtered_G = tcs.G[tc_key]
-        filtered_pheno = tcs.FAM_DFS[tc_key][bbf.FAM_PHENO_COL].to_numpy()
-        if tcs.SNP_FILTERS[tc_key] is not None:
-            filtered_G = filtered_G[tcs.SNP_FILTERS[tc_key]]
-        if tcs.SAMPLE_FILTERS[tc_key] is not None:
-            filtered_G = filtered_G[:, tcs.SAMPLE_FILTERS[tc_key]]
-            filtered_pheno = filtered_pheno[tcs.SAMPLE_FILTERS[tc_key]]
-
-        actual_results = sut.grma(
-            rel_file=tcs.REL_DFS[tc_key],
-            bed_file=tcs.G[tc_key],
-            bim_file=tcs.BIM_DFS[tc_key],
-            fam_file=tcs.FAM_DFS[tc_key],
-            rel_degree=rel_degree,
-            id_list=tcs.SAMPLE_LISTS[tc_key],
-            snp_list=tcs.SNP_LISTS[tc_key]
-        )
-
-
-        test_betas, test_ses = helper.mock_grma(
-            rel_df=tcs.REL_DFS[tc_key],
-            fam_df=tcs.FAM_DFS[tc_key],
-            G=filtered_G,
-            pheno=filtered_pheno,
-            rel_deg=rel_degree
-        )
-        expected_betas, expected_ses = test_betas, test_ses
-        assert np.allclose(actual_results[sut.OUTPUT_BETA_COL].to_numpy(), expected_betas, atol=0.001, equal_nan=True)
-        assert np.allclose(actual_results[sut.OUTPUT_SE_COL].to_numpy(), expected_ses, atol=0.001, equal_nan=True)
-        # TODO(jonbjala)  Should test P and Sum_Sq_X at some point
-
-
-    @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
-    def test__all_opts__expected_results(self, rel_degree, caplog):
-
-        with caplog.at_level(logging.DEBUG):
-            actual_results = sut.grma(
-                rel_file=tc_allopt.REL_DF,
-                bed_file=tc_allopt.G,
-                bim_file=tc_allopt.BIM_DF,
-                fam_file=tc_allopt.FAM_DF,
-                pheno_file=tc_allopt.PHENO_DF,
-                covar_file=tc_allopt.COVAR_DF,
-                rel_degree=rel_degree,
-                id_list=tc_allopt.SAMPLE_DF,
-                snp_list=tc_allopt.SNP_LIST,
-                snps_per_block=tc_allopt.SNPS_PER_BLOCK
-            )
-        
-        captured = caplog.text
-
-
-        assert "All SNPs filtered out in this block" in captured
-        assert len(actual_results) == len(tc_allopt.SNP_LIST)
-        assert actual_results[bbf.BIM_RSID_COL].equals(tc_allopt.SNP_LIST[bbf.BIM_RSID_COL])
-        # TODO(jonbjala) Should probably compare actual results (betas, ses, etc)
-
     def test__add_singletons__same_results(self):
         pass
 
@@ -4834,3 +4785,95 @@ class TestGRMA:
 
 
     # TODO(jonbjala) Definitely need error cases
+
+
+
+# Case harness ====================================================================================
+#
+# Generic tests over every case in tcs.REGISTRY.  A case states what it is built to have and,
+# optionally, any intermediate values; anything it does not state is derived by the mocks in
+# helper.py.  See tcs.py for the format.
+
+def _assert_close(key, name, actual, expected):
+    """Compares a value against a case's expectation, naming the case and quantity on failure"""
+
+    actual = actual.toarray() if sp.issparse(actual) else np.asarray(actual, dtype=float)
+    expected = expected.toarray() if sp.issparse(expected) else np.asarray(expected, dtype=float)
+    assert actual.shape == expected.shape, \
+        f"{key}: {name} has shape {actual.shape}, expected {expected.shape}"
+    worst = float(np.max(np.abs(actual - expected))) if actual.size else 0.0
+    assert np.allclose(actual, expected, atol=tcs.tolerance(key), rtol=0.0), \
+        f"{key}: {name} differs by up to {worst:.3g} ({tcs.provenance(key, name)} expectation)"
+
+
+class TestCaseFormat:
+
+    @pytest.mark.parametrize("key", tcs.KEYS)
+    def test__case__follows_the_format(self, key):
+        assert tcs.format_problems(key) == []
+
+
+class TestCaseSelfConsistency:
+    """Every value a case states that the mocks can also derive, checked against the mocks
+
+    No production code runs here.  A failure means the case and the mocks disagree, so one of them
+    is wrong -- a hand-derived matrix with a slip in it, a reference value computed under an older
+    estimator (notes §15.1), or a mock that has drifted.  Either way it must be resolved before the
+    production tests that use the case mean anything.
+    """
+
+    @pytest.mark.parametrize("key, name, degree", tcs.stated_derivable_params())
+    def test__stated_value__agrees_with_mocks(self, key, name, degree):
+        stated, derived = tcs.stated(key, name, degree), tcs.derived(key, name, degree)
+
+        if name in ("AFFECTED", "ANALYSIS_IIDS", "RETAINED_RSIDS"):
+            assert sorted(stated) == sorted(derived) if name == "AFFECTED" else stated == derived
+        elif name == "PARENTAL_MEANS":
+            assert sorted(stated) == sorted(derived)
+            for iid in stated:
+                assert np.allclose(stated[iid], derived[iid], atol=tcs.tolerance(key),
+                                   equal_nan=True), f"{key}: PARENTAL_MEANS[{iid}]"
+        else:
+            _assert_close(key, name, stated, derived)
+
+
+class TestCaseEndToEnd:
+
+    @pytest.mark.parametrize("key, degree", tcs.params("end_to_end"))
+    def test__grma__matches_expected(self, key, degree, tmp_path, caplog):
+        with caplog.at_level(logging.DEBUG):
+            actual = sut.grma(**tcs.grma_kwargs(key, degree, tmp_path))
+
+        assert actual[bbf.BIM_RSID_COL].astype(str).tolist() == tcs.get(key, "RETAINED_RSIDS")
+        _assert_close(key, "BETAS", actual[sut.OUTPUT_BETA_COL], tcs.get(key, "BETAS", degree))
+        _assert_close(key, "SES", actual[sut.OUTPUT_SE_COL], tcs.get(key, "SES", degree))
+
+        for message, count in (tcs.REGISTRY[key]["EXPECTED_LOG_COUNTS"] or {}).items():
+            assert caplog.text.count(message) == count, \
+                f"{key}: expected {count} occurrence(s) of {message!r}"
+
+
+class TestCaseInvariance:
+    """Properties every case must have, checked against production alone
+
+    These need no reimplementation of the method, so they can catch a gap the mocks share with
+    production -- as notes §13.5 was: the mocks did not center phenotypes either, so they agreed.
+    """
+
+    @pytest.mark.parametrize("key, degree", tcs.params("invariance"))
+    def test__phenotypes_shifted_by_a_constant__results_unchanged(self, key, degree, tmp_path):
+        kwargs = tcs.grma_kwargs(key, degree, tmp_path)
+        baseline = sut.grma(**kwargs)
+
+        shifted_fam = kwargs["fam_file"].copy()
+        shifted_fam[bbf.FAM_PHENO_COL] = shifted_fam[bbf.FAM_PHENO_COL].astype(float) + 10.0
+        shifted_kwargs = dict(kwargs, fam_file=shifted_fam)
+        if kwargs["pheno_file"] is not None:
+            shifted_pheno = kwargs["pheno_file"].copy()
+            shifted_pheno.iloc[:, 2] = shifted_pheno.iloc[:, 2].astype(float) + 10.0
+            shifted_kwargs["pheno_file"] = shifted_pheno
+        shifted = sut.grma(**shifted_kwargs)
+
+        for col in (sut.OUTPUT_BETA_COL, sut.OUTPUT_SE_COL):
+            assert np.allclose(shifted[col], baseline[col], atol=1e-9, rtol=0.0), \
+                f"{key}: {col} depends on the phenotype's origin"

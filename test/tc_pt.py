@@ -1,3 +1,17 @@
+"""
+PT: the reference case from Patrick, who leads GRMA and devised the method.  16 samples in four
+groups linked by full-sib, 2nd- and 3rd-degree pairs, with one missing genotype.
+
+Its expected betas and SEs were computed under the PRE-GLS estimator (OLS with a sandwich SE; notes
+§15.1), so they cannot match the current method and are kept under underscore names, where the
+harness never asserts them.  The expectations used are therefore derived by the mocks.  Patrick will
+supply a replacement case that includes parental residualization.
+
+R_MATRICES were supplied printed to 8 decimal places, so they differ from the exact values by up to
+about 2e-8 -- well inside the default tolerance.
+
+No parent columns, so parental residualization is a no-op (AFFECTED is empty).
+"""
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
@@ -6,26 +20,18 @@ import bedbimfam as bbf
 import grma_lib as lib
 
 
-NUM_SNPS = 5
+_NUM_SNPS = 5
 BIM_DF = pd.DataFrame(
     {
         bbf.BIM_CHR_COL : 1,
-        bbf.BIM_RSID_COL : [f"rs{num+1:02d}" for num in range(NUM_SNPS)],
-        bbf.BIM_CM_COL : [float(num) for num in range(NUM_SNPS)],
-        bbf.BIM_BP_COL : [100*num for num in range(NUM_SNPS)],
+        bbf.BIM_RSID_COL : [f"rs{num+1:02d}" for num in range(_NUM_SNPS)],
+        bbf.BIM_CM_COL : [float(num) for num in range(_NUM_SNPS)],
+        bbf.BIM_BP_COL : [100*num for num in range(_NUM_SNPS)],
         bbf.BIM_A1_COL : 'A',
         bbf.BIM_A2_COL : 'T'
     },
     columns=bbf.BIM_COLS
 )
-
-SNP_LIST = None
-
-SNP_FILTER = None
-
-SAMPLE_LIST = None
-
-SAMPLE_FILTER = None
 
 FAM_DF = pd.DataFrame(
     {
@@ -44,8 +50,8 @@ FAM_DF = pd.DataFrame(
 )
 
 
-M = len(BIM_DF)
-N = len(FAM_DF)
+_M = len(BIM_DF)
+_N = len(FAM_DF)
 
 G = np.array([[np.nan, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
                       [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 2.0, 0.0, 1.0, 0.0, 1.0, 1.0, 2.0, 2.0, 1.0],
@@ -87,7 +93,7 @@ REL_DF = pd.DataFrame(
     columns=lib.NEEDED_KING_COLS
 )
 
-DEG_FS_R = np.array(
+_DEG_FS_R = np.array(
     [
         [ 0.,  0. ,  0. ,  0. ,  0. ,  0. ,  0. ,  0. ,  0. ,  0. ,  0. ,  0. ,
    0. ,  0. ,  0. ,  0. ],
@@ -123,9 +129,9 @@ DEG_FS_R = np.array(
    0. ,  0. ,  0. ,  0. ]]
 )
 
-DEG_PO_R = DEG_FS_R.copy()
+_DEG_PO_R = _DEG_FS_R.copy()
 
-DEG_2ND_R = np.array(
+_DEG_2ND_R = np.array(
     [[ 0.66666667,  0.        ,  0.        ,  0.        , -0.33333333,
    0.        ,  0.        ,  0.        , -0.33333333,  0.        ,
    0.        ,  0.        ,  0.        ,  0.        ,  0.        ,
@@ -193,7 +199,7 @@ DEG_2ND_R = np.array(
 )
 
 
-DEG_3RD_R = np.array(
+_DEG_3RD_R = np.array(
     [[ 0.66666667,  0.        ,  0.        ,  0.        , -0.33333333,
    0.        ,  0.        ,  0.        , -0.33333333,  0.        ,
    0.        ,  0.        ,  0.        ,  0.        ,  0.        ,
@@ -261,19 +267,16 @@ DEG_3RD_R = np.array(
 
 )
 
-DEG_4TH_R = DEG_3RD_R.copy()
 
 R_MATRICES = {
-    lib.DEG_FULLSIB : sp.csr_array(DEG_FS_R),
-    lib.DEG_PARENT_OFFSPRING : sp.csr_array(DEG_PO_R),
-    lib.DEG_2ND : sp.csr_array(DEG_2ND_R),
-    lib.DEG_3RD : sp.csr_array(DEG_3RD_R),
-    lib.DEG_4TH : sp.csr_array(DEG_4TH_R)
+    lib.DEG_FULLSIB : sp.csr_array(_DEG_FS_R),
+    lib.DEG_PARENT_OFFSPRING : sp.csr_array(_DEG_PO_R),
+    lib.DEG_2ND : sp.csr_array(_DEG_2ND_R),
+    lib.DEG_3RD : sp.csr_array(_DEG_3RD_R)
 }
 
 
-
-BETAS = {
+_PRE_GLS_BETAS = {
     lib.DEG_FULLSIB : -np.array([-0.2606, -0.1602, -0.2606, 0.4899, -1.1223]),
     lib.DEG_PARENT_OFFSPRING : -np.array([-0.2606, -0.1602, -0.2606, 0.4899, -1.1223]),
     lib.DEG_2ND : -np.array([-0.3724, 0.0515, -0.1684, 0.7521, -0.4618]),
@@ -281,7 +284,7 @@ BETAS = {
     lib.DEG_4TH : -np.array([-0.4644, -0.1047, 0.1630, 0.4977, -0.4589])
 }
 
-SES = {
+_PRE_GLS_SES = {
     lib.DEG_FULLSIB : np.array([0.2606, 0.1602, 0.2606, 0.5332, 0.8671]),
     lib.DEG_PARENT_OFFSPRING : np.array([0.2606, 0.1602, 0.2606, 0.5332, 0.8671]),
     lib.DEG_2ND : np.array([0.3724, 0.3421, 0.2207, 0.5843, 0.6962]),
@@ -290,6 +293,13 @@ SES = {
 }
 
 
+# Stated facts and intermediates =================================================================
 
-DEMEANED_P = {deg : r_matrix @ FAM_DF[bbf.FAM_PHENO_COL].to_numpy() for deg, r_matrix in R_MATRICES.items()}
-DEMEANED_G = {deg : np.nan_to_num(G @ r_matrix.T) for deg, r_matrix in R_MATRICES.items()}
+AFFECTED = []
+
+# Phenotypes are centered before residualization (notes §13.5).  With nobody affected every row of R
+# sums to zero or is empty, so this equals R applied to the raw phenotypes, as it was first written.
+_PHENOS = FAM_DF[bbf.FAM_PHENO_COL].to_numpy(dtype=float)
+RESID_PHENOS = {deg : r_matrix @ (_PHENOS - _PHENOS.mean()) for deg, r_matrix in R_MATRICES.items()}
+
+RESID_GENOS = {deg : np.nan_to_num(G @ r_matrix.T) for deg, r_matrix in R_MATRICES.items()}

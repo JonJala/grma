@@ -1,3 +1,11 @@
+"""
+SIMPLE: sample 0 is related to each of six others at a different degree -- full sib, parent-offspring,
+2nd, 3rd, 4th, and one listed as unrelated -- so each degree adds exactly one row to R.  A SNP list
+keeps three of the five SNPs.
+
+No parent columns, so parental residualization is a no-op (AFFECTED is empty).  R_MATRICES and the
+residualized values below are hand-derived; TestCaseSelfConsistency checks them against the mocks.
+"""
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
@@ -19,11 +27,7 @@ BIM_DF = pd.DataFrame(
 )
 
 SNP_LIST = pd.DataFrame({bbf.BIM_RSID_COL : ['rs1', 'rs3', 'rs4']})
-SNP_FILTER = np.array([0, 2, 3])
-
-SAMPLE_LIST = None
-
-SAMPLE_FILTER = None
+_SNP_FILTER = np.array([0, 2, 3])
 
 FAM_DF = pd.DataFrame(
     {
@@ -37,10 +41,10 @@ FAM_DF = pd.DataFrame(
     columns=bbf.FAM_COLS
 )
 
-M = len(BIM_DF)
-N = len(FAM_DF)
+_M = len(BIM_DF)
+_N = len(FAM_DF)
 
-G = np.array([[(i + j * j + 1) % 3  for j in range(N)] for i in range(M)], dtype=float)
+G = np.array([[(i + j * j + 1) % 3  for j in range(_N)] for i in range(_M)], dtype=float)
 
 REL_DF = pd.DataFrame(
     {
@@ -64,7 +68,7 @@ REL_DF = pd.DataFrame(
     
 
 # R Matrices
-DEG_FS_R = np.array(
+_DEG_FS_R = np.array(
     [
         [0.5, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
         [-0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -76,20 +80,28 @@ DEG_FS_R = np.array(
     ]
 )
 
-DEG_PO_R = DEG_FS_R.copy(); DEG_PO_R[2] = np.array([-0.5, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0])
-DEG_2ND_R = DEG_PO_R.copy(); DEG_2ND_R[3] = np.array([-0.5, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0])
-DEG_3RD_R = DEG_2ND_R.copy(); DEG_3RD_R[4] = np.array([-0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0])
-DEG_4TH_R = DEG_3RD_R.copy(); DEG_4TH_R[5] = np.array([-0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0])
+_DEG_PO_R = _DEG_FS_R.copy(); _DEG_PO_R[2] = np.array([-0.5, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0])
+_DEG_2ND_R = _DEG_PO_R.copy(); _DEG_2ND_R[3] = np.array([-0.5, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0])
+_DEG_3RD_R = _DEG_2ND_R.copy(); _DEG_3RD_R[4] = np.array([-0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0])
 
 
 R_MATRICES = {
-    lib.DEG_FULLSIB : sp.csr_array(DEG_FS_R),
-    lib.DEG_PARENT_OFFSPRING : sp.csr_array(DEG_PO_R),
-    lib.DEG_2ND : sp.csr_array(DEG_2ND_R),
-    lib.DEG_3RD : sp.csr_array(DEG_3RD_R),
-    lib.DEG_4TH : sp.csr_array(DEG_4TH_R)
+    lib.DEG_FULLSIB : sp.csr_array(_DEG_FS_R),
+    lib.DEG_PARENT_OFFSPRING : sp.csr_array(_DEG_PO_R),
+    lib.DEG_2ND : sp.csr_array(_DEG_2ND_R),
+    lib.DEG_3RD : sp.csr_array(_DEG_3RD_R)
 }
 
 
-DEMEANED_P = {deg : r_matrix @ FAM_DF[bbf.FAM_PHENO_COL].to_numpy() for deg, r_matrix in R_MATRICES.items()}
-DEMEANED_G = {deg : np.nan_to_num(G @ r_matrix.T) for deg, r_matrix in R_MATRICES.items()}
+# Stated facts and intermediates =================================================================
+
+AFFECTED = []
+
+RETAINED_RSIDS = BIM_DF[bbf.BIM_RSID_COL].iloc[_SNP_FILTER].tolist()
+
+# Phenotypes are centered before residualization (notes §13.5).  With nobody affected every row of R
+# sums to zero or is empty, so this equals R applied to the raw phenotypes, as it was first written.
+_PHENOS = FAM_DF[bbf.FAM_PHENO_COL].to_numpy(dtype=float)
+RESID_PHENOS = {deg : r_matrix @ (_PHENOS - _PHENOS.mean()) for deg, r_matrix in R_MATRICES.items()}
+
+RESID_GENOS = {deg : np.nan_to_num(G @ r_matrix.T)[_SNP_FILTER] for deg, r_matrix in R_MATRICES.items()}

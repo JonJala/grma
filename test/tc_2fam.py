@@ -1,10 +1,20 @@
+"""
+TWO_FAMILY: two families, each two parents plus three full sibs, with every parent-offspring and
+sibling pair listed.  Degrees 1-3 give the same R, since nobody's closest relative is 2nd or 3rd
+degree.
+
+The parent columns are empty (0), so parental residualization is a no-op here (AFFECTED is empty),
+even though the families are trios in KING's eyes.  Note IID 0 is a parent: filling in the parent
+columns would need the IIDs moved off 0 first, which is the fam file's missing-parent code.
+R_MATRICES and the residualized values below are hand-derived; TestCaseSelfConsistency checks them
+against the mocks.
+"""
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
 import bedbimfam as bbf
 import grma_lib as lib
-
 
 
 BIM_DF = pd.DataFrame(
@@ -18,14 +28,6 @@ BIM_DF = pd.DataFrame(
     },
     columns=bbf.BIM_COLS
 )
-
-SNP_LIST = None
-
-SNP_FILTER = None
-
-SAMPLE_LIST = None
-
-SAMPLE_FILTER = None
 
 FAM_DF = pd.DataFrame(
     {
@@ -45,12 +47,10 @@ FAM_DF = pd.DataFrame(
     columns=bbf.FAM_COLS
 )
 
-M = len(BIM_DF)
-N = len(FAM_DF)
+_M = len(BIM_DF)
+_N = len(FAM_DF)
 
-G = np.array([[(i + j) % 3  for j in range(N)] for i in range(M)], dtype=float)
-
-
+G = np.array([[(i + j) % 3  for j in range(_N)] for i in range(_M)], dtype=float)
 
 
 REL_DF = pd.DataFrame(
@@ -87,8 +87,8 @@ REL_DF = pd.DataFrame(
 
 
 # R Matrices
-DEG_FS_R = np.zeros((10, 10))
-DEG_FS_R[4:10] = np.array(
+_DEG_FS_R = np.zeros((10, 10))
+_DEG_FS_R[4:10] = np.array(
     [
         [0.0, 0.0, 0.0, 0.0, 2.0/3.0, -1.0/3.0, -1.0/3.0, 0.0, 0.0, 0.0],
         [0.0, 0.0, 0.0, 0.0, -1.0/3.0, 2.0/3.0, -1.0/3.0, 0.0, 0.0, 0.0],
@@ -99,8 +99,8 @@ DEG_FS_R[4:10] = np.array(
     ]
 )
 
-DEG_PO_R = DEG_FS_R.copy()
-DEG_PO_R[0:4] = np.array(
+_DEG_PO_R = _DEG_FS_R.copy()
+_DEG_PO_R[0:4] = np.array(
     [
         [0.75, 0.0, 0.0, 0.0, -0.25, -0.25, -0.25, 0.0, 0.0, 0.0],
         [0.0, 0.75, 0.0, 0.0, -0.25, -0.25, -0.25, 0.0, 0.0, 0.0],
@@ -109,21 +109,25 @@ DEG_PO_R[0:4] = np.array(
     ]
 )
 
-DEG_2ND_R = DEG_PO_R.copy()  # No change after PO
-DEG_3RD_R = DEG_PO_R.copy()  # No change after PO
-DEG_4TH_R = DEG_PO_R.copy()  # No change after PO
-
+_DEG_2ND_R = _DEG_PO_R.copy()  # No change after PO
+_DEG_3RD_R = _DEG_PO_R.copy()  # No change after PO
 
 
 R_MATRICES = {
-    lib.DEG_FULLSIB : sp.csr_array(DEG_FS_R),
-    lib.DEG_PARENT_OFFSPRING : sp.csr_array(DEG_PO_R),
-    lib.DEG_2ND : sp.csr_array(DEG_2ND_R),
-    lib.DEG_3RD : sp.csr_array(DEG_3RD_R),
-    lib.DEG_4TH : sp.csr_array(DEG_4TH_R)
+    lib.DEG_FULLSIB : sp.csr_array(_DEG_FS_R),
+    lib.DEG_PARENT_OFFSPRING : sp.csr_array(_DEG_PO_R),
+    lib.DEG_2ND : sp.csr_array(_DEG_2ND_R),
+    lib.DEG_3RD : sp.csr_array(_DEG_3RD_R)
 }
 
 
+# Stated facts and intermediates =================================================================
 
-DEMEANED_P = {deg : r_matrix @ FAM_DF[bbf.FAM_PHENO_COL].to_numpy() for deg, r_matrix in R_MATRICES.items()}
-DEMEANED_G = {deg : np.nan_to_num(G @ r_matrix.T) for deg, r_matrix in R_MATRICES.items()}
+AFFECTED = []
+
+# Phenotypes are centered before residualization (notes §13.5).  With nobody affected every row of R
+# sums to zero or is empty, so this equals R applied to the raw phenotypes, as it was first written.
+_PHENOS = FAM_DF[bbf.FAM_PHENO_COL].to_numpy(dtype=float)
+RESID_PHENOS = {deg : r_matrix @ (_PHENOS - _PHENOS.mean()) for deg, r_matrix in R_MATRICES.items()}
+
+RESID_GENOS = {deg : np.nan_to_num(G @ r_matrix.T) for deg, r_matrix in R_MATRICES.items()}

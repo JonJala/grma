@@ -356,16 +356,21 @@ def process_phenotypes(fam_file: Union[str, pd.DataFrame], *,
         logging.info(f"\tDropped {num_nan} samples with missing/NaN phenotype values.")
     fam_mi = fam_df.index
 
-    # Residualize phenotypes on covariates
+    # Residualize phenotypes on an intercept plus any covariates.  With no covariates this is
+    # centering on the mean, which matters: an affected sample's row of R is an identity row, so its
+    # phenotype passes through unchanged, and an uncentered one would make the betas depend on the
+    # phenotype's origin (notes §13.5)
+    design = np.ones((len(fam_df), 1))
     if covar_file is not None:
         logging.info(f"\tRunning regression to residualize phenotypes on covariates")
         covar_df = covar_df.set_index(FAM_KEY, drop=False).reindex(fam_mi)
-        covar_df["Intercept"] = 1.0
+        design = np.column_stack([covar_df.iloc[:, 2:].to_numpy(dtype=float), design])
+    else:
+        logging.info(f"\tCentering phenotypes on their mean")
 
-        covars = covar_df.iloc[:, 2:].to_numpy(dtype=float)
-        orig_phenotypes = fam_df[FAM_PHENO_COL].to_numpy(dtype=float)
-        x, _, _, _ = np.linalg.lstsq(a = covars, b = orig_phenotypes, rcond = None)
-        fam_df[FAM_PHENO_COL] = orig_phenotypes - covars @ x
+    orig_phenotypes = fam_df[FAM_PHENO_COL].to_numpy(dtype=float)
+    x, _, _, _ = np.linalg.lstsq(a = design, b = orig_phenotypes, rcond = None)
+    fam_df[FAM_PHENO_COL] = orig_phenotypes - design @ x
 
 
     # Make sure fam_df is in sorted order based on original index
@@ -1141,18 +1146,18 @@ def calculate_R(rel_df: pd.DataFrame, N: int, affected_samples: np.ndarray = Non
                 ) -> sp.csr_array:
     """Builds the residualization matrix
 
-    Each sample's row centres them within their relatedness group, so that multiplying by R
+    Each sample's row centers them within their relatedness group, so that multiplying by R
     subtracts that group's mean.
 
     Samples listed in affected_samples instead receive an IDENTITY row, passing their values
     through unchanged.  Those are the individuals whose genotypes have already been residualized
-    against their parents, so centring them a second time would be wrong.  Note this differs from
+    against their parents, so centering them a second time would be wrong.  Note this differs from
     what a sample with no relatives receives, which is a ZERO row: an unrelated sample has no
     within-family contrast and so contributes nothing, whereas an affected sample contributes its
     own Mendelian residual.
 
     Affected samples are excluded only from their OWN rows.  They remain as columns in the rows of
-    their relatives, who continue to centre against them, and they still count when determining
+    their relatives, who continue to center against them, and they still count when determining
     those relatives' minimum relatedness degree.
 
     Args:
@@ -1899,7 +1904,7 @@ def get_residualized_genotype_data(bed_file: Union[str, np.ndarray], M_orig: int
     # Subtract the parental means BEFORE multiplying by R, not after.  For the affected
     # individuals themselves the order makes no difference, since their identity rows pass them
     # through either way.  It differs for everyone else in their relatedness groups: subtracting
-    # first means a relative centres against the differenced value, which is the intended
+    # first means a relative centers against the differenced value, which is the intended
     # behaviour.  Note also that every mean is computed before any subtraction is applied, so a
     # multi-generation pedigree differences against raw parental genotypes rather than against
     # values that have already been adjusted.

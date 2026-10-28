@@ -67,7 +67,6 @@ def mock_create_rel_info(king_df: pd.DataFrame, fam_df: pd.DataFrame, rel_deg: i
     return rel_info
 
 
-
 def mock_shrink_offdiag(matrix: sp.csr_array, weight: float = 0.75):
     """Independent per-block reimplementation of the shrinkage applied in calculate_omega().
 
@@ -170,28 +169,6 @@ def mock_calc_omega(fam_df: pd.DataFrame, N: int, rel_df: pd.DataFrame,
     return shrunk_omega
 
 
-def mock_construct_R(rel_input: list):
-    N = len(rel_input)
-
-    result = np.identity(N, dtype=float)
-    for row_num, row in enumerate(rel_input):
-        result[row_num, row] -= np.reciprocal(float(len(row)))
-
-    return sp.csr_array(result)
-
-
-# Assume K x N (where K is likely M or 1 depending on whether this is G or the phenotypes)
-def mock_demean(rel_input: list, arr: np.ndarray):
-    result = arr.copy()
-    
-    for person_num, row in enumerate(rel_input):
-        result[:, person_num] -= np.mean(arr[:, row], axis=1)
-
-    result[np.isnan(result)] = 0.0
-
-    return result
-
-
 #################################
 def mock_gls_estimates(genotypes, gls_weights, weighted_phenotypes):
     """Works the GLS estimates out one SNP at a time
@@ -220,31 +197,6 @@ def mock_gls_estimates(genotypes, gls_weights, weighted_phenotypes):
 
     return np.array(betas), np.array(ses), np.array(XtWX)
 
-
-def mock_grma(rel_df: pd.DataFrame, fam_df: pd.DataFrame, G: np.ndarray, pheno: np.ndarray, rel_deg: int):
-    M, N = G.shape
-
-    rel_info = mock_create_rel_info(rel_df, fam_df, rel_deg, N)
-
-    R = mock_construct_R(rel_info)
-
-    demeaned_geno = mock_demean(rel_info, G)
-    demeaned_pheno = mock_demean(rel_info, pheno.reshape(1,-1))
-
-    omega = mock_calc_omega(fam_df=fam_df, N=N, rel_df=rel_df, unresidualized_phenotypes=pheno)
-
-    # The covariance of the residualized phenotypes, whose pseudo-inverse weights the regression.
-    # Production inverts this block by block over the relatedness components, which is exact
-    # rather than approximate; taking one pinv over the whole matrix is a separate route to the
-    # same answer.
-    resid_pheno_cov = (R @ omega @ R.T).toarray() if sp.issparse(R) else R @ omega @ R.T
-    gls_weights = np.linalg.pinv(resid_pheno_cov)
-
-    betas, ses, _ = mock_gls_estimates(
-        genotypes=demeaned_geno, gls_weights=gls_weights,
-        weighted_phenotypes=gls_weights @ np.ravel(demeaned_pheno))
-
-    return -betas, ses
 
 #################################
 def mock_snipar_imputation(rng: np.random.Generator, num_snps: int, neither_observed: np.ndarray,
@@ -316,3 +268,161 @@ def mock_snipar_imputation(rng: np.random.Generator, num_snps: int, neither_obse
 
 ##################################
 
+#################################
+# Stage-by-stage mocks, chained by test/tcs.py to derive any intermediate a case does not state.
+#
+# Each is a separate route to one stage's result, written for clarity over speed.  None of them
+# consumes an intermediate a case STATES -- only the case's inputs and its stated facts (AFFECTED,
+# PARENTAL_MEANS, RETAINED_RSIDS) -- so that a stated intermediate compared against this chain is a
+# genuine cross-check rather than the stated value checked against itself.
+
+def _id_key(fid, iid):
+    """Sample key compared as strings, since fixtures mix integer and string IDs"""
+    return (str(fid), str(iid))
+
+
+def mock_analysis_sample(fam_df: pd.DataFrame, id_list: pd.DataFrame = None,
+                         pheno_df: pd.DataFrame = None, covar_df: pd.DataFrame = None
+                         ) -> pd.DataFrame:
+    """The samples kept for analysis, in fam file order, with their final phenotypes
+
+    Kept means: in the id_list, the phenotype file and the covariate file wherever those are given,
+    with no missing covariate, and with a non-missing phenotype -- taken from the phenotype file
+    where there is one, otherwise from the fam file.  Phenotypes are then residualized on an
+    intercept plus any covariates.  Production uses lstsq for that; this solves the normal
+    equations, or takes the mean where there are no covariates -- separate routes to the same fit.
+
+    Returns:
+        The kept rows of fam_df, reindexed from 0, with FAM_PHENO_COL holding final phenotypes
+    """
+
+    keys = [_id_key(f, i) for f, i in zip(fam_df[bbf.FAM_FID_COL], fam_df[bbf.FAM_IID_COL])]
+    keep = set(keys)
+    phenos = dict(zip(keys, fam_df[bbf.FAM_PHENO_COL].astype(float)))
+
+    if id_list is not None:
+        keep &= {_id_key(f, i) for f, i in zip(id_list.iloc[:, 0], id_list.iloc[:, 1])}
+
+    if pheno_df is not None:
+        from_file = {_id_key(f, i): float(p)
+                     for f, i, p in pheno_df.iloc[:, :3].itertuples(index=False)}
+        keep &= set(from_file)
+        phenos = {k: from_file.get(k, np.nan) for k in keys}
+
+    covars = None
+    if covar_df is not None:
+        covars = {_id_key(row[0], row[1]): np.asarray(row[2:], dtype=float)
+                  for row in covar_df.itertuples(index=False)}
+        covars = {k: v for k, v in covars.items() if not np.isnan(v).any()}
+        keep &= set(covars)
+
+    rows = [n for n, k in enumerate(keys) if k in keep and not np.isnan(phenos[k])]
+    analysis_df = fam_df.iloc[rows].reset_index(drop=True).copy()
+    y = np.array([phenos[keys[n]] for n in rows], dtype=float)
+
+    # Residualized on an intercept plus any covariates (notes §13.5).  Without covariates that is
+    # just the mean, taken explicitly here where production runs the same lstsq either way.
+    if covars is not None:
+        X = np.column_stack([np.vstack([covars[keys[n]] for n in rows]), np.ones(len(rows))])
+        y = y - X @ np.linalg.solve(X.T @ X, X.T @ y)
+    else:
+        y = y - np.mean(y)
+
+    analysis_df[bbf.FAM_PHENO_COL] = y
+    return analysis_df
+
+
+def mock_fam_trios(fam_df: pd.DataFrame, analysis_df: pd.DataFrame) -> list:
+    """IIDs of the analysis samples whose fam file lists two parents who are both samples
+
+    Parents are looked up within the child's FID, and "0" means no parent.  A parent need not be
+    in the analysis sample.  No KING validation: this is only for cross-checking a case's stated
+    AFFECTED, and a case whose pedigree KING contradicts should fail loudly in production anyway.
+    """
+
+    samples = {_id_key(f, i) for f, i in zip(fam_df[bbf.FAM_FID_COL], fam_df[bbf.FAM_IID_COL])}
+    analysis = {_id_key(f, i)
+                for f, i in zip(analysis_df[bbf.FAM_FID_COL], analysis_df[bbf.FAM_IID_COL])}
+
+    trios = []
+    for fid, iid, dad, mum in zip(fam_df[bbf.FAM_FID_COL], fam_df[bbf.FAM_IID_COL],
+                                  fam_df[bbf.FAM_IIDF_COL], fam_df[bbf.FAM_IIDM_COL]):
+        if (_id_key(fid, iid) in analysis and str(dad) != "0" and str(mum) != "0" and
+                _id_key(fid, dad) in samples and _id_key(fid, mum) in samples):
+            trios.append(str(iid))
+    return trios
+
+
+def mock_fam_parental_means(fam_df: pd.DataFrame, G: np.ndarray, affected_iids: list) -> dict:
+    """The mean of each affected individual's two fam-file parents, from RAW genotypes
+
+    Returns:
+        dict of IID -> (snps,) array over every SNP of G
+    """
+
+    pos = {_id_key(f, i): n for n, (f, i) in
+           enumerate(zip(fam_df[bbf.FAM_FID_COL], fam_df[bbf.FAM_IID_COL]))}
+    rows = {str(i): (f, d, m) for f, i, d, m in zip(
+        fam_df[bbf.FAM_FID_COL], fam_df[bbf.FAM_IID_COL],
+        fam_df[bbf.FAM_IIDF_COL], fam_df[bbf.FAM_IIDM_COL])}
+
+    means = {}
+    for iid in affected_iids:
+        fid, dad, mum = rows[str(iid)]
+        means[str(iid)] = (G[:, pos[_id_key(fid, dad)]] + G[:, pos[_id_key(fid, mum)]]) / 2.0
+    return means
+
+
+def mock_restrict_rel_df(rel_df: pd.DataFrame, analysis_df: pd.DataFrame) -> pd.DataFrame:
+    """The relatedness pairs between analysis samples, which are the only ones that play a part"""
+
+    kept = {_id_key(f, i) for f, i in zip(analysis_df[bbf.FAM_FID_COL],
+                                          analysis_df[bbf.FAM_IID_COL])}
+    mask = [(_id_key(f1, i1) in kept and _id_key(f2, i2) in kept) for f1, i1, f2, i2 in zip(
+        rel_df[grma_lib.KING_FID1_COL], rel_df[grma_lib.KING_IID1_COL],
+        rel_df[grma_lib.KING_FID2_COL], rel_df[grma_lib.KING_IID2_COL])]
+    return rel_df[np.asarray(mask, dtype=bool)].reset_index(drop=True)
+
+
+def mock_R(rel_info: list, analysis_df: pd.DataFrame, affected_iids: list) -> np.ndarray:
+    """R row by row: an affected sample passes through unchanged; everyone else is centered on
+    their group, which may include affected relatives at their DIFFERENCED values"""
+
+    is_affected = analysis_df[bbf.FAM_IID_COL].astype(str).isin(affected_iids).to_numpy()
+    R = np.identity(len(rel_info))
+    for person, group in enumerate(rel_info):
+        if not is_affected[person]:
+            R[person, group] -= 1.0 / len(group)
+    return R
+
+
+def mock_resid_genos(G: np.ndarray, fam_df: pd.DataFrame, analysis_df: pd.DataFrame,
+                     rel_info: list, affected_iids: list, parental_means: dict,
+                     retained_snps: np.ndarray) -> np.ndarray:
+    """Residualized genotypes, (retained snps, analysis samples), NaN set to zero
+
+    Every parental mean is subtracted from a copy of the RAW genotypes, so someone who is both
+    affected and a parent is differenced against raw values.  Residualization then uses explicit
+    group means, so that a missing value spoils only the rows whose groups actually contain it --
+    as with production's sparse R, and unlike a dense product, where NaN times zero would spread it
+    everywhere.
+    """
+
+    all_keys = [_id_key(f, i) for f, i in zip(fam_df[bbf.FAM_FID_COL], fam_df[bbf.FAM_IID_COL])]
+    iid_pos = {str(i): n for n, i in enumerate(fam_df[bbf.FAM_IID_COL])}
+
+    G = G.copy()
+    for iid in affected_iids:
+        G[:, iid_pos[iid]] -= parental_means[iid]
+
+    positions = [all_keys.index(_id_key(f, i)) for f, i in
+                 zip(analysis_df[bbf.FAM_FID_COL], analysis_df[bbf.FAM_IID_COL])]
+    G = G[np.asarray(retained_snps)][:, positions]
+
+    is_affected = analysis_df[bbf.FAM_IID_COL].astype(str).isin(affected_iids).to_numpy()
+    resid = G.copy()
+    for person, group in enumerate(rel_info):
+        if not is_affected[person]:
+            resid[:, person] = G[:, person] - np.mean(G[:, group], axis=1)
+    resid[np.isnan(resid)] = 0.0
+    return resid
