@@ -85,6 +85,8 @@ SNIPAR_PED_IID_COL = snipar.SNIPAR_PED_IID_COL
 SNIPAR_PED_FID_COL = snipar.SNIPAR_PED_FID_COL
 SNIPAR_PED_FATHER_COL = snipar.SNIPAR_PED_FATHER_COL
 SNIPAR_PED_MOTHER_COL = snipar.SNIPAR_PED_MOTHER_COL
+SNIPAR_PED_HAS_FATHER_COL = snipar.SNIPAR_PED_HAS_FATHER_COL
+SNIPAR_PED_HAS_MOTHER_COL = snipar.SNIPAR_PED_HAS_MOTHER_COL
 
 FAM_INDEX = "FAM_INDEX"
 
@@ -1129,6 +1131,27 @@ def process_imputed_parents(imputed_parental_file: str, full_fam_df: pd.DataFram
     logging.info(f"\t\t{int((in_analysis & ~(has_imputed | has_observed_parent)).sum())} not "
                  f"usable (no imputed row and no genotyped parent)")
     logging.info(f"\t\t{int(usable.sum())} individual(s) to residualize against their parents")
+
+    # snipar records which of each individual's parents IT had genotypes for, and what its imputed
+    # row holds depends on that: the missing parent where one was genotyped, both parents' AVERAGE
+    # where neither was, nothing where both were.  The parental mean is built from the parents GRMA
+    # finds in its own fam file, so the two must agree, or a parent is counted twice, read as an
+    # average when it is one parent, or treated as zero (notes §13.4).  They can only disagree when
+    # snipar was run on a different fileset, which cannot be repaired here -- an average of two
+    # parents cannot be split -- so it is raised rather than worked around.
+    def flags(column):
+        return np.char.lower(pedigree[:, column].astype(str)) == "true"
+    checked = in_analysis & (child_pos != -1)
+    mismatched = checked & ((flags(SNIPAR_PED_HAS_FATHER_COL) != (parent_pos[:, 0] != -1)) |
+                            (flags(SNIPAR_PED_HAS_MOTHER_COL) != (parent_pos[:, 1] != -1)))
+    if np.any(mismatched):
+        offenders = describe_offenders(pedigree[mismatched, SNIPAR_PED_IID_COL])
+        raise ValueError(f"The imputed parental genotype file and the fileset given to GRMA "
+                         f"disagree about which parents are genotyped, for {offenders}: snipar's "
+                         f"pedigree records whether it had each parent's genotypes, and GRMA finds "
+                         f"a different set of those parents in the fam file.  This happens when "
+                         f"snipar was run on a different fileset.  Run snipar's impute.py on the "
+                         f"same fileset given to GRMA.")
 
     validate_parents_against_king(
         iids=pedigree[:, SNIPAR_PED_IID_COL], child_pos=child_pos,

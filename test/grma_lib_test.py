@@ -4344,12 +4344,24 @@ class TestProcessImputedParents:
     NUM_SNPS = 2
 
     @classmethod
-    def imputed_file(cls, tmp_path, pedigree_records, families):
+    def imputed_file(cls, tmp_path, full_fam, pedigree_records, families):
         """Writes an imputed parental genotype file holding the given pedigree and families
 
         Only the pedigree and the family list matter here; the per-SNP arrays are filler, since
         nothing this function does reads them.
+
+        A record of (FID, IID, father, mother) gets has_father / has_mother flags consistent with
+        full_fam -- "True" exactly where that parent is in it -- as snipar would have written them
+        had it run on the same fileset.  A record of six fields keeps the flags it gives, which is
+        how the tests below describe a file from a DIFFERENT fileset (notes §13.4).
         """
+
+        genotyped = set(full_fam[bbf.FAM_IID_COL].astype(str))
+
+        def with_flags(record):
+            if len(record) == 6:
+                return list(record)
+            return [*record, str(record[2] in genotyped), str(record[3] in genotyped)]
 
         path = str(tmp_path / "chr_1.hdf5")
         num_families = len(families)
@@ -4360,8 +4372,7 @@ class TestProcessImputedParents:
             num_obs_par_alleles=np.full((num_families, cls.NUM_SNPS), 4.0),
             standard_f=np.full(cls.NUM_SNPS, 0.25),
             parental_status=np.zeros((num_families, 3), dtype=bool),
-            pedigree=np.array([[record[0], record[1], record[2], record[3], "False", "False"]
-                               for record in pedigree_records]),
+            pedigree=np.array([with_flags(record) for record in pedigree_records]),
             families=np.array(families),
             bim_values=np.array([["1", f"rs{snp}", "0", str(snp * 100), "A", "G"]
                                  for snp in range(cls.NUM_SNPS)]))
@@ -4398,7 +4409,7 @@ class TestProcessImputedParents:
         # imputed the father and GRMA will use both: the mother from the bed file, the father
         # from the imputed row.
         full_fam = self.fam([("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, [("F1", "KID", "GHOST_DAD", "MUM")], ["F1"])
+        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "GHOST_DAD", "MUM")], ["F1"])
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
@@ -4416,7 +4427,7 @@ class TestProcessImputedParents:
         # The second population.  Nothing needed imputing, so snipar wrote no row for this family
         # -- but both parents are in the bed file, which is all the differencing needs.
         full_fam = self.fam([("F1", "DAD"), ("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, [("F1", "KID", "DAD", "MUM")], ["F_OTHER"])
+        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "DAD", "MUM")], ["F_OTHER"])
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
@@ -4434,7 +4445,7 @@ class TestProcessImputedParents:
         # There is then nothing to difference against, and ordinary within-group residualization
         # applies instead.
         full_fam = self.fam([("F1", "KID")])
-        path = self.imputed_file(tmp_path, [("F1", "KID", "GHOST_DAD", "GHOST_MUM")],
+        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "GHOST_DAD", "GHOST_MUM")],
                                  ["F_OTHER"])
 
         with caplog.at_level(logging.INFO):
@@ -4458,7 +4469,7 @@ class TestProcessImputedParents:
         full_fam.loc[2, bbf.FAM_IIDF_COL] = "STRANGER"
         full_fam.loc[2, bbf.FAM_IIDM_COL] = "STRANGER"
 
-        path = self.imputed_file(tmp_path, [("F1", "KID", "DAD", "MUM")], ["F_OTHER"])
+        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "DAD", "MUM")], ["F_OTHER"])
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
@@ -4471,7 +4482,7 @@ class TestProcessImputedParents:
     def test__child_not_in_the_fam_file__not_usable(self, tmp_path, caplog):
         # snipar's pedigree covers everyone it saw, which can exceed the bfile being analysed now
         full_fam = self.fam([("F1", "DAD"), ("F1", "MUM")])
-        path = self.imputed_file(tmp_path, [("F1", "ABSENT_KID", "DAD", "MUM")], ["F1"])
+        path = self.imputed_file(tmp_path, full_fam, [("F1", "ABSENT_KID", "DAD", "MUM")], ["F1"])
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
@@ -4484,7 +4495,7 @@ class TestProcessImputedParents:
     def test__child_not_in_the_analysis_sample__not_usable(self, tmp_path, caplog):
         # Dropped for a missing phenotype, so they contribute to no result
         full_fam = self.fam([("F1", "DAD"), ("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, [("F1", "KID", "DAD", "MUM")], ["F1"])
+        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "DAD", "MUM")], ["F1"])
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
@@ -4499,7 +4510,7 @@ class TestProcessImputedParents:
         # The father was dropped for a missing phenotype, but his genotypes are in the bed file
         # and are what the child is differenced against
         full_fam = self.fam([("F1", "DAD"), ("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, [("F1", "KID", "DAD", "MUM")], ["F_OTHER"])
+        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "DAD", "MUM")], ["F_OTHER"])
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
@@ -4514,7 +4525,7 @@ class TestProcessImputedParents:
     def test__siblings__share_an_imputed_row(self, tmp_path, caplog):
         # snipar imputes the parents FROM the sibship, so one row serves all of them
         full_fam = self.fam([("F1", "KID_A"), ("F1", "KID_B")])
-        path = self.imputed_file(tmp_path, [("F1", "KID_A", "GHOST_DAD", "GHOST_MUM"),
+        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID_A", "GHOST_DAD", "GHOST_MUM"),
                                             ("F1", "KID_B", "GHOST_DAD", "GHOST_MUM")], ["F1"])
 
         with caplog.at_level(logging.INFO):
@@ -4532,7 +4543,7 @@ class TestProcessImputedParents:
         # message blaming the fam file here would send the user to a file that says nothing about
         # these relationships at all.
         full_fam = self.fam([("F1", "DAD"), ("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, [("F1", "KID", "DAD", "MUM")], ["F_OTHER"])
+        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "DAD", "MUM")], ["F_OTHER"])
 
         with pytest.raises(ValueError) as error:
             sut.process_imputed_parents(
@@ -4543,10 +4554,57 @@ class TestProcessImputedParents:
         assert "KID (mother)" in str(error.value)
 
 
+    # snipar's pedigree records which parents IT had genotypes for, and its imputed row depends on
+    # that.  When GRMA's fam file disagrees, snipar was run on a different fileset, and every such
+    # disagreement must stop the run rather than quietly mis-weight the parental mean (notes §13.4).
+    # Each case below is one way the two can disagree.  KING is left empty: the check comes first.
+
+    @pytest.mark.parametrize("fam_iids, record, families, what_goes_wrong", [
+        (["DAD", "KID"], ("F1", "KID", "DAD", "MUM", "False", "False"), ["F1"],
+         "row is both parents' average; adding the genotyped father counts him twice"),
+        (["DAD", "MUM", "KID"], ("F1", "KID", "DAD", "MUM", "False", "False"), ["F1"],
+         "row is both parents' average; adding both genotypes counts both twice"),
+        (["DAD", "MUM", "KID"], ("F1", "KID", "DAD", "MUM", "True", "False"), ["F1"],
+         "row is the mother; adding her genotype counts her twice"),
+        (["KID"], ("F1", "KID", "DAD", "MUM", "True", "False"), ["F1"],
+         "row is the mother only, but would be read as an average and doubled"),
+        (["DAD", "KID"], ("F1", "KID", "DAD", "MUM", "True", "True"), ["F_OTHER"],
+         "no row, so the missing mother would count as zero"),
+        (["KID"], ("F1", "KID", "DAD", "MUM", "True", "True"), ["F_OTHER"],
+         "no row and no parent found, so the child would quietly go unresidualized"),
+    ])
+    def test__snipar_and_the_fam_file_disagree_about_genotyped_parents__raises(
+            self, tmp_path, fam_iids, record, families, what_goes_wrong):
+        full_fam = self.fam([("F1", iid) for iid in fam_iids])
+        path = self.imputed_file(tmp_path, full_fam, [record], families)
+
+        with pytest.raises(ValueError, match="disagree about which parents are genotyped") as error:
+            sut.process_imputed_parents(
+                imputed_parental_file=path, full_fam_df=full_fam,
+                fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
+
+        assert "KID" in str(error.value), what_goes_wrong
+        assert "Run snipar's impute.py on the same fileset" in str(error.value)
+
+
+    def test__disagreement_for_a_child_outside_the_analysis__not_raised(self, tmp_path, caplog):
+        # Only children who could be residualized are checked: one filtered out of the analysis
+        # is never used, so a disagreement about their parents changes nothing
+        full_fam = self.fam([("F1", "DAD"), ("F1", "MUM"), ("F1", "KID")])
+        path = self.imputed_file(tmp_path, full_fam,
+                                 [("F1", "KID", "DAD", "MUM", "False", "False")], ["F1"])
+
+        sources = sut.process_imputed_parents(
+            imputed_parental_file=path, full_fam_df=full_fam,
+            fam_df=self.analysis_sample(full_fam, positions=[0, 1]), rel_df=self.king([]))
+
+        assert len(sources.affected_samples) == 0
+
+
     def test__nobody_usable__empty_sources(self, tmp_path, caplog):
         # Every pedigree record describes somebody outside the analysis, so there is nothing to do
         full_fam = self.fam([("F1", "SOMEONE_ELSE")])
-        path = self.imputed_file(tmp_path, [("F1", "ABSENT_KID", "DAD", "MUM")], ["F1"])
+        path = self.imputed_file(tmp_path, full_fam, [("F1", "ABSENT_KID", "DAD", "MUM")], ["F1"])
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
@@ -4561,7 +4619,7 @@ class TestProcessImputedParents:
         # The SNP alignment reads bim_values and bim_columns from this, and the chunk cache reads
         # standard_f, so what comes back has to be the whole thing rather than the parts used here
         full_fam = self.fam([("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, [("F1", "KID", "GHOST_DAD", "MUM")], ["F1"])
+        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "GHOST_DAD", "MUM")], ["F1"])
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
@@ -4583,7 +4641,7 @@ class TestProcessImputedParents:
         # early before the mask is applied.
         full_fam = self.fam([("F1", "LONE_KID"), ("F2", "DAD"), ("F2", "MUM"), ("F2", "KID")])
         path = self.imputed_file(
-            tmp_path,
+            tmp_path, full_fam,
             [("F1", "LONE_KID", "GHOST_DAD", "GHOST_MUM"), ("F2", "KID", "DAD", "MUM")],
             ["F_OTHER"])
 
