@@ -890,11 +890,12 @@ def validate_parents_against_king(iids: np.ndarray, child_pos: np.ndarray,
 
     Args:
         iids: Individual IDs, for the error message
-        child_pos: Sample positions of those individuals, -1 where not a sample
-        father_pos: Sample positions of their fathers, -1 where not genotyped
-        mother_pos: Sample positions of their mothers, -1 where not genotyped
+        child_pos: Positions in the whole fam file of those individuals, -1 where not a sample
+        father_pos: Positions in the whole fam file of their fathers, -1 where not genotyped
+        mother_pos: Positions in the whole fam file of their mothers, -1 where not genotyped
         usable: Which entries will actually be used
-        rel_df: Relatedness pairs, mapped to sample indices and integer degrees
+        rel_df: Relatedness pairs, as positions in the SAME whole fam file -- comparing them with
+            the analysis sample's positions instead was notes §13.1
         source: Where the relationships came from, for the error message
 
     Raises:
@@ -925,7 +926,7 @@ def validate_parents_against_king(iids: np.ndarray, child_pos: np.ndarray,
 
 
 # -------------------------
-def determine_fam_file_trios(fam_file: Union[str, pd.DataFrame], fam_df: pd.DataFrame,
+def determine_fam_file_trios(full_fam_df: pd.DataFrame, fam_df: pd.DataFrame,
                              rel_df: pd.DataFrame) -> ParentalSources:
     """Identifies full trios from the fam file's parental ID columns
 
@@ -940,9 +941,12 @@ def determine_fam_file_trios(fam_file: Union[str, pd.DataFrame], fam_df: pd.Data
     the two inputs, and kills the run.
 
     Args:
-        fam_file: String path to the fam file, or the DataFrame itself, UNFILTERED
+        full_fam_df: The whole fam file, UNFILTERED, as read by process_relatedness() with every
+            column as text
         fam_df: The already-filtered sample IDs, as returned by process_phenotypes()
-        rel_df: Relatedness pairs, mapped to sample indices and integer degrees
+        rel_df: Relatedness pairs, as positions in the WHOLE fam file (full_fam_df), with
+            integer degrees -- see map_king_to_fam_positions().  Not the analysis sample's
+            positions: a parent filtered out of the analysis must keep their pairs (notes §13.1)
 
     Returns:
         A ParentalSources describing the full trios found
@@ -953,7 +957,6 @@ def determine_fam_file_trios(fam_file: Union[str, pd.DataFrame], fam_df: pd.Data
 
     logging.info("\tDetermining trios from the fam file's parental ID columns")
 
-    full_fam_df, _ = get_df(fam_file, "fam_file", {"names" : FAM_COLS, "dtype" : str})
     id_cols = [FAM_FID_COL, FAM_IID_COL, FAM_IIDF_COL, FAM_IIDM_COL]
     full_fam_ids = as_id_strings(full_fam_df, id_cols)
 
@@ -1063,7 +1066,7 @@ def map_samples_to_imputed_families(pedigree: np.ndarray, families: np.ndarray,
     return child_pos, parent_pos, imputed_rows
 
 # -------------------------
-def process_imputed_parents(imputed_parental_file: str, fam_file: Union[str, pd.DataFrame],
+def process_imputed_parents(imputed_parental_file: str, full_fam_df: pd.DataFrame,
                             fam_df: pd.DataFrame, rel_df: pd.DataFrame) -> ParentalSources:
     """Identifies the individuals whose genotypes can be residualized against their parents,
     using snipar's imputed parental genotype file
@@ -1085,9 +1088,12 @@ def process_imputed_parents(imputed_parental_file: str, fam_file: Union[str, pd.
 
     Args:
         imputed_parental_file: String path to the imputed parental genotype file
-        fam_file: String path to the fam file, or the DataFrame itself, UNFILTERED
+        full_fam_df: The whole fam file, UNFILTERED, as read by process_relatedness() with every
+            column as text
         fam_df: The already-filtered sample IDs, as returned by process_phenotypes()
-        rel_df: Relatedness pairs, mapped to sample indices and integer degrees
+        rel_df: Relatedness pairs, as positions in the WHOLE fam file (full_fam_df), with
+            integer degrees -- see map_king_to_fam_positions().  Not the analysis sample's
+            positions: a parent filtered out of the analysis must keep their pairs (notes §13.1)
 
     Returns:
         A ParentalSources describing the individuals with imputed or observed parents
@@ -1103,7 +1109,6 @@ def process_imputed_parents(imputed_parental_file: str, fam_file: Union[str, pd.
     pedigree = metadata[snipar.SNIPAR_PEDIGREE_KEY]
     families = metadata[snipar.SNIPAR_FAMILIES_KEY]
 
-    full_fam_df, _ = get_df(fam_file, "fam_file", {"names" : FAM_COLS, "dtype" : str})
     full_fam_ids = as_id_strings(full_fam_df, [FAM_FID_COL, FAM_IID_COL])
 
     child_pos, parent_pos, imputed_rows = map_samples_to_imputed_families(
@@ -1139,6 +1144,66 @@ def process_imputed_parents(imputed_parental_file: str, fam_file: Union[str, pd.
         imputed_rows=imputed_rows[usable],
         imputed_file=imputed_parental_file,
         snipar_metadata=metadata)
+
+
+# -------------------------
+def map_king_to_fam_positions(king_df: pd.DataFrame, fam_ids: pd.DataFrame) -> pd.DataFrame:
+    """KING pairs between samples of a fam file, as positions in that file, with degrees
+
+    For parental processing, which works in the whole fam file's positions.  IDs are compared as
+    strings, as the parental code compares them, since the fam file is read as text while KING's
+    types are inferred (see as_id_strings()).  Pairs beyond SE_RELATEDNESS are dropped, as for the
+    analysis sample's mapping in process_relatedness().
+
+    Args:
+        king_df: The KING file, with NEEDED_KING_COLS
+        fam_ids: The fam file, or at least its FID and IID columns
+
+    Returns:
+        A frame with FAM_INDEX_1, FAM_INDEX_2 (positions in fam_ids) and KING_REL_COL (degrees)
+    """
+
+    fam_mi = pd.MultiIndex.from_frame(as_id_strings(fam_ids, FAM_KEY))
+    pos1 = fam_mi.get_indexer(pd.MultiIndex.from_frame(as_id_strings(king_df, KING_KEY_1)))
+    pos2 = fam_mi.get_indexer(pd.MultiIndex.from_frame(as_id_strings(king_df, KING_KEY_2)))
+    mask = (pos1 != -1) & (pos2 != -1)
+
+    mapped = pd.DataFrame({FAM_INDEX_1 : pos1[mask], FAM_INDEX_2 : pos2[mask],
+                           KING_REL_COL : king_df[KING_REL_COL].to_numpy()[mask]})
+    mapped[KING_REL_COL] = mapped[KING_REL_COL].map(INFTYPE_TO_DEG_MAP)
+    return mapped[mapped[KING_REL_COL] <= SE_RELATEDNESS].reset_index(drop=True)
+
+
+# -------------------------
+def to_analysis_positions(fam_positions: np.ndarray, full_fam_df: pd.DataFrame,
+                          fam_df: pd.DataFrame) -> np.ndarray:
+    """Translates positions in the whole fam file into positions in the analysis sample
+
+    Parental processing reports affected samples as whole-fam-file positions; R's rows are the
+    analysis sample's.  Every affected sample must be in the analysis sample, so one that is not
+    means the two have come apart, and is raised rather than silently dropped.
+
+    Args:
+        fam_positions: Positions in the whole fam file
+        full_fam_df: The whole fam file, or at least its FID and IID columns
+        fam_df: The analysis sample, in its own order
+
+    Raises:
+        ValueError: If any of the positions is not a sample in the analysis
+
+    Returns:
+        The corresponding positions in fam_df
+    """
+
+    analysis_mi = pd.MultiIndex.from_frame(as_id_strings(fam_df, FAM_KEY))
+    full_mi = pd.MultiIndex.from_frame(as_id_strings(full_fam_df, FAM_KEY))
+    positions = analysis_mi.get_indexer(full_mi[np.asarray(fam_positions, dtype=int)])
+
+    if np.any(positions == -1):
+        missing = full_mi[np.asarray(fam_positions, dtype=int)[positions == -1]]
+        raise ValueError(f"Internal error: samples reported as affected are not in the analysis "
+                         f"sample: {describe_offenders([iid for _, iid in missing])}")
+    return positions
 
 
 # -------------------------
@@ -1263,22 +1328,24 @@ def process_relatedness(
                          f"{MAX_GRMA_RELATEDNESS} (inclusive).")
 
 
-    # Read in relatedness file (should be in KING format)
-    rel_df, _ = get_df(rel_file, "rel_file", {"header":0})
-    rel_df = rel_df[NEEDED_KING_COLS]
-    logging.info(f"\tRead in {len(rel_df)} rows from relatedness file")
-    logging.info(f"\tRelatedness counts: {get_rel_report(rel_df)}\n")
+    # Read in relatedness file (should be in KING format).  Kept whole as unfiltered_rel_df, since
+    # parental processing maps it onto the whole fam file below; rel_df is the analysis sample's
+    # view of it.
+    unfiltered_rel_df, _ = get_df(rel_file, "rel_file", {"header":0})
+    unfiltered_rel_df = unfiltered_rel_df[NEEDED_KING_COLS]
+    logging.info(f"\tRead in {len(unfiltered_rel_df)} rows from relatedness file")
+    logging.info(f"\tRelatedness counts: {get_rel_report(unfiltered_rel_df)}\n")
 
     # Take note of the sample indices for each FID, IID pair to map to bed file and phenotypes
     N = len(fam_df)
     fam_mi = pd.MultiIndex.from_frame(fam_df[FAM_KEY])
     fam_index_vals = fam_df.index.to_numpy()
 
-    pos1 = fam_mi.get_indexer(pd.MultiIndex.from_frame(rel_df[KING_KEY_1]))
-    pos2 = fam_mi.get_indexer(pd.MultiIndex.from_frame(rel_df[KING_KEY_2]))
+    pos1 = fam_mi.get_indexer(pd.MultiIndex.from_frame(unfiltered_rel_df[KING_KEY_1]))
+    pos2 = fam_mi.get_indexer(pd.MultiIndex.from_frame(unfiltered_rel_df[KING_KEY_2]))
     mask = (pos1 != -1) & (pos2 != -1)
 
-    rel_df = rel_df.loc[mask].drop(columns=KING_KEY_1+KING_KEY_2).reset_index(drop=True)
+    rel_df = unfiltered_rel_df.loc[mask].drop(columns=KING_KEY_1+KING_KEY_2).reset_index(drop=True)
     rel_df[FAM_INDEX_1] = fam_index_vals[pos1[mask]]
     rel_df[FAM_INDEX_2] = fam_index_vals[pos2[mask]]
     logging.debug(f"\tRestricted the KING file to relevant samples")
@@ -1300,13 +1367,19 @@ def process_relatedness(
 
 
     # Determine whose genotypes are residualized against their parents, and where those parents'
-    # genotypes come from.  Needs the KING data parsed and mapped to sample indices, which is why
-    # it sits here rather than as a separate step above.
+    # genotypes come from.  This works in the WHOLE fam file's positions, not the analysis
+    # sample's: it must see parents who were filtered out of the analysis (notes §6.2.9a), and its
+    # positions index the full-width genotype matrix.  So it gets the fam file, read once here, and
+    # its own mapping of the KING pairs onto it, with nobody dropped -- not rel_df, whose positions
+    # are the analysis sample's and from which every pair involving a filtered-out sample is gone
+    # (notes §13.1).
+    full_fam_df, _ = get_df(fam_file, "fam_file", {"names" : FAM_COLS, "dtype" : str})
+    full_rel_df = map_king_to_fam_positions(king_df=unfiltered_rel_df, fam_ids=full_fam_df)
     parental_sources = (
-        process_imputed_parents(imputed_parental_file=imputed_parental_file, fam_file=fam_file,
-                                fam_df=fam_df, rel_df=rel_df)
+        process_imputed_parents(imputed_parental_file=imputed_parental_file,
+                                full_fam_df=full_fam_df, fam_df=fam_df, rel_df=full_rel_df)
         if imputed_parental_file is not None
-        else determine_fam_file_trios(fam_file=fam_file, fam_df=fam_df, rel_df=rel_df))
+        else determine_fam_file_trios(full_fam_df=full_fam_df, fam_df=fam_df, rel_df=full_rel_df))
 
     # Assign samples to relatedness components once.  Both the shrinkage inside calculate_omega()
     # and the block-wise inversion in calculate_gls_weights() need this same partition, and both
@@ -1322,7 +1395,11 @@ def process_relatedness(
     logging.debug(f"\tAfter restricting to user-specified relatedness threshold, "
                   f"{len(rel_df)} rows remaining in relatedness file")
     logging.debug(f"\tRelatedness degree counts: {get_rel_report(rel_df)}")
-    R = calculate_R(rel_df=rel_df, N=N, affected_samples=parental_sources.affected_samples)
+    # affected_samples are whole-fam-file positions; R's rows are the analysis sample's
+    R = calculate_R(rel_df=rel_df, N=N,
+                    affected_samples=to_analysis_positions(
+                        fam_positions=parental_sources.affected_samples,
+                        full_fam_df=full_fam_df, fam_df=fam_df))
 
 
     # Residualize the phenotypes using R

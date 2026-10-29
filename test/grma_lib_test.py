@@ -3951,6 +3951,83 @@ class TestMapSamplesToImputedFamilies:
 
 
 
+class TestMapKingToFamPositions:
+    """KING pairs as positions in the WHOLE fam file, for parental processing (notes §13.1)"""
+
+    @staticmethod
+    def king(rows):
+        return pd.DataFrame(rows, columns=[sut.KING_FID1_COL, sut.KING_IID1_COL, sut.KING_FID2_COL,
+                                           sut.KING_IID2_COL, sut.KING_KINSHIP_COL, sut.KING_REL_COL])
+
+    def test__pairs__positions_in_the_whole_fam_file(self):
+        fam = pd.DataFrame({bbf.FAM_FID_COL : ["F", "F", "F", "F"],
+                            bbf.FAM_IID_COL : ["x", "dad", "mum", "kid"]})
+        king = self.king([["F", "dad", "F", "kid", 0.25, sut.INF_PARENT_OFFSPRING],
+                          ["F", "mum", "F", "kid", 0.25, sut.INF_PARENT_OFFSPRING]])
+
+        actual = sut.map_king_to_fam_positions(king_df=king, fam_ids=fam)
+
+        assert actual[[sut.FAM_INDEX_1, sut.FAM_INDEX_2]].values.tolist() == [[1, 3], [2, 3]]
+        assert actual[sut.KING_REL_COL].tolist() == [sut.DEG_PARENT_OFFSPRING] * 2
+
+    def test__pair_with_someone_not_in_the_fam_file__dropped(self):
+        fam = pd.DataFrame({bbf.FAM_FID_COL : ["F", "F"], bbf.FAM_IID_COL : ["dad", "kid"]})
+        king = self.king([["F", "dad", "F", "kid", 0.25, sut.INF_PARENT_OFFSPRING],
+                          ["F", "elsewhere", "F", "kid", 0.25, sut.INF_FULLSIB]])
+
+        actual = sut.map_king_to_fam_positions(king_df=king, fam_ids=fam)
+
+        assert actual[[sut.FAM_INDEX_1, sut.FAM_INDEX_2]].values.tolist() == [[0, 1]]
+
+    def test__pair_beyond_se_relatedness__dropped(self):
+        fam = pd.DataFrame({bbf.FAM_FID_COL : ["F", "F"], bbf.FAM_IID_COL : ["a", "b"]})
+        king = self.king([["F", "a", "F", "b", 0.0, sut.INF_4TH]])
+
+        assert len(sut.map_king_to_fam_positions(king_df=king, fam_ids=fam)) == 0
+
+    def test__numeric_ids_in_king_and_text_ids_in_the_fam_file__still_matched(self):
+        # The fam file is read as text, while pandas infers KING's ID columns as integers
+        fam = pd.DataFrame({bbf.FAM_FID_COL : ["1", "1"], bbf.FAM_IID_COL : ["10", "12"]})
+        king = self.king([[1, 10, 1, 12, 0.25, sut.INF_PARENT_OFFSPRING]])
+
+        actual = sut.map_king_to_fam_positions(king_df=king, fam_ids=fam)
+
+        assert actual[[sut.FAM_INDEX_1, sut.FAM_INDEX_2]].values.tolist() == [[0, 1]]
+
+
+class TestToAnalysisPositions:
+    """Whole-fam-file positions translated into the analysis sample's, for R (notes §13.1)"""
+
+    FULL = pd.DataFrame({bbf.FAM_FID_COL : ["F"] * 5, bbf.FAM_IID_COL : ["x", "a", "b", "c", "d"]})
+
+    def test__samples_filtered_out_before__positions_shift_down(self):
+        analysis = self.FULL.iloc[[1, 3, 4]].reset_index(drop=True)  # x and b filtered out
+
+        actual = sut.to_analysis_positions(fam_positions=np.array([3, 4, 1]),
+                                           full_fam_df=self.FULL, fam_df=analysis)
+
+        assert actual.tolist() == [1, 2, 0]
+
+    def test__no_filtering__unchanged(self):
+        actual = sut.to_analysis_positions(fam_positions=np.array([0, 2, 4]),
+                                           full_fam_df=self.FULL, fam_df=self.FULL)
+
+        assert actual.tolist() == [0, 2, 4]
+
+    def test__nothing_to_translate__empty(self):
+        actual = sut.to_analysis_positions(fam_positions=np.array([], dtype=int),
+                                           full_fam_df=self.FULL, fam_df=self.FULL)
+
+        assert actual.size == 0
+
+    def test__a_sample_not_in_the_analysis__raises(self):
+        analysis = self.FULL.iloc[[1, 2]].reset_index(drop=True)
+
+        with pytest.raises(ValueError, match="not in the analysis sample"):
+            sut.to_analysis_positions(fam_positions=np.array([1, 3]), full_fam_df=self.FULL,
+                                      fam_df=analysis)
+
+
 class TestDetermineFamFileTrios:
 
     # Fam file trio mode.  The ORIGINAL fam file is read rather than the filtered frame, because
@@ -3996,7 +4073,7 @@ class TestDetermineFamFileTrios:
 
         with caplog.at_level(logging.INFO):
             actual = sut.determine_fam_file_trios(
-                fam_file=full_fam, fam_df=self.analysis_sample(full_fam),
+                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam),
                 rel_df=self.king([(2, 0), (2, 1)]))
 
         assert list(actual.affected_samples) == [2]
@@ -4018,7 +4095,7 @@ class TestDetermineFamFileTrios:
 
         with caplog.at_level(logging.INFO):
             actual = sut.determine_fam_file_trios(
-                fam_file=full_fam, fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
+                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
 
         assert len(actual.affected_samples) == 0
         logged = "\n".join(record.message for record in caplog.records)
@@ -4034,7 +4111,7 @@ class TestDetermineFamFileTrios:
 
         with caplog.at_level(logging.INFO):
             actual = sut.determine_fam_file_trios(
-                fam_file=full_fam, fam_df=self.analysis_sample(full_fam),
+                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam),
                 rel_df=self.king([(1, 0)]))
 
         assert len(actual.affected_samples) == 0
@@ -4051,7 +4128,7 @@ class TestDetermineFamFileTrios:
 
         with caplog.at_level(logging.INFO):
             actual = sut.determine_fam_file_trios(
-                fam_file=full_fam, fam_df=self.analysis_sample(full_fam),
+                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam),
                 rel_df=self.king([(1, 0)]))
 
         assert len(actual.affected_samples) == 0
@@ -4071,7 +4148,7 @@ class TestDetermineFamFileTrios:
 
         with caplog.at_level(logging.INFO):
             actual = sut.determine_fam_file_trios(
-                fam_file=full_fam, fam_df=self.analysis_sample(full_fam, positions=[0, 1]),
+                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam, positions=[0, 1]),
                 rel_df=self.king([(2, 0), (2, 1)]))
 
         assert len(actual.affected_samples) == 0
@@ -4088,7 +4165,7 @@ class TestDetermineFamFileTrios:
 
         with caplog.at_level(logging.INFO):
             actual = sut.determine_fam_file_trios(
-                fam_file=full_fam, fam_df=self.analysis_sample(full_fam, positions=[1, 2]),
+                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam, positions=[1, 2]),
                 rel_df=self.king([(2, 0), (2, 1)]))
 
         assert list(actual.affected_samples) == [2]
@@ -4107,7 +4184,7 @@ class TestDetermineFamFileTrios:
 
         with caplog.at_level(logging.INFO):
             actual = sut.determine_fam_file_trios(
-                fam_file=full_fam, fam_df=self.analysis_sample(full_fam),
+                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam),
                 rel_df=self.king([(4, 0), (4, 1), (5, 2), (5, 3)]))
 
         assert list(actual.affected_samples) == [4, 5]
@@ -4123,7 +4200,7 @@ class TestDetermineFamFileTrios:
 
         with caplog.at_level(logging.INFO):
             actual = sut.determine_fam_file_trios(
-                fam_file=full_fam, fam_df=self.analysis_sample(full_fam),
+                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam),
                 rel_df=self.king([(3, 0), (3, 1), (2, 1)]))
 
         assert list(actual.affected_samples) == [3]
@@ -4143,7 +4220,7 @@ class TestDetermineFamFileTrios:
                              ("F1", "KID", "DAD", "MUM")])
 
         with pytest.raises(ValueError) as error:
-            sut.determine_fam_file_trios(fam_file=full_fam,
+            sut.determine_fam_file_trios(full_fam_df=full_fam,
                                          fam_df=self.analysis_sample(full_fam),
                                          rel_df=self.king([(2, 0)]))
 
@@ -4164,7 +4241,7 @@ class TestDetermineFamFileTrios:
 
         with caplog.at_level(logging.INFO):
             actual = sut.determine_fam_file_trios(
-                fam_file=full_fam, fam_df=self.analysis_sample(full_fam),
+                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam),
                 rel_df=self.king([(2, 0), (2, 1)]))
 
         assert list(actual.affected_samples) == [2]
@@ -4173,9 +4250,10 @@ class TestDetermineFamFileTrios:
 
 
     def test__read_from_an_actual_fam_file__same_as_from_a_frame(self, tmp_path, caplog):
-        # Everything else here hands the function a frame, which skips the read.  This is the only
-        # case that exercises the file path, where the IDs arrive as text and the dtype given to
-        # read_csv is what keeps them that way.
+        # process_relatedness() reads the fam file once, with every column as text, and hands the
+        # frame on.  Everything else here builds that frame directly; this one reads it from an
+        # actual file exactly as process_relatedness() does, so purely numeric IDs arrive as text
+        # and must still be matched.
         path = str(tmp_path / "trio.fam")
         bbf.write_fam_file(fam_filename=path,
                            fid=np.array(["1", "1", "1"]),
@@ -4189,7 +4267,7 @@ class TestDetermineFamFileTrios:
 
         with caplog.at_level(logging.INFO):
             actual = sut.determine_fam_file_trios(
-                fam_file=path, fam_df=self.analysis_sample(from_file),
+                full_fam_df=from_file, fam_df=self.analysis_sample(from_file),
                 rel_df=self.king([(2, 0), (2, 1)]))
 
         assert list(actual.affected_samples) == [2]
@@ -4267,7 +4345,7 @@ class TestProcessImputedParents:
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
-                imputed_parental_file=path, fam_file=full_fam,
+                imputed_parental_file=path, full_fam_df=full_fam,
                 fam_df=self.analysis_sample(full_fam), rel_df=self.king([(1, 0)]))
 
         assert list(actual.affected_samples) == [1]
@@ -4285,7 +4363,7 @@ class TestProcessImputedParents:
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
-                imputed_parental_file=path, fam_file=full_fam,
+                imputed_parental_file=path, full_fam_df=full_fam,
                 fam_df=self.analysis_sample(full_fam), rel_df=self.king([(2, 0), (2, 1)]))
 
         assert list(actual.affected_samples) == [2]
@@ -4304,7 +4382,7 @@ class TestProcessImputedParents:
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
-                imputed_parental_file=path, fam_file=full_fam,
+                imputed_parental_file=path, full_fam_df=full_fam,
                 fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
 
         assert len(actual.affected_samples) == 0
@@ -4327,7 +4405,7 @@ class TestProcessImputedParents:
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
-                imputed_parental_file=path, fam_file=full_fam,
+                imputed_parental_file=path, full_fam_df=full_fam,
                 fam_df=self.analysis_sample(full_fam), rel_df=self.king([(2, 0), (2, 1)]))
 
         assert actual.observed_parent_cols.tolist() == [[0, 1]]
@@ -4340,7 +4418,7 @@ class TestProcessImputedParents:
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
-                imputed_parental_file=path, fam_file=full_fam,
+                imputed_parental_file=path, full_fam_df=full_fam,
                 fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
 
         assert len(actual.affected_samples) == 0
@@ -4353,7 +4431,7 @@ class TestProcessImputedParents:
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
-                imputed_parental_file=path, fam_file=full_fam,
+                imputed_parental_file=path, full_fam_df=full_fam,
                 fam_df=self.analysis_sample(full_fam, positions=[0, 1]),
                 rel_df=self.king([(2, 0), (2, 1)]))
 
@@ -4368,7 +4446,7 @@ class TestProcessImputedParents:
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
-                imputed_parental_file=path, fam_file=full_fam,
+                imputed_parental_file=path, full_fam_df=full_fam,
                 fam_df=self.analysis_sample(full_fam, positions=[1, 2]),
                 rel_df=self.king([(2, 0), (2, 1)]))
 
@@ -4384,7 +4462,7 @@ class TestProcessImputedParents:
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
-                imputed_parental_file=path, fam_file=full_fam,
+                imputed_parental_file=path, full_fam_df=full_fam,
                 fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
 
         assert list(actual.affected_samples) == [0, 1]
@@ -4401,7 +4479,7 @@ class TestProcessImputedParents:
 
         with pytest.raises(ValueError) as error:
             sut.process_imputed_parents(
-                imputed_parental_file=path, fam_file=full_fam,
+                imputed_parental_file=path, full_fam_df=full_fam,
                 fam_df=self.analysis_sample(full_fam), rel_df=self.king([(2, 0)]))
 
         assert str(error.value).startswith("the imputed parental genotype file's pedigree")
@@ -4415,7 +4493,7 @@ class TestProcessImputedParents:
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
-                imputed_parental_file=path, fam_file=full_fam,
+                imputed_parental_file=path, full_fam_df=full_fam,
                 fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
 
         assert len(actual.affected_samples) == 0
@@ -4430,7 +4508,7 @@ class TestProcessImputedParents:
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
-                imputed_parental_file=path, fam_file=full_fam,
+                imputed_parental_file=path, full_fam_df=full_fam,
                 fam_df=self.analysis_sample(full_fam), rel_df=self.king([(1, 0)]))
 
         for key in (snipar_hdf5.SNIPAR_PEDIGREE_KEY, snipar_hdf5.SNIPAR_FAMILIES_KEY,
@@ -4454,7 +4532,7 @@ class TestProcessImputedParents:
 
         with caplog.at_level(logging.INFO):
             actual = sut.process_imputed_parents(
-                imputed_parental_file=path, fam_file=full_fam,
+                imputed_parental_file=path, full_fam_df=full_fam,
                 fam_df=self.analysis_sample(full_fam), rel_df=self.king([(3, 1), (3, 2)]))
 
         assert list(actual.affected_samples) == [3]

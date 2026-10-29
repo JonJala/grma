@@ -143,10 +143,6 @@ def _kinds_except(*excluded):
     return tuple(k for k in TEST_KINDS if k not in excluded)
 
 
-# process_bim_file() never sees the sample positions, so it is unaffected
-_XFAIL_13_1 = dict(raises=ValueError, applies_to=_kinds_except("process_bim_file"),
-                   reason="notes §13.1: parental positions are unfiltered, rel_df and R are "
-                          "filtered")
 # Only the end-to-end comparison is affected.  The tests that compare two runs of this case see the
 # same wrong SNP's data in both, so they pass; marking them would turn those passes into strict
 # XPASS failures.
@@ -190,15 +186,12 @@ REGISTRY = {
 
     # Dropping a sample must not change who is affected: X is unrelated and sits first in the fam
     # file, so every position shifts; mo1 is a parent, and a parent need not be in the analysis.
-    "PARENTAL_FAM_DROP_X" : Case(tc_parental, ID_LIST=_drop_sample(tc_parental, "X"),
-                                 XFAIL=_XFAIL_13_1),
-    "PARENTAL_FAM_DROP_PARENT" : Case(tc_parental, ID_LIST=_drop_sample(tc_parental, "mo1"),
-                                      XFAIL=_XFAIL_13_1),
+    "PARENTAL_FAM_DROP_X" : Case(tc_parental, ID_LIST=_drop_sample(tc_parental, "X")),
+    "PARENTAL_FAM_DROP_PARENT" : Case(tc_parental, ID_LIST=_drop_sample(tc_parental, "mo1")),
     "PARENTAL_IMPUTED_DROP_X" : Case(tc_parental_imputed,
-                                     ID_LIST=_drop_sample(tc_parental, "X"), XFAIL=_XFAIL_13_1),
+                                     ID_LIST=_drop_sample(tc_parental, "X")),
     "PARENTAL_IMPUTED_DROP_PARENT" : Case(tc_parental_imputed,
-                                          ID_LIST=_drop_sample(tc_parental, "mo1"),
-                                          XFAIL=_XFAIL_13_1),
+                                          ID_LIST=_drop_sample(tc_parental, "mo1")),
 
     # A cross-chunk swap in the imputed file's SNP order
     "PARENTAL_IMPUTED_OUT_OF_ORDER" : Case(
@@ -509,14 +502,13 @@ def _snipar_variants():
 
     Each is built from the case's true genotypes by helper.mock_snipar_from_trios(), so it must give
     results identical to the case itself (EQUIVALENT_TO) -- the invariance of notes §15.3.  Cases
-    already in imputed mode, with no one affected, or with an XFAIL are skipped, as are cases that
-    filter samples, since parental processing under sample filtering is the known bug of §13.1.
+    already in imputed mode, with no one affected, or with an XFAIL are skipped.  (Cases that filter
+    samples were skipped too until §13.1 was fixed.)
     """
 
     variants = {}
     for key, case in REGISTRY.items():
-        if (is_imputed(key) or not case["AFFECTED"] or case["XFAIL"] or
-                any(case[n] is not None for n in ("ID_LIST", "PHENO_DF", "COVAR_DF"))):
+        if is_imputed(key) or not case["AFFECTED"] or case["XFAIL"]:
             continue
         for mode, suffix in (("one", "SNIPAR_ONE_PARENT_IMPUTED"),
                              ("both", "SNIPAR_BOTH_PARENTS_IMPUTED")):
