@@ -632,6 +632,80 @@ class TestProcessRelatedness:
         assert np.allclose(expected_gls_weights, actual_gls_weights.toarray(), atol=1e-6)
 
 
+    # ---- The same pair listed more than once (notes §7.4f) ----------------------------------
+    #
+    # Each runs TWO_FAMILY with a KING file that lists one pair again, and compares everything
+    # process_relatedness() returns against the same file without the repeat.
+
+    @staticmethod
+    def run_relatedness(rel_df, fam_df):
+        phenos = fam_df[bbf.FAM_PHENO_COL].to_numpy(dtype=float)
+        R, W, resid, _ = sut.process_relatedness(
+            rel_file=rel_df, fam_file=fam_df, fam_df=fam_df, rel_degree=1,
+            unresidualized_phenotypes=phenos - phenos.mean())
+        return R.toarray(), W.toarray(), resid
+
+    @staticmethod
+    def assert_same(actual, expected):
+        for a, e in zip(actual, expected):
+            assert np.allclose(a, e)
+
+
+    def test__pair_repeated__counted_once_with_a_warning(self, caplog):
+        rel_df, fam_df = tcs.get(tcs.KEY_2FAM, "REL_DF"), tcs.get(tcs.KEY_2FAM, "FAM_DF")
+        repeated = pd.concat([rel_df, rel_df.iloc[[0]]], ignore_index=True)
+
+        with caplog.at_level(logging.WARNING):
+            actual = self.run_relatedness(repeated, fam_df)
+
+        self.assert_same(actual, self.run_relatedness(rel_df, fam_df))
+        assert "more than once" in caplog.text and "1-5" in caplog.text
+
+
+    def test__pair_listed_both_ways_round__counted_once(self, caplog):
+        rel_df, fam_df = tcs.get(tcs.KEY_2FAM, "REL_DF"), tcs.get(tcs.KEY_2FAM, "FAM_DF")
+        reversed_row = rel_df.iloc[[0]].rename(columns={
+            sut.KING_FID1_COL : sut.KING_FID2_COL, sut.KING_IID1_COL : sut.KING_IID2_COL,
+            sut.KING_FID2_COL : sut.KING_FID1_COL, sut.KING_IID2_COL : sut.KING_IID1_COL})
+        both_ways = pd.concat([rel_df, reversed_row[rel_df.columns]], ignore_index=True)
+
+        with caplog.at_level(logging.WARNING):
+            actual = self.run_relatedness(both_ways, fam_df)
+
+        self.assert_same(actual, self.run_relatedness(rel_df, fam_df))
+        assert "more than once" in caplog.text
+
+
+    def test__pair_given_two_degrees__raises_naming_both(self):
+        rel_df, fam_df = tcs.get(tcs.KEY_2FAM, "REL_DF"), tcs.get(tcs.KEY_2FAM, "FAM_DF")
+        contradiction = rel_df.iloc[[0]].copy()   # 1-5, parent-offspring in the file
+        contradiction[sut.KING_REL_COL] = sut.INF_3RD
+
+        with pytest.raises(ValueError, match="more than one degree") as error:
+            self.run_relatedness(pd.concat([rel_df, contradiction], ignore_index=True), fam_df)
+
+        message = str(error.value)
+        assert "1-5" in message
+        assert sut.INF_PARENT_OFFSPRING in message and sut.INF_3RD in message
+
+
+    def test__duplicate_involving_a_filtered_out_sample__ignored(self, caplog):
+        # Pairs with someone outside the analysis never reach the calculation, so neither a repeat
+        # nor a contradiction involving them should warn or stop the run
+        rel_df, full_fam = tcs.get(tcs.KEY_2FAM, "REL_DF"), tcs.get(tcs.KEY_2FAM, "FAM_DF")
+        fam_df = full_fam[full_fam[bbf.FAM_IID_COL] != 10].reset_index(drop=True)
+        involving_10 = rel_df[rel_df[sut.KING_IID2_COL] == 10].iloc[[0]]
+        contradiction = involving_10.copy()
+        contradiction[sut.KING_REL_COL] = sut.INF_3RD
+        noisy = pd.concat([rel_df, involving_10, contradiction], ignore_index=True)
+
+        with caplog.at_level(logging.WARNING):
+            actual = self.run_relatedness(noisy, fam_df)
+
+        self.assert_same(actual, self.run_relatedness(rel_df, fam_df))
+        assert "more than once" not in caplog.text
+
+
     @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
     @pytest.mark.parametrize("rng_seed", [1, 34])
     @pytest.mark.parametrize("tc_key", [tcs.KEY_SIMPLE, tcs.KEY_2FAM, tcs.KEY_VARIED])
@@ -4809,22 +4883,9 @@ class TestCalculateR:
         assert np.allclose(sut.calculate_R(self.relatedness(pairs), N=3).toarray(), expected)
 
 
-    @pytest.mark.xfail(strict=True,
-                       reason="duplicate pairs are summed rather than deduplicated; the "
-                              "relatedness file is not yet checked for them")
-    def test__the_same_pair_listed_twice__counted_once(self):
-        # A repeated pair should change nothing: it says the same thing twice.  What happens
-        # instead is that the row weights are built with a sparse constructor that SUMS entries
-        # landing in the same cell, so the row sum comes out at 2 rather than 1 and the pair is
-        # centered at two thirds rather than a half.
-        #
-        # The same is true of calculate_omega(), where the two covariances are added together.
-        # Both want the relatedness file checked for duplicates, which also has to normalise the
-        # order of each pair rather than only dropping exact repeats.
-        actual = sut.calculate_R(self.relatedness([(0, 1), (0, 1)]), N=2).toarray()
-
-        assert np.allclose(actual, [[0.5, -0.5],
-                                    [-0.5, 0.5]])
+    # A pair listed more than once is removed before calculate_R() is reached, by
+    # deduplicate_relatedness_pairs() in process_relatedness(), so calculate_R() can rely on each
+    # pair once.  The tests are in TestProcessRelatedness (notes §7.4f).
 
 
     # ---- Samples residualized against their parents ---------------------------------------

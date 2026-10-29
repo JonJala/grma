@@ -1238,6 +1238,61 @@ def to_analysis_positions(fam_positions: np.ndarray, full_fam_df: pd.DataFrame,
 
 
 # -------------------------
+def deduplicate_relatedness_pairs(rel_df: pd.DataFrame, fam_df: pd.DataFrame) -> pd.DataFrame:
+    """Each pair of samples once, whichever order it was listed in
+
+    KING writes one row per pair, but a concatenated file, merged KING runs or a hand edit can list
+    a pair more than once, and calculate_R() and calculate_omega() would then count it more than
+    once (notes §7.4f).  A pair repeated at the same degree says the same thing twice, so it is
+    kept once, with a warning.  A pair given two DIFFERENT degrees is a contradiction that cannot
+    be resolved here, so it is raised.
+
+    Only pairs between analysis samples reach this, so a duplicate involving someone filtered out
+    of the analysis never stops a run.
+
+    Args:
+        rel_df: Relatedness pairs as analysis-sample positions (FAM_INDEX_1, FAM_INDEX_2), with
+            degrees in KING_REL_COL
+        fam_df: The analysis sample, for naming offending pairs
+
+    Raises:
+        ValueError: If any pair is listed with more than one degree
+
+    Returns:
+        rel_df with each unordered pair once, keeping its first row
+    """
+
+    low = np.minimum(rel_df[FAM_INDEX_1].to_numpy(), rel_df[FAM_INDEX_2].to_numpy())
+    high = np.maximum(rel_df[FAM_INDEX_1].to_numpy(), rel_df[FAM_INDEX_2].to_numpy())
+    pairs = pd.DataFrame({"low" : low, "high" : high, "degree" : rel_df[KING_REL_COL].to_numpy()})
+
+    # Named as the user's file names them: IIDs, and KING's own InfType labels
+    iids = fam_df[FAM_IID_COL].astype(str).to_numpy()
+    inftype = {degree : label for label, degree in INFTYPE_TO_DEG_MAP.items()}
+
+    degrees_per_pair = pairs.groupby(["low", "high"])["degree"].unique()
+    conflicting = degrees_per_pair[degrees_per_pair.map(len) > 1]
+    if len(conflicting) > 0:
+        details = [f"{iids[low]}-{iids[high]} ({', '.join(inftype[d] for d in sorted(degrees))})"
+                   for (low, high), degrees in conflicting.items()]
+        raise ValueError(f"The relatedness file gives some pairs more than one degree of "
+                         f"relatedness, which cannot be resolved: "
+                         f"{describe_offenders(details, noun='pair(s)')}.  KING writes one row "
+                         f"per pair, so this usually comes from combining files.")
+
+    repeated = pairs.duplicated(subset=["low", "high"], keep="first").to_numpy()
+    if np.any(repeated):
+        names = [f"{iids[low]}-{iids[high]}"
+                 for low, high in zip(pairs["low"][repeated], pairs["high"][repeated])]
+        logging.warning(f"\tThe relatedness file lists some pairs more than once, at the same "
+                        f"degree; each is counted once: "
+                        f"{describe_offenders(names, noun='pair(s)')}")
+        rel_df = rel_df.loc[~repeated].reset_index(drop=True)
+
+    return rel_df
+
+
+# -------------------------
 def calculate_R(rel_df: pd.DataFrame, N: int, affected_samples: np.ndarray = None
                 ) -> sp.csr_array:
     """Builds the residualization matrix
@@ -1387,6 +1442,10 @@ def process_relatedness(
     rel_df[KING_REL_COL] = rel_df[KING_REL_COL].map(INFTYPE_TO_DEG_MAP)
     logging.debug(f"\tMapping KING relatedness to relatedness degree")
     logging.debug(f"\tRelatedness degree counts: {get_rel_report(rel_df)}\n")
+
+    # Each pair once, before anything builds a matrix from them: the sparse constructors in
+    # calculate_R() and calculate_omega() SUM entries that land in the same cell (notes §7.4f)
+    rel_df = deduplicate_relatedness_pairs(rel_df=rel_df, fam_df=fam_df)
 
 
     # Filter out relatedness that's too far away
