@@ -1672,6 +1672,20 @@ def process_bim_file(bim_file: Union[str, pd.DataFrame], snp_list: Union[str, pd
     snp_alignment = SnpAlignment(hdf5_indices=hdf5_indices[keep_mask],
                                  flip_mask=flip_mask[keep_mask])
 
+    # read_imputed_block() only ever reads forward through the imputed file, so the file must list
+    # the SNPs in the bim's order.  A step backwards would make it read another SNP's data,
+    # silently (notes §13.2).  A repeated position is fine: it can only come from the bim listing
+    # one SNP twice.
+    backwards = np.flatnonzero(np.diff(snp_alignment.hdf5_indices) < 0) + 1
+    if backwards.size > 0:
+        rsids = bim_df[BIM_RSID_COL].to_numpy()[snp_filter[backwards]]
+        raise ValueError(f"The imputed parental genotype file lists SNPs in a different order "
+                         f"from the bim file: {describe_offenders(rsids, noun='SNP(s)')} come "
+                         f"earlier in the imputed file than the SNP before them in the bim file.  "
+                         f"GRMA reads the imputed file in the bim file's order, so the two must "
+                         f"match.  Run snipar's impute.py on a fileset whose variants are in the "
+                         f"same order as the one given to GRMA.")
+
     logging.info(f"\tThere are {len(snp_filter)} SNPs remaining after aligning the imputed "
                  f"parental genotype file")
 
@@ -1869,8 +1883,8 @@ def read_imputed_block(imputed_hdf5, metadata: dict, block_hdf5_indices: np.ndar
     # however snps_per_block and the file's chunk width happen to line up.
     #
     # Advancing is only ever forward, which is what makes discarding the previous chunk safe:
-    # blocks are processed in ascending SNP order and hdf5_indices follows the bim's order, so
-    # the frontier never moves back.
+    # blocks are processed in ascending SNP order, and process_bim_file() rejects an imputed file
+    # whose SNPs are not in the bim's order (notes §13.2), so the frontier never moves back.
     filled = 0
     while filled < len(block_hdf5_indices):
         if chunk["cached_start"] == -1 or block_hdf5_indices[filled] >= chunk["cached_stop"]:

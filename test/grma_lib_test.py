@@ -28,6 +28,7 @@ import snipar_hdf5
 
 import helper
 import tcs  # The case registry and harness; see its docstring for the format
+import tc_parental  # For its out-of-order imputed file (TestProcessBimFile)
 
 
 ##############
@@ -948,6 +949,62 @@ class TestProcessBimFile:
         assert expected_M == actual_M
         assert (expected_snp_filter is None and actual_snp_filter is None) or \
                np.allclose(expected_snp_filter, actual_snp_filter)
+
+
+    @staticmethod
+    def imputed_sources(path):
+        """Parental sources with only what process_bim_file() reads: the imputed file's metadata"""
+        return sut.ParentalSources(affected_samples=np.array([], dtype=int),
+                                   observed_parent_cols=np.empty((0, 2), dtype=int),
+                                   imputed_rows=np.array([], dtype=int), imputed_file=path,
+                                   snipar_metadata=snipar_hdf5.read_snipar_metadata(path))
+
+
+    def test__imputed_file_snps_out_of_order__raises(self, tmp_path):
+        # rs2 and rs3 are swapped in the imputed file relative to the bim (notes §13.2)
+        path = str(tmp_path / ("out_of_order" + snipar_hdf5.SNIPAR_FILE_SUFFIX))
+        snipar_hdf5.write_snipar_file(
+            path, **tc_parental.imputed_file_arrays(tc_parental.hdf5_rsids_out_of_order()))
+
+        with pytest.raises(ValueError, match="different order") as error:
+            sut.process_bim_file(bim_file=tc_parental.BIM_DF, snp_list=None,
+                                 parental_sources=self.imputed_sources(path))
+
+        # The SNP that steps backwards is named, so the user can see where the orders diverge
+        assert "rs3" in str(error.value)
+
+
+    def test__imputed_file_snps_in_order__accepted(self, tmp_path):
+        path = str(tmp_path / ("in_order" + snipar_hdf5.SNIPAR_FILE_SUFFIX))
+        snipar_hdf5.write_snipar_file(path, **tc_parental.imputed_file_arrays())
+
+        _, _, _, alignment = sut.process_bim_file(bim_file=tc_parental.BIM_DF, snp_list=None,
+                                                  parental_sources=self.imputed_sources(path))
+
+        assert np.all(np.diff(alignment.hdf5_indices) > 0)
+
+
+    def test__bim_lists_a_snp_twice__repeated_imputed_position_accepted(self, tmp_path):
+        # Both copies of rs2 align to the same SNP in the imputed file.  That repeats a position
+        # rather than stepping backwards, which the forward-only reader handles.
+        bim = pd.DataFrame({bbf.BIM_CHR_COL : 1, bbf.BIM_RSID_COL : ["rs1", "rs2", "rs2", "rs3"],
+                            bbf.BIM_CM_COL : 0.0, bbf.BIM_BP_COL : [100, 200, 200, 300],
+                            bbf.BIM_A1_COL : ["A", "G", "G", "C"],
+                            bbf.BIM_A2_COL : ["C", "T", "T", "T"]}, columns=bbf.BIM_COLS)
+        path = str(tmp_path / ("repeated" + snipar_hdf5.SNIPAR_FILE_SUFFIX))
+        snipar_hdf5.write_snipar_file(
+            path, imputed_gts=np.ones((1, 3)), num_obs_par_alleles=np.full((1, 3), 4.0),
+            standard_f=np.full(3, 0.3), parental_status=np.zeros((1, 3), dtype=bool),
+            pedigree=np.array([["F", "kid", "dad", "mum", "False", "False"]]),
+            families=np.array(["F"]),
+            bim_values=np.array([["1", "rs1", "0", "100", "A", "C"],
+                                 ["1", "rs2", "0", "200", "G", "T"],
+                                 ["1", "rs3", "0", "300", "C", "T"]]))
+
+        _, _, _, alignment = sut.process_bim_file(bim_file=bim, snp_list=None,
+                                                  parental_sources=self.imputed_sources(path))
+
+        assert alignment.hdf5_indices.tolist() == [0, 1, 1, 2]
 
 
     @pytest.mark.parametrize("rng_seed", [95, 301, 486])

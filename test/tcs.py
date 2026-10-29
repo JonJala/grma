@@ -143,13 +143,6 @@ def _kinds_except(*excluded):
     return tuple(k for k in TEST_KINDS if k not in excluded)
 
 
-# Only the end-to-end comparison is affected.  The tests that compare two runs of this case see the
-# same wrong SNP's data in both, so they pass; marking them would turn those passes into strict
-# XPASS failures.
-_XFAIL_13_2 = dict(raises=AssertionError, applies_to=("end_to_end",),
-                   reason="notes §13.2: the chunk cache assumes the imputed file lists SNPs in the "
-                          "bim's order.  Once a guard lands this case should expect its error "
-                          "instead; once out-of-order files are supported it should simply pass.")
 
 # Adding singletons changes omega's variance, and with anyone affected the centering mean too, so
 # results change for every case until §13.6 is fixed.  Applied by the singleton test to any case
@@ -192,12 +185,6 @@ REGISTRY = {
                                      ID_LIST=_drop_sample(tc_parental, "X")),
     "PARENTAL_IMPUTED_DROP_PARENT" : Case(tc_parental_imputed,
                                           ID_LIST=_drop_sample(tc_parental, "mo1")),
-
-    # A cross-chunk swap in the imputed file's SNP order
-    "PARENTAL_IMPUTED_OUT_OF_ORDER" : Case(
-        tc_parental_imputed,
-        IMPUTED_FILE=tc_parental.imputed_file_arrays(tc_parental.hdf5_rsids_out_of_order()),
-        EXPECTED_LOG_COUNTS=None, XFAIL=_XFAIL_13_2),
 }
 
 KEYS = list(REGISTRY)
