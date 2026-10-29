@@ -603,12 +603,20 @@ def calculate_gls_weights(R: sp.csr_array, omega: sp.csr_array, labels: np.ndarr
         idx = order[starts[component]:ends[component]]
         block = resid_pheno_cov[idx][:, idx].toarray()
 
-        # numpy's default cutoff for treating a direction as null space, which separates float
-        # noise from everything else.  An explicit one was tried and removed: expressing it
-        # relative to epsilon drove rcond to 1.0 for any block whose largest entry fell below
-        # epsilon, which discards every direction including the largest and silently gives every
-        # sample in that block zero weight.
-        block_pinv = np.linalg.pinv(block)
+        # The cutoff below which a direction is treated as null space.  R makes every block
+        # singular by construction (each group's mean direction is removed), and in floating
+        # point those zero eigenvalues come out as rounding noise of order (block size) x eps x
+        # the largest singular value.  numpy's default cutoff is a FIXED 1e-15 of the largest, so
+        # from a few hundred samples per block the noise exceeds it and is inverted rather than
+        # discarded, giving weights around 1e14, silently (notes §8.10).  This cutoff scales with
+        # the block, as the noise does -- it is what numpy 2's rtol=None computes, written out so
+        # that numpy 1 works too.
+        #
+        # Not to be confused with the explicit cutoff tried and removed earlier, which was relative
+        # to epsilon, an absolute value: that drove rcond to 1.0 for any block whose largest entry
+        # fell below epsilon, discarding every direction.  This one is relative to the block's own
+        # largest singular value and stays far below 1 for any block that could exist.
+        block_pinv = np.linalg.pinv(block, rcond=max(block.shape) * np.finfo(float).eps)
 
         nonzero = np.nonzero(block_pinv)
         rows.append(idx[nonzero[0]])

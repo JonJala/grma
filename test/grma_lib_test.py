@@ -2651,6 +2651,41 @@ class TestCalculateGLSWeights:
         assert np.isclose(actual[1, 1], 1e9)
 
 
+    def test__large_component__rounding_noise_not_inverted(self):
+        """One component of 1,000 people: 250 sibships of 4, chained by weak cousin links.
+
+        R removes each sibship's mean, so the block has 250 exactly-zero eigenvalues, which come out
+        as rounding noise that grows with the block.  numpy's default cutoff is a fixed 1e-15 of the
+        largest singular value, and at this size enough of the noise exceeds it to give weights
+        around 1e13 to 1e14 (notes §8.10).  1,000 rather than the few hundred where the failure
+        begins: where it begins depends on the numerical library, and this is well past it
+        everywhere.  The data is built here, from a fixed seed.
+        """
+
+        rng = np.random.default_rng(seed=810)
+        num_sibships, sibship_size = 250, 4
+        N = num_sibships * sibship_size
+
+        omega = np.identity(N)
+        R = np.identity(N)
+        for sibship in range(num_sibships):
+            idx = np.arange(sibship * sibship_size, (sibship + 1) * sibship_size)
+            omega[np.ix_(idx, idx)] = 0.4
+            omega[idx, idx] = 1.0
+            R[np.ix_(idx, idx)] -= 1.0 / sibship_size
+            if sibship > 0:
+                # A cousin link to the previous sibship, so that all of them form ONE component
+                omega[idx[0], idx[0] - 1] = omega[idx[0] - 1, idx[0]] = 0.1
+        omega *= rng.uniform(0.5, 3.0)  # An arbitrary phenotype scale
+
+        actual = sut.calculate_gls_weights(R=sp.csr_array(R), omega=sp.csr_array(omega),
+                                           labels=np.zeros(N, dtype=int)).toarray()
+
+        resid_pheno_cov = R @ omega @ R.T
+        assert np.abs(actual).max() < 10.0
+        assert np.allclose(resid_pheno_cov @ actual @ resid_pheno_cov, resid_pheno_cov, atol=1e-8)
+
+
     def test__no_samples__empty_matrix(self):
         # Nothing to invert.  grma() rejects an empty sample filter long before this, so the
         # pipeline never arrives here -- but the assembly concatenates a list of blocks, and an
