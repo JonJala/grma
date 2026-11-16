@@ -1,964 +1,709 @@
 """
-Testing of grma_lib.py
+Tests of grma_lib: GRMA's planning and statistics.
+
+So far: the sample table, the relatedness graph, duplicate samples, parents, groups, Omega, the
+SNPs to analyse, the four regressions, the covariance of their estimates, their meta-analysis,
+and grma(), which runs it all.
 """
 
-import copy
-import itertools as it
 import logging
 import os
-import re
 import sys
 
 import numpy as np
-import pytest
 import pandas as pd
+import pytest
 import scipy.sparse as sp
-from scipy import stats
+import scipy.sparse.csgraph as csgraph
 
 main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-test_directory = os.path.abspath(os.path.join(main_directory, "test"))
-data_directory = os.path.abspath(os.path.join(test_directory, "data"))
 sys.path.append(main_directory)
-pd.options.mode.copy_on_write = True #https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#
 
 import bedbimfam as bbf
-import grma
+import grma_io
 import grma_lib as sut
 import snipar_hdf5
 
-import helper
-import tcs  # The case registry and harness; see its docstring for the format
-import tc_parental  # For its out-of-order imputed file (TestProcessBimFile)
 
+def fam(iids, phenos, sexes=None):
+    """A fam frame as grma_io.read_fam() returns it, everyone in family F"""
+    return grma_io.read_fam(pd.DataFrame({
+        bbf.FAM_FID_COL : "F", bbf.FAM_IID_COL : iids, bbf.FAM_IIDF_COL : "0",
+        bbf.FAM_IIDM_COL : "0", bbf.FAM_SEX_COL : sexes if sexes is not None else "0",
+        bbf.FAM_PHENO_COL : phenos}))
 
-##############
 
-np.seterr(all='print')
+def samples_of(iids, in_analysis=None, sexes=None):
+    """A sample table for the given IIDs; in_analysis lists who is in it (default everyone)"""
+    phenos = [1.0 if in_analysis is None or iid in in_analysis else -9.0 for iid in iids]
+    return sut.build_sample_table(fam(iids, phenos, sexes))
 
-##############
 
+def king(rows):
+    """A KING frame from (iid1, iid2, inftype) rows, everyone in family F"""
+    return grma_io.read_king(pd.DataFrame(
+        [("F", a, "F", b, t) for a, b, t in rows], columns=list(grma_io.KING_COLS)))
 
-def make_bim(bim_filename: str, M: int):
-    rs_width = len(str(M))
 
-    bbf.write_bim_file(bim_filename=bim_filename, chrs=np.ones(M),
-                       rsid=np.array([f'RS{snp_id:0{rs_width}d}' for snp_id in range(M)]),
-                       bp=np.array([10*snp_id for snp_id in range(M)]),
-                       a1=['G'] * M,
-                       a2=['A'] * M)
+def graph_of(samples, rows):
+    return sut.build_relatedness_graph(samples, king(rows))
 
-def make_bim_df(M: int):
-    rs_width = len(str(M+1))
 
-    return pd.DataFrame(
-        {
-            bbf.BIM_CHR_COL : 1,
-            bbf.BIM_RSID_COL : [f'RS{snp_id+1:0{rs_width}d}' for snp_id in range(M)],
-            bbf.BIM_CM_COL : [float(i) for i in range(M)],
-            bbf.BIM_BP_COL : [10 * i for i in range(M)],
-            bbf.BIM_A1_COL : 'A',
-            bbf.BIM_A2_COL : 'T'
-        }
-    )
+def snipar(records, families):
+    """snipar metadata holding a pedigree and a family list, as read_snipar_metadata() returns them
 
+    records are (snipar FID, IID, father, mother, has_father, has_mother); the flags are booleans.
+    """
+    pedigree = np.array([[f, i, d, m, str(hf), str(hm)] for f, i, d, m, hf, hm in records])
+    return {snipar_hdf5.SNIPAR_PEDIGREE_KEY : pedigree,
+            snipar_hdf5.SNIPAR_FAMILIES_KEY : np.array(families)}
 
 
-def make_fam(fam_filename: str, N: int, pheno: np.ndarray=None):
-    iids=np.array([i for i in range(N)])
-    fids=iids.copy()
-    bbf.write_fam_file(fam_filename=fam_filename, fid=fids, iid=iids, pheno=pheno.ravel())
+def resolved(iids, king_rows, in_analysis=None, sexes=None):
+    """The sample table and graph, through resolve_duplicates()"""
+    samples = samples_of(iids, in_analysis, sexes)
+    return sut.resolve_duplicates(samples, graph_of(samples, king_rows))
 
 
+def pairs(graph):
+    """The graph as a set of (row 1, row 2, relationship), for order-free comparison"""
+    return set(zip(graph[sut.GRAPH_ROW1_COL], graph[sut.GRAPH_ROW2_COL],
+                   graph[sut.GRAPH_RELATIONSHIP_COL]))
 
-def make_fam_df(N: int):
-    return pd.DataFrame(
-        {
-            bbf.FAM_FID_COL : [2*i for i in range(N)],
-            bbf.FAM_IID_COL : [i for i in range(N)],
-            bbf.FAM_IIDF_COL : 0,
-            bbf.FAM_IIDM_COL : 0,
-            bbf.FAM_SEX_COL : 0,
-            bbf.FAM_PHENO_COL : [float((i+1) * (-1) ** i) for i in range(N)]
-        }
-    )
 
+def ids(iids):
+    return pd.DataFrame({bbf.FAM_FID_COL : "F", bbf.FAM_IID_COL : iids})
 
-make_bed=bbf.write_bed_file
 
+# --------------------------------------------------------------------------------------------------
+class TestBuildSampleTable:
 
-# TODO(jonbjala) Include more error cases
+    def test__fam_only__one_row_per_sample_in_fam_order(self):
+        actual = sut.build_sample_table(fam(["c", "a", "b"], [1.0, 2.0, 3.0]))
 
-class TestProcessPhenotypes:
+        assert actual[sut.SAMPLE_IID_COL].tolist() == ["c", "a", "b"]
+        assert actual[sut.SAMPLE_BED_COL].tolist() == [0, 1, 2]
+        assert actual[sut.SAMPLE_PHENO_COL].tolist() == [1.0, 2.0, 3.0]
+        assert actual[sut.SAMPLE_IN_ANALYSIS_COL].tolist() == [True, True, True]
 
-    def test__simple_fam_file__return_centered(self):
-        N = 100
+    def test__missing_fam_phenotype__no_phenotype_not_in_analysis(self):
+        actual = sut.build_sample_table(fam(["a", "b"], [1.0, -9.0]))
 
-        fam_df = make_fam_df(N)
+        assert actual[sut.SAMPLE_HAS_PHENO_COL].tolist() == [True, False]
+        assert actual[sut.SAMPLE_IN_ANALYSIS_COL].tolist() == [True, False]
 
-        actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
-            sut.process_phenotypes(fam_file=fam_df)
+    def test__phenotype_file__is_the_only_source(self):
+        # b's fam phenotype is ignored once a phenotype file is given, since the file does not
+        # list b; c is listed with a missing value
+        pheno = grma_io.read_pheno(ids(["a", "c"]).assign(**{bbf.FAM_PHENO_COL : [5.0, -9.0]}))
 
-        # Without covariates, phenotypes are still regressed on an intercept, i.e. centered
-        # (notes §13.5)
-        expected_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy(dtype=float)
-        expected_pheno = expected_pheno - expected_pheno.mean()
+        actual = sut.build_sample_table(fam(["a", "b", "c"], [1.0, 2.0, 3.0]), pheno=pheno)
 
-        assert actual_N == actual_N_orig
-        assert actual_N == N
-        assert np.array_equal(actual_indices, np.arange(N))
-        assert fam_df[sut.FAM_KEY].equals(actual_id_df)
-        assert np.allclose(actual_pheno, expected_pheno)
+        assert actual[sut.SAMPLE_PHENO_COL].iloc[0] == 5.0
+        assert actual[sut.SAMPLE_HAS_PHENO_COL].tolist() == [True, False, False]
+        assert actual[sut.SAMPLE_IN_ANALYSIS_COL].tolist() == [True, False, False]
 
+    def test__covariates__aligned_and_incomplete_ones_excluded(self):
+        # Listed out of order; b has a missing covariate; c is absent from the file
+        covar = grma_io.read_covar(ids(["b", "a"]).assign(age=[np.nan, 40.0], pc1=[0.1, 0.2]))
 
-    @pytest.mark.parametrize("rng_seed", [90, 456])
-    def test__randomized_phenos__expected_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
+        actual = sut.build_sample_table(fam(["a", "b", "c"], [1.0, 2.0, 3.0]), covar=covar)
 
-        N = 100 + rng.integers(1, 100)
+        assert actual["COVAR_1"].iloc[0] == 40.0 and actual["COVAR_2"].iloc[0] == 0.2
+        assert actual[sut.SAMPLE_IN_ANALYSIS_COL].tolist() == [True, False, False]
+        # A covariate's absence affects only the analysis, not whether there is a phenotype
+        assert actual[sut.SAMPLE_HAS_PHENO_COL].tolist() == [True, True, True]
 
-        fam_df = make_fam_df(N)
-        phenotypes = 10.0 * rng.random(N) + 1.0
-        fam_df[bbf.FAM_PHENO_COL] = phenotypes
+    def test__id_list__restricts_the_analysis(self):
+        actual = sut.build_sample_table(fam(["a", "b", "c"], [1.0, 2.0, 3.0]),
+                                        id_list=grma_io.read_id_list(ids(["c", "a"])))
 
-        actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
-            sut.process_phenotypes(fam_file=fam_df)
+        assert actual[sut.SAMPLE_IN_ANALYSIS_COL].tolist() == [True, False, True]
 
-        assert actual_N_orig == N
-        assert actual_N == N
-        assert np.array_equal(actual_indices, np.arange(N))
-        assert fam_df[sut.FAM_KEY].equals(actual_id_df)
-        assert np.allclose(actual_pheno, phenotypes - phenotypes.mean())
+    def test__all_filters_together__a_sample_must_pass_every_one(self):
+        pheno = grma_io.read_pheno(ids(["a", "b", "c", "d"]).assign(
+            **{bbf.FAM_PHENO_COL : [1.0, 2.0, 3.0, -9.0]}))
+        covar = grma_io.read_covar(ids(["a", "b", "d"]).assign(age=[1.0, 2.0, 4.0]))
 
+        id_list = grma_io.read_id_list(ids(["a", "c", "d"]))
 
-    @pytest.mark.parametrize("rng_seed", [7, 2024])
-    def test__no_covariates__same_as_regressing_on_intercept_alone(self, rng_seed):
-        """Centering is the covariate regression with no covariate columns.  A covariate that is
-        zero for everyone contributes nothing, so only the intercept is fitted."""
+        actual = sut.build_sample_table(fam(["a", "b", "c", "d"], [0.0] * 4), pheno=pheno,
+                                        covar=covar, id_list=id_list)
 
-        rng = np.random.default_rng(seed=rng_seed)
-        N = 50 + rng.integers(1, 50)
+        # a: passes all; b: not in ID list; c: no covariates; d: missing phenotype
+        assert actual[sut.SAMPLE_IN_ANALYSIS_COL].tolist() == [True, False, False, False]
 
-        fam_df = make_fam_df(N)
-        fam_df[bbf.FAM_PHENO_COL] = 10.0 * rng.random(N) + 5.0
-        zero_covar_df = fam_df[[bbf.FAM_FID_COL, bbf.FAM_IID_COL]].copy()
-        zero_covar_df["COVAR"] = 0.0
+    @pytest.mark.parametrize("which", ["fam", "pheno", "covar", "id_list"])
+    def test__repeated_sample_in_any_input__raises_naming_it(self, which):
+        inputs = dict(fam=fam(["a", "b"], [1.0, 2.0]), pheno=None, covar=None, id_list=None)
+        repeated = ids(["a", "b", "b"])
+        if which == "fam":
+            inputs["fam"] = fam(["a", "b", "b"], [1.0, 2.0, 3.0])
+        elif which == "pheno":
+            inputs["pheno"] = grma_io.read_pheno(repeated.assign(**{bbf.FAM_PHENO_COL : 1.0}))
+        elif which == "covar":
+            inputs["covar"] = grma_io.read_covar(repeated.assign(age=1.0))
+        else:
+            inputs["id_list"] = grma_io.read_id_list(repeated)
 
-        *_, without_covars = sut.process_phenotypes(fam_file=fam_df)
-        *_, with_zero_covar = sut.process_phenotypes(fam_file=fam_df, covar_file=zero_covar_df)
+        with pytest.raises(ValueError, match="more than once") as error:
+            sut.build_sample_table(**inputs)
 
-        assert np.allclose(without_covars, with_zero_covar)
-        assert np.isclose(without_covars.mean(), 0.0)
+        assert "F b" in str(error.value)
 
+    def test__nobody_left_in_the_analysis__raises(self):
+        with pytest.raises(ValueError, match="No sample is left"):
+            sut.build_sample_table(fam(["a", "b"], [-9.0, -9.0]))
 
-    @pytest.mark.parametrize("rng_seed", [37, 268])
-    def test__fam_file_with_nans__nan_rows_dropped(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
+    def test__sex__carried_as_text(self):
+        actual = sut.build_sample_table(fam(["a", "b"], [1.0, 2.0], sexes=["1", "2"]))
 
-        N = 100 + rng.integers(1, 100)
+        assert actual[sut.SAMPLE_SEX_COL].tolist() == ["1", "2"]
 
-        num_nan = rng.integers(1, N // 10 + 1)
-        nan_indices = rng.choice(N, size=num_nan, replace=False)
 
-        fam_df = make_fam_df(N)
-        fam_df.loc[nan_indices, bbf.FAM_PHENO_COL] = np.nan
+# --------------------------------------------------------------------------------------------------
+class TestBuildRelatednessGraph:
 
-        expected_dropped = fam_df.iloc[nan_indices]
+    def test__pairs__as_rows_in_order_with_relationships(self):
+        samples = samples_of(["a", "b", "c", "d", "e", "f"])
 
-        actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
-            sut.process_phenotypes(fam_file=fam_df)
+        actual = graph_of(samples, [("b", "a", "PO"), ("a", "c", "FS"), ("d", "a", "2nd"),
+                                    ("a", "e", "3rd"), ("f", "a", "Dup/MZTwin")])
 
-        assert actual_N_orig == N
-        assert actual_N == N - num_nan
-        assert not expected_dropped[bbf.FAM_FID_COL].isin(actual_id_df[bbf.FAM_FID_COL]).any()
-        assert not expected_dropped[bbf.FAM_IID_COL].isin(actual_id_df[bbf.FAM_IID_COL]).any()
-        assert not np.any(np.isnan(actual_pheno))
+        assert pairs(actual) == {(0, 1, sut.RELATIONSHIP_PO), (0, 2, sut.RELATIONSHIP_FS),
+                                 (0, 3, sut.RELATIONSHIP_2ND), (0, 4, sut.RELATIONSHIP_3RD),
+                                 (0, 5, sut.RELATIONSHIP_DUPLICATE)}
 
+    def test__fourth_degree_and_unrelated__left_out(self):
+        samples = samples_of(["a", "b", "c"])
 
-    @pytest.mark.parametrize("rng_seed", [6, 8923])
-    def test__sample_id_file__expected_filtering(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
+        assert len(graph_of(samples, [("a", "b", "4th"), ("a", "c", "UN")])) == 0
 
-        N = 100 + rng.integers(1, 100)
+    def test__sample_not_in_the_fam_file__pair_ignored(self, caplog):
+        samples = samples_of(["a", "b"])
 
-        num_samples = rng.integers(N // 10 + 1, 9 * (N // 10))
-        sample_indices = rng.choice(N, size=num_samples, replace=False)
+        with caplog.at_level(logging.INFO):
+            actual = graph_of(samples, [("a", "b", "FS"), ("a", "stranger", "FS")])
 
-        fam_df = make_fam_df(N)
-        sample_df = fam_df[[bbf.FAM_FID_COL, bbf.FAM_IID_COL]].iloc[sample_indices].copy()
+        assert pairs(actual) == {(0, 1, sut.RELATIONSHIP_FS)}
+        assert "not in the fam file" in caplog.text
 
+    def test__neither_sample_in_the_analysis__pair_left_out(self):
+        samples = samples_of(["a", "b", "c"], in_analysis={"a"})
 
-        actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
-            sut.process_phenotypes(fam_file=fam_df, sample_id_file=sample_df)
+        actual = graph_of(samples, [("b", "c", "FS"), ("a", "b", "PO")])
 
-        assert actual_N_orig == N
-        assert actual_N == num_samples
-        assert sample_df[bbf.FAM_FID_COL].isin(actual_id_df[bbf.FAM_FID_COL]).all()
-        assert sample_df[bbf.FAM_IID_COL].isin(actual_id_df[bbf.FAM_IID_COL]).all()
-        assert set(zip(actual_id_df[bbf.FAM_FID_COL], actual_id_df[bbf.FAM_IID_COL])) == \
-               set(zip(sample_df[bbf.FAM_FID_COL], sample_df[bbf.FAM_IID_COL]))
-        assert len(actual_id_df) == num_samples
+        # b-c can never be used; a-b can, since a is in the analysis
+        assert pairs(actual) == {(0, 1, sut.RELATIONSHIP_PO)}
 
+    def test__inftype_king_does_not_define__raises(self):
+        samples = samples_of(["a", "b"])
 
-    @pytest.mark.parametrize("rng_seed", [16, 18923])
-    def test__pheno_file__expected_pheno_values(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
+        with pytest.raises(ValueError, match="does not define") as error:
+            graph_of(samples, [("a", "b", "cousin")])
 
-        N = 100 + rng.integers(1, 100)
+        assert "cousin" in str(error.value)
 
-        num_phenos = rng.integers(N // 10 + 1, 9 * (N // 10))
-        pheno_indices = rng.choice(N, size=num_phenos, replace=False)
+    def test__sample_paired_with_itself__raises(self):
+        samples = samples_of(["a", "b"])
 
-        fam_df = make_fam_df(N)
-        phenotypes = 10.0 * rng.random(num_phenos) + 1.0
-        pheno_df = fam_df[[bbf.FAM_FID_COL, bbf.FAM_IID_COL, bbf.FAM_PHENO_COL]].iloc[pheno_indices].copy()
+        with pytest.raises(ValueError, match="with themselves") as error:
+            graph_of(samples, [("a", "a", "FS")])
 
-        pheno_df[bbf.FAM_PHENO_COL] = phenotypes
+        assert "a" in str(error.value)
 
-        actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
-            sut.process_phenotypes(fam_file=fam_df, pheno_file=pheno_df)
+    def test__pair_given_two_relationships__raises_naming_both(self):
+        samples = samples_of(["a", "b"])
 
-        assert actual_N_orig == N
-        assert actual_N == num_phenos
-        # Centered on the mean of the samples kept, not of the whole fam file (notes §13.5)
-        expected_pheno = pheno_df[bbf.FAM_PHENO_COL].sort_index().to_numpy()
-        assert np.allclose(actual_pheno, expected_pheno - expected_pheno.mean())
-        assert pheno_df[bbf.FAM_FID_COL].isin(actual_id_df[bbf.FAM_FID_COL]).all()
-        assert pheno_df[bbf.FAM_IID_COL].isin(actual_id_df[bbf.FAM_IID_COL]).all()
-        assert len(actual_id_df) == num_phenos
+        with pytest.raises(ValueError, match="more than one relationship") as error:
+            graph_of(samples, [("a", "b", "FS"), ("b", "a", "2nd")])
 
+        assert "a-b" in str(error.value)
+        assert "FS" in str(error.value) and "2nd" in str(error.value)
 
-    @pytest.mark.parametrize("rng_seed", [215, 887])
-    def test__covar_file__expected_residualization(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
+    def test__contradiction_between_two_unused_samples__ignored(self):
+        samples = samples_of(["a", "b", "c"], in_analysis={"a"})
 
-        N = 100
-        num_covariates = rng.integers(4,10)
-        covar_names = [f"COVAR_{covar_num+1}" for covar_num in range(num_covariates)]
+        actual = graph_of(samples, [("b", "c", "FS"), ("b", "c", "2nd"), ("a", "b", "PO")])
 
-        fam_df = make_fam_df(N)
-        orig_phenotypes = fam_df[bbf.FAM_PHENO_COL].to_numpy().copy()
-        covariates = np.hstack([(10.0 * rng.random(size=(N, num_covariates)) - 5.0), np.ones((N,1))])
-        covar_df = pd.DataFrame({bbf.FAM_FID_COL : fam_df[bbf.FAM_FID_COL],
-                                 bbf.FAM_IID_COL : fam_df[bbf.FAM_IID_COL]} |
-                                {covar_names[i] : covariates[:, i].ravel()
-                                    for i in range(num_covariates)
-                                })
+        assert pairs(actual) == {(0, 1, sut.RELATIONSHIP_PO)}
 
-        x, _, _, _ = np.linalg.lstsq(a = covariates, b = orig_phenotypes, rcond = None)
-        expected_pheno = orig_phenotypes - covariates @ x
+    def test__pair_repeated_either_way_round__kept_once_with_a_warning(self, caplog):
+        samples = samples_of(["a", "b"])
 
-        actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
-            sut.process_phenotypes(fam_file=fam_df, covar_file=covar_df)
+        with caplog.at_level(logging.WARNING):
+            actual = graph_of(samples, [("a", "b", "FS"), ("b", "a", "FS"), ("a", "b", "FS")])
 
-        assert np.allclose(actual_pheno, expected_pheno, equal_nan=True)
+        assert len(actual) == 1
+        assert "more than once" in caplog.text and "a-b" in caplog.text
 
 
-    def test__covar_file_with_nans__nan_rows_dropped(self):
-        pass
+# --------------------------------------------------------------------------------------------------
+class TestResolveDuplicates:
 
+    def test__no_duplicates__nothing_dropped(self):
+        samples, graph = resolved(["a", "b"], [("a", "b", "FS")])
 
-    def test__invalid_covar_file__expected_error(self):
-        N = 100
+        assert samples[sut.SAMPLE_DUPLICATE_OF_COL].tolist() == [-1, -1]
+        assert pairs(graph) == {(0, 1, sut.RELATIONSHIP_FS)}
 
-        invalid_covar_df = pd.DataFrame(data={bbf.FAM_FID_COL : list(range(N)),
-                                              bbf.FAM_IID_COL : list(range(N))})
+    def test__pair__the_earlier_kept_the_later_dropped(self):
+        samples, graph = resolved(["a", "b", "c"], [("a", "b", "Dup/MZTwin"), ("b", "c", "FS"),
+                                                    ("a", "c", "FS")])
 
-        fam_df = make_fam_df(N)
+        assert samples[sut.SAMPLE_DUPLICATE_OF_COL].tolist() == [-1, 0, -1]
+        assert samples[sut.SAMPLE_IN_ANALYSIS_COL].tolist() == [True, False, True]
+        # The duplicate pair itself, and every pair involving b, are gone
+        assert pairs(graph) == {(0, 2, sut.RELATIONSHIP_FS)}
 
-        with pytest.raises(ValueError) as ex_info:
-            actual_N_orig, actual_N, actual_indices, actual_id_df, actual_pheno = \
-                sut.process_phenotypes(fam_file=fam_df, covar_file=invalid_covar_df)
+    def test__earlier_not_in_the_analysis__the_one_in_it_kept(self):
+        samples, _ = resolved(["a", "b"], [("a", "b", "Dup/MZTwin")], in_analysis={"b"})
 
-    def test__all_inputs__expected_results(self):
-        pass
+        assert samples[sut.SAMPLE_DUPLICATE_OF_COL].tolist() == [1, -1]
+        assert samples[sut.SAMPLE_IN_ANALYSIS_COL].tolist() == [False, True]
 
-    @pytest.mark.parametrize("rng_seed", [316, 765765])
-    def test__permute_fam_file_rows__permuted_results(self, rng_seed):
-        pass
+    def test__chain_of_duplicates__one_cluster_one_kept(self):
+        samples, _ = resolved(["a", "b", "c", "d"], [("c", "b", "Dup/MZTwin"),
+                                                     ("b", "a", "Dup/MZTwin")])
 
-    @pytest.mark.parametrize("rng_seed", [25, 908])
-    def test__permute_pheno_file_rows__unchanged_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
+        assert samples[sut.SAMPLE_DUPLICATE_OF_COL].tolist() == [-1, 0, 0, -1]
 
-        N = 100 + rng.integers(1, 100)
+    def test__two_separate_pairs__one_kept_from_each(self):
+        samples, _ = resolved(["a", "b", "c", "d"], [("a", "b", "Dup/MZTwin"),
+                                                     ("c", "d", "Dup/MZTwin")])
 
-        fam_df = make_fam_df(N)
-        phenotypes = 10.0 * rng.random(N) + 1.0
-        pheno_df_1 = fam_df[[bbf.FAM_FID_COL, bbf.FAM_IID_COL, bbf.FAM_PHENO_COL]].copy()
-        pheno_df_1[bbf.FAM_PHENO_COL] = phenotypes
+        assert samples[sut.SAMPLE_DUPLICATE_OF_COL].tolist() == [-1, 0, -1, 2]
 
-        actual_N_orig_1, actual_N_1, actual_indices_1, actual_id_df_1, actual_pheno_1 = \
-            sut.process_phenotypes(fam_file=fam_df, pheno_file=pheno_df_1)
+    def test__pair_left_with_neither_in_the_analysis__removed(self):
+        # c is not in the analysis, and its only link to it was through b, now dropped
+        samples, graph = resolved(["a", "b", "c"], [("a", "b", "Dup/MZTwin"), ("b", "c", "FS")],
+                                  in_analysis={"a", "b"})
 
-        pheno_df_2 = pheno_df_1.sample(frac=1, random_state=rng).reset_index(drop=True).copy()
+        assert len(graph) == 0
 
-        actual_N_orig_2, actual_N_2, actual_indices_2, actual_id_df_2, actual_pheno_2 = \
-            sut.process_phenotypes(fam_file=fam_df, pheno_file=pheno_df_2)
 
-        assert actual_N_orig_1 == actual_N_orig_2
-        assert actual_N_1 == actual_N_2
-        assert np.array_equal(actual_indices_1, actual_indices_2)
-        assert actual_id_df_1.equals(actual_id_df_2)
-        assert np.allclose(actual_pheno_1, actual_pheno_2)
+# --------------------------------------------------------------------------------------------------
+class TestIdentifyParents:
 
+    def parents_of(self, iids, king_rows, records, families, in_analysis=None, sexes=None):
+        samples, graph = resolved(iids, king_rows, in_analysis, sexes)
+        return sut.identify_parents(samples, graph, snipar(records, families))
 
-    @pytest.mark.parametrize("rng_seed", [382, 99903])
-    def test__permute_covar_file_rows__unchanged_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
+    def test__no_snipar_file__nobody_with_a_warning(self, caplog):
+        samples, graph = resolved(["a", "b"], [("a", "b", "PO")])
 
-        N = 100
-        fam_df = make_fam_df(N)
+        with caplog.at_level(logging.WARNING):
+            actual = sut.identify_parents(samples, graph, None)
 
-        covar_df_1 = pd.DataFrame({bbf.FAM_FID_COL : fam_df[bbf.FAM_FID_COL],
-                                 bbf.FAM_IID_COL : fam_df[bbf.FAM_IID_COL],
-                                 'COVAR_1' : 10.0 * rng.random(N),
-                                 'COVAR_2' : -7.0 * rng.random(N)})
+        assert len(actual) == 0 and actual.columns.tolist() == list(sut.PARENTS_COLS)
+        assert "parent-offspring regression is omitted" in caplog.text
 
-        covar_df_2 = covar_df_1.sample(frac=1, random_state=rng).reset_index(drop=True).copy()
+    def test__both_parents_genotyped__both_rows_and_no_imputed_family(self):
+        actual = self.parents_of(["dad", "mum", "kid"],
+                                 [("dad", "kid", "PO"), ("mum", "kid", "PO")],
+                                 [("S1", "kid", "dad", "mum", True, True)], ["OTHER"])
 
-        N_orig_1, N_1, ind_1, fam_cols_1, pheno_1 = \
-            sut.process_phenotypes(fam_file=fam_df, covar_file=covar_df_1)
+        assert actual.values.tolist() == [[2, 0, 1, -1]]
 
+    def test__one_parent_genotyped__other_absent_and_imputed_family_found(self):
+        actual = self.parents_of(["dad", "kid"], [("dad", "kid", "PO")],
+                                 [("S1", "kid", "dad", "mum", True, False)], ["S0", "S1"])
 
-        N_orig_2, N_2, ind_2, fam_cols_2, pheno_2 = \
-            sut.process_phenotypes(fam_file=fam_df, covar_file=covar_df_2)
+        assert actual.values.tolist() == [[1, 0, -1, 1]]
 
-        assert N_orig_1 == N_orig_2
-        assert N_1 == N_2
-        assert np.array_equal(ind_1, ind_2)
-        assert fam_cols_1.equals(fam_cols_2)
-        assert np.allclose(pheno_1, pheno_2)
+    def test__child_not_in_the_analysis__left_out(self):
+        actual = self.parents_of(["dad", "kid"], [("dad", "kid", "PO")],
+                                 [("S1", "kid", "dad", "mum", True, False)], ["S1"],
+                                 in_analysis={"dad"})
 
+        assert len(actual) == 0
 
-    @pytest.mark.parametrize("rng_seed", [17, 85])
-    def test__permute_covar_file_cols__unchanged_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
+    def test__no_parent_genotyped__left_out(self):
+        actual = self.parents_of(["kid"], [],
+                                 [("S1", "kid", "dad", "mum", False, False)], ["S1"])
 
-        N = 100
-        fam_df = make_fam_df(N)
+        assert len(actual) == 0
 
-        covar_df_1 = pd.DataFrame({bbf.FAM_FID_COL : fam_df[bbf.FAM_FID_COL],
-                                 bbf.FAM_IID_COL : fam_df[bbf.FAM_IID_COL],
-                                 'COVAR_1' : 10.0 * rng.random(N),
-                                 'COVAR_2' : -7.0 * rng.random(N),
-                                 'COVAR_3' : 4.5 * rng.random(N)})
+    def test__parent_zero__means_no_parent_even_with_a_sample_named_zero(self):
+        # snipar writes "0" for a missing parent, as a fam file does.  A sample whose IID is "0"
+        # must not be taken for that parent.
+        actual = self.parents_of(["0", "mum", "kid"], [("mum", "kid", "PO")],
+                                 [("S1", "kid", "0", "mum", False, True)], ["S1"])
 
-        covar_df_2 = covar_df_1[[bbf.FAM_FID_COL, bbf.FAM_IID_COL,
-                                 'COVAR_2', 'COVAR_3', 'COVAR_1']].copy()
+        assert actual.values.tolist() == [[2, -1, 1, 0]]
 
-        N_orig_1, N_1, ind_1, fam_cols_1, pheno_1 = \
-            sut.process_phenotypes(fam_file=fam_df, covar_file=covar_df_1)
-        
+    def test__parent_dropped_as_a_duplicate__replaced_by_the_one_kept(self):
+        # mum and her twin are duplicates; the twin, later in the fam file, is dropped
+        actual = self.parents_of(["mum", "twin", "kid"],
+                                 [("mum", "twin", "Dup/MZTwin"), ("mum", "kid", "PO"),
+                                  ("twin", "kid", "PO")],
+                                 [("S1", "kid", "0", "twin", False, True)], ["S1"])
 
-        N_orig_2, N_2, ind_2, fam_cols_2, pheno_2 = \
-            sut.process_phenotypes(fam_file=fam_df, covar_file=covar_df_2)
+        assert actual.values.tolist() == [[2, -1, 0, 0]]
 
-        assert N_orig_1 == N_orig_2
-        assert N_1 == N_2
-        assert np.array_equal(ind_1, ind_2)
-        assert fam_cols_1.equals(fam_cols_2)
-        assert np.allclose(pheno_1, pheno_2)
+    def test__child_dropped_as_a_duplicate__not_replaced(self):
+        actual = self.parents_of(["dad", "kid", "kid_dup"],
+                                 [("kid", "kid_dup", "Dup/MZTwin"), ("dad", "kid", "PO"),
+                                  ("dad", "kid_dup", "PO")],
+                                 [("S1", "kid", "dad", "0", True, False),
+                                  ("S1", "kid_dup", "dad", "0", True, False)], ["S1"])
 
+        assert actual[sut.PARENTS_CHILD_COL].tolist() == [1]
 
+    def test__iid_named_by_snipar_shared_by_two_samples__raises(self):
+        samples = sut.build_sample_table(grma_io.read_fam(pd.DataFrame({
+            bbf.FAM_FID_COL : ["F1", "F2", "F1"], bbf.FAM_IID_COL : ["dad", "dad", "kid"],
+            bbf.FAM_IIDF_COL : "0", bbf.FAM_IIDM_COL : "0", bbf.FAM_SEX_COL : "0",
+            bbf.FAM_PHENO_COL : 1.0})))
+        graph = sut.build_relatedness_graph(samples, king([]))
 
-    @pytest.mark.parametrize("rng_seed", [125, 1908])
-    def test__permute_sample_file_rows__unchanged_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
+        with pytest.raises(ValueError, match="more than one sample") as error:
+            sut.identify_parents(*sut.resolve_duplicates(samples, graph),
+                                 snipar([("S1", "kid", "dad", "0", True, False)], ["S1"]))
 
-        N = 100 + rng.integers(1, 100)
+        assert "dad" in str(error.value)
 
-        fam_df = make_fam_df(N)
-        sample_df_1 = fam_df[[bbf.FAM_FID_COL, bbf.FAM_IID_COL]].copy()
+    def test__shared_iid_snipar_does_not_name__no_error(self):
+        samples = sut.build_sample_table(grma_io.read_fam(pd.DataFrame({
+            bbf.FAM_FID_COL : ["F1", "F2", "F1", "F1"], bbf.FAM_IID_COL : ["x", "x", "dad", "kid"],
+            bbf.FAM_IIDF_COL : "0", bbf.FAM_IIDM_COL : "0", bbf.FAM_SEX_COL : "0",
+            bbf.FAM_PHENO_COL : 1.0})))
+        rows = pd.DataFrame([("F1", "dad", "F1", "kid", "PO")], columns=list(grma_io.KING_COLS))
+        graph = sut.build_relatedness_graph(samples, grma_io.read_king(rows))
 
-        actual_N_orig_1, actual_N_1, actual_indices_1, actual_id_df_1, actual_pheno_1 = \
-            sut.process_phenotypes(fam_file=fam_df, sample_id_file=sample_df_1)
+        actual = sut.identify_parents(*sut.resolve_duplicates(samples, graph),
+                                      snipar([("S1", "kid", "dad", "0", True, False)], ["S1"]))
 
-        sample_df_2 = sample_df_1.sample(frac=1, random_state=rng).reset_index(drop=True).copy()
+        assert actual.values.tolist() == [[3, 2, -1, 0]]
 
-        actual_N_orig_2, actual_N_2, actual_indices_2, actual_id_df_2, actual_pheno_2 = \
-            sut.process_phenotypes(fam_file=fam_df, sample_id_file=sample_df_2)
+    @pytest.mark.parametrize("has_father, has_mother", [(False, False), (True, True)])
+    def test__snipar_disagrees_about_which_parents_are_genotyped__raises(self, has_father,
+                                                                         has_mother):
+        # Only dad is in the fam file; snipar says neither, or both
+        with pytest.raises(ValueError, match="disagree about which parents") as error:
+            self.parents_of(["dad", "kid"], [("dad", "kid", "PO")],
+                            [("S1", "kid", "dad", "mum", has_father, has_mother)], ["S1"])
 
-        assert actual_N_orig_1 == actual_N_orig_2
-        assert actual_N_1 == actual_N_2
-        assert np.array_equal(actual_indices_1, actual_indices_2)
-        assert actual_id_df_1.equals(actual_id_df_2)
-        assert np.allclose(actual_pheno_1, actual_pheno_2)
+        assert "kid" in str(error.value)
+        assert "same fileset" in str(error.value)
 
-    def test__zero__intersection__expected_error(self):
-        pass
+    def test__parent_king_does_not_confirm__raises_naming_child_and_parent(self):
+        with pytest.raises(ValueError, match="does not classify as parent-offspring") as error:
+            self.parents_of(["dad", "kid"], [("dad", "kid", "FS")],
+                            [("S1", "kid", "dad", "0", True, False)], ["S1"])
 
-class TestCalculateOmega:
+        assert "kid (father dad)" in str(error.value)
 
-    def test__already_PSD__no_change(self):
-        # 1 pair (0,1) at degree 1; pheno chosen so pheno_variance >> |pair_cov|.
-        # For a single pair, pair_cov = -1.0 exactly (analytically), while pheno_var = 24.4.
-        # Since lambda_min(off_diag) = -1.0 > -24.4 = -pheno_var, the full
-        # omega = pheno_var*I + off_diag is already PSD, so alpha = 1.0 (no shrinkage).
-        N = 5
-        pheno = np.array([1.0, -1.0, 10.0, 10.0, 10.0])
-        rel_df = pd.DataFrame({
-            sut.FAM_INDEX_1: [0],
-            sut.FAM_INDEX_2: [1],
-            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING],
-        })
+    def test__child_listed_twice__raises(self):
+        with pytest.raises(ValueError, match="more than once"):
+            self.parents_of(["dad", "kid"], [("dad", "kid", "PO")],
+                            [("S1", "kid", "dad", "0", True, False),
+                             ("S1", "kid", "dad", "0", True, False)], ["S1"])
 
-        actual_omega = sut.calculate_omega(rel_df=rel_df, N=N, unresidualized_phenotypes=pheno,
-            labels=sut.get_relatedness_components(rel_df, N))
+    def test__same_sex_parents__warning_only(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            actual = self.parents_of(["p1", "p2", "kid"],
+                                     [("p1", "kid", "PO"), ("p2", "kid", "PO")],
+                                     [("S1", "kid", "p1", "p2", True, True)], ["S1"],
+                                     sexes=["2", "2", "0"])
 
-        # Expected: pheno_var * I + 1.0 * off_diag  (alpha = 1.0, no shrinkage applied)
-        pheno_var = np.var(pheno)
-        pair_cov = np.cov(pheno[[0, 1]], pheno[[1, 0]], ddof=0)[0, 1]  # = -1.0
-        expected_off_diag = sp.coo_array(
-            (np.array([pair_cov, pair_cov]), ([0, 1], [1, 0])), shape=(N, N)
-        ).tocsr()
-        expected_omega = pheno_var * sp.eye(N) + expected_off_diag
+        assert len(actual) == 1
+        assert "same recorded sex" in caplog.text
 
-        assert np.allclose(actual_omega.toarray(), expected_omega.toarray())
+    def test__unknown_sexes__no_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            self.parents_of(["p1", "p2", "kid"], [("p1", "kid", "PO"), ("p2", "kid", "PO")],
+                            [("S1", "kid", "p1", "p2", True, True)], ["S1"])
 
-    def test__not_PSD__shrink_as_expected(self):
-        # 1 pair (0,1) at degree 1; pheno chosen so pheno_variance < |pair_cov|.
-        # For a single pair, pair_cov = -1.0 exactly, while pheno_var approx = 0.40.
-        # Since lambda_min(off_diag) = -1.0 < -0.40 = -pheno_var, the full
-        # omega = pheno_var*I + off_diag is NOT PSD, so shrinkage is applied (alpha < 1.0).
-        # Cross-validates the closed-form shrinkage formula against the mock binary search.
-        N = 5
-        pheno = np.array([1.0, -1.0, 0.1, 0.1, 0.1])
-        rel_df = pd.DataFrame({
-            sut.FAM_INDEX_1: [0],
-            sut.FAM_INDEX_2: [1],
-            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING],
-        })
+        assert "same recorded sex" not in caplog.text
 
-        # Build KING-format data for mock cross-validation
-        fam_df = pd.DataFrame({
-            bbf.FAM_FID_COL: list(range(N)),
-            bbf.FAM_IID_COL: list(range(N)),
-            bbf.FAM_IIDF_COL: 0,
-            bbf.FAM_IIDM_COL: 0,
-            bbf.FAM_SEX_COL: 0,
-            bbf.FAM_PHENO_COL: pheno,
-        })
-        king_rel_df = pd.DataFrame({
-            sut.KING_FID1_COL: [0],
-            sut.KING_IID1_COL: [0],
-            sut.KING_FID2_COL: [1],
-            sut.KING_IID2_COL: [1],
-            sut.KING_KINSHIP_COL: [0.0],
-            sut.KING_REL_COL: [sut.INF_PARENT_OFFSPRING],
-        }, columns=sut.NEEDED_KING_COLS)
+    def test__several_children__in_sample_table_order(self):
+        actual = self.parents_of(["k2", "dad", "k1"], [("dad", "k1", "PO"), ("dad", "k2", "PO")],
+                                 [("S1", "k1", "dad", "0", True, False),
+                                  ("S1", "k2", "dad", "0", True, False)], ["S1"])
 
-        actual_omega = sut.calculate_omega(rel_df=rel_df, N=N, unresidualized_phenotypes=pheno,
-            labels=sut.get_relatedness_components(rel_df, N))
+        assert actual[sut.PARENTS_CHILD_COL].tolist() == [0, 2]
 
-        # Verify result is PSD
-        actual_eigenvalues = np.linalg.eigvalsh(actual_omega.toarray())
-        assert np.all(actual_eigenvalues >= -1e-8)
 
-        # Cross-validate: closed-form formula (production) vs. binary search (mock).
-        # Both methods should find the same alpha; atol accounts for binary search precision.
-        expected_omega = helper.mock_calc_omega(
-            fam_df=fam_df, N=N, rel_df=king_rel_df, unresidualized_phenotypes=pheno
-        )
-        assert np.allclose(actual_omega.toarray(), expected_omega.toarray(), atol=1e-3)
+# --------------------------------------------------------------------------------------------------
+class TestAssignGroups:
 
+    # Everyone is in family F.  kid has a genotyped parent and a sib; sib has only kid; nephew has
+    # only a 2nd-degree relative; cousin only a 3rd-degree one; loner nobody; dad is kid's parent.
+    IIDS = ["dad", "kid", "sib", "nephew", "cousin", "loner"]
+    KING_ROWS = [("dad", "kid", "PO"), ("kid", "sib", "FS"), ("sib", "nephew", "2nd"),
+                 ("nephew", "cousin", "3rd")]
+    RECORDS = [("S1", "kid", "dad", "0", True, False)]
 
-    def test__multiple_components__only_guilty_block_shrunk(self):
-        # Two disjoint components carrying the SAME relatedness degree, so both get the same
-        # covariance rho and any difference in their shrinkage is due to STRUCTURE alone:
-        #
-        #   block A, a star 0-1 / 0-2 / 0-3   lambda_min = -rho*sqrt(3)
-        #   block B, a single pair 4-5        lambda_min = -rho
-        #
-        # The phenotypes below put var(y) between the two, so the star breaks
-        # positive-definiteness and the pair does not.  A single global alpha would shrink the
-        # innocent pair anyway; per-block leaves it untouched.
-        N = 10
-        pheno = np.array([0.680193, -0.845163, -0.010330, 0.699210, -1.368729,
-                          -1.756903, 0.215909, 0.036958, -0.204671, 0.032086])
-        rel_df = pd.DataFrame({
-            sut.FAM_INDEX_1: [0, 0, 0, 4],
-            sut.FAM_INDEX_2: [1, 2, 3, 5],
-            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING] * 4,
-        })
+    def groups(self, rel_degree, in_analysis=None, king_rows=None):
+        samples, graph = resolved(self.IIDS, king_rows or self.KING_ROWS, in_analysis)
+        parents = sut.identify_parents(samples, graph, snipar(self.RECORDS, ["S1"]))
+        actual = sut.assign_groups(samples, graph, parents, rel_degree=rel_degree)
+        return dict(zip(actual[sut.SAMPLE_IID_COL], actual[sut.SAMPLE_GROUP_COL]))
 
-        rel_to_cov = sut.get_rel_covariances(rel_df=rel_df, unresidualized_phenotypes=pheno)
-        rho = rel_to_cov[sut.DEG_PARENT_OFFSPRING]
-        pheno_var = float(np.var(pheno))
+    def test__first_group_qualified_for__exactly_one_each(self):
+        actual = self.groups(rel_degree=3)
 
-        # The premise of the test: the star breaks PD, the pair does not
-        assert rho < pheno_var < rho * np.sqrt(3.0)
-
-        omega = sut.calculate_omega(rel_df=rel_df, N=N,
-                                    unresidualized_phenotypes=pheno,
-                                    labels=sut.get_relatedness_components(rel_df, N)).toarray()
+        # kid has a parent AND a sib: PO only.  dad has a child (PO pair) but no parent, sib or
+        # 2nd/3rd-degree relative of his own: NOT_FOCAL.  sib has a 2nd-degree relative too: FS
+        # only.
+        assert actual == {"dad" : sut.GROUP_NOT_FOCAL, "kid" : sut.GROUP_PO, "sib" : sut.GROUP_FS,
+                          "nephew" : sut.GROUP_2ND, "cousin" : sut.GROUP_3RD,
+                          "loner" : sut.GROUP_NOT_FOCAL}
 
-        # The pair keeps its unshrunk covariance; the star does not
-        assert np.isclose(omega[4, 5], rho)
-        assert abs(omega[0, 1]) < abs(rho)
-        assert not np.isclose(omega[0, 1], omega[4, 5])
+    def test__relative_outside_the_analysis__does_not_qualify(self):
+        # nephew's 2nd-degree relative (sib) is out of the analysis, so nephew falls to his
+        # 3rd-degree relative
+        actual = self.groups(rel_degree=3, in_analysis={"dad", "kid", "nephew", "cousin", "loner"})
 
-        # What a single global alpha would have done to the innocent pair, for contrast
-        global_alpha = min((sut.DEFAULT_OMEGA_EPSILON - pheno_var) / (-rho * np.sqrt(3.0)), 1.0)
-        assert not np.isclose(omega[4, 5], global_alpha * rho)
+        assert actual["nephew"] == sut.GROUP_3RD
+        assert actual["sib"] is None
 
-        # And the whole matrix is still positive semi-definite
-        assert np.all(np.linalg.eigvalsh(omega) >= -1e-8)
+    @pytest.mark.parametrize("rel_degree, nephew, cousin", [
+        (0, sut.GROUP_NOT_FOCAL, sut.GROUP_NOT_FOCAL),
+        (1, sut.GROUP_NOT_FOCAL, sut.GROUP_NOT_FOCAL),
+        (2, sut.GROUP_2ND, sut.GROUP_NOT_FOCAL),
+        (3, sut.GROUP_2ND, sut.GROUP_3RD)])
+    def test__rel_degree__cuts_off_later_groups(self, rel_degree, nephew, cousin):
+        actual = self.groups(rel_degree=rel_degree)
 
+        # PO and FS run at every degree
+        assert actual["kid"] == sut.GROUP_PO and actual["sib"] == sut.GROUP_FS
+        assert actual["nephew"] == nephew and actual["cousin"] == cousin
 
-    def test__per_block_shrinkage__result_is_psd(self):
-        # The guarantee that matters: shrinking per block must still leave the whole matrix
-        # positive semi-definite.
-        rng = np.random.default_rng(20260831)
-        N = 40
-        pheno = rng.normal(size=N)
-        pairs = [(i, i + 1) for i in range(0, N - 1, 2)] + [(0, 2), (4, 6), (8, 10)]
-        rel_df = pd.DataFrame({
-            sut.FAM_INDEX_1: [p[0] for p in pairs],
-            sut.FAM_INDEX_2: [p[1] for p in pairs],
-            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING] * len(pairs),
-        })
+    @pytest.mark.parametrize("rel_degree", [-1, 4])
+    def test__rel_degree_out_of_range__raises(self, rel_degree):
+        with pytest.raises(ValueError, match="between 0 and 3"):
+            self.groups(rel_degree=rel_degree)
 
-        omega = sut.calculate_omega(rel_df=rel_df, N=N, unresidualized_phenotypes=pheno,
-            labels=sut.get_relatedness_components(rel_df, N))
+    def test__parent_outside_the_analysis__still_makes_the_child_po(self):
+        actual = self.groups(rel_degree=3, in_analysis={"kid", "sib", "nephew", "cousin", "loner"})
 
-        assert np.all(np.linalg.eigvalsh(omega.toarray()) >= -1e-8)
+        assert actual["kid"] == sut.GROUP_PO
+        assert actual["dad"] is None
 
 
-    def test__no_related_pairs__omega_is_diagonal(self):
-        # With no pairs at all every sample is its own component, off_diag is empty, and omega
-        # should come back as pheno_variance on the diagonal and nothing else.
-        N = 6
-        pheno = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-        rel_df = pd.DataFrame({
-            sut.FAM_INDEX_1: pd.Series(dtype=np.int64),
-            sut.FAM_INDEX_2: pd.Series(dtype=np.int64),
-            sut.KING_REL_COL: pd.Series(dtype=np.int64),
-        })
+# --------------------------------------------------------------------------------------------------
+# Omega
 
-        omega = sut.calculate_omega(rel_df=rel_df, N=N,
-                                    unresidualized_phenotypes=pheno,
-                                    labels=sut.get_relatedness_components(rel_df, N)).toarray()
+def planned(phenos, king_rows, records=(), families=(), rel_degree=3, covars=None):
+    """The sample table through select_omega_sample(), with its graph and parents
 
-        assert np.allclose(omega, np.var(pheno) * np.eye(N))
+    phenos maps each IID, in fam order, to its phenotype (-9 for missing); covars, where given, maps
+    each IID to its covariate values.
+    """
+    iids = list(phenos)
+    covar = None
+    if covars is not None:
+        rows = [["F", iid, *values] for iid, values in covars.items()]
+        covar = grma_io.read_covar(pd.DataFrame(rows))
+    samples = sut.build_sample_table(fam(iids, list(phenos.values())), covar=covar)
+    samples, graph = sut.resolve_duplicates(samples, sut.build_relatedness_graph(samples,
+                                                                                 king(king_rows)))
+    parents = sut.identify_parents(samples, graph,
+                                   snipar(list(records), list(families)) if records else None)
+    samples = sut.assign_groups(samples, graph, parents, rel_degree=rel_degree)
+    return sut.select_omega_sample(samples, parents), graph, parents
 
 
-    def test__all_blocks_pass_gershgorin_screen__no_shrinkage(self):
-        # When every block's largest absolute row sum is below pheno_variance, the screen proves
-        # all of them definite and no eigendecomposition happens at all.  Exercises the
-        # early-return path in get_block_alphas().
-        N = 8
-        pheno = np.array([12.0, -11.0, 9.0, -13.0, 10.0, -9.0, 11.0, -12.0])
-        rel_df = pd.DataFrame({
-            sut.FAM_INDEX_1: [0, 2, 4],
-            sut.FAM_INDEX_2: [1, 3, 5],
-            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING] * 3,
-        })
+def omega_members(samples):
+    in_omega = samples[sut.SAMPLE_OMEGA_IDX_COL] != -1
+    return samples.loc[in_omega, sut.SAMPLE_IID_COL].tolist()
 
-        rel_to_cov = sut.get_rel_covariances(rel_df=rel_df, unresidualized_phenotypes=pheno)
-        rho = rel_to_cov[sut.DEG_PARENT_OFFSPRING]
 
-        # Premise: each block is a bare pair, so its row sum is |rho|, comfortably under var(y)
-        assert abs(rho) < float(np.var(pheno))
+class TestSelectOmegaSample:
 
-        omega = sut.calculate_omega(rel_df=rel_df, N=N,
-                                    unresidualized_phenotypes=pheno,
-                                    labels=sut.get_relatedness_components(rel_df, N)).toarray()
+    # dad is kid's genotyped parent but focal in no regression; kid is PO; sib is FS; loner is
+    # related to nobody
+    PHENOS = {"dad" : 1.0, "kid" : 2.0, "sib" : 3.0, "loner" : 4.0}
+    KING_ROWS = [("dad", "kid", "PO"), ("dad", "sib", "PO"), ("kid", "sib", "FS")]
+    RECORDS = [("S1", "kid", "dad", "0", True, False), ("S1", "sib", "dad", "0", True, False)]
 
-        # No shrinkage anywhere -- every off-diagonal entry is the raw covariance
-        assert np.isclose(omega[0, 1], rho)
-        assert np.isclose(omega[2, 3], rho)
-        assert np.isclose(omega[4, 5], rho)
+    def test__focal_samples_and_parents_in__others_out(self):
+        samples, _, _ = planned(self.PHENOS, self.KING_ROWS, self.RECORDS, ["S1"])
 
+        assert omega_members(samples) == ["dad", "kid", "sib"]
+        assert samples[sut.SAMPLE_OMEGA_IDX_COL].tolist() == [0, 1, 2, -1]
 
-    def test__degree_without_covariance__expected_error(self):
-        # get_rel_covariances() keys rel_to_cov over range(SE_RELATEDNESS + 1), so a degree above
-        # that maps to NaN.  process_relatedness() filters those out before calling this function,
-        # so it is unreachable in normal use -- but a NaN must not pass silently, because the
-        # Gershgorin screen compares against a row sum and every comparison against NaN is False.
-        # The block would keep alpha=1, skip its eigendecomposition, and poison omega.
-        N = 4
-        pheno = np.array([1.0, 2.0, 3.0, 4.0])
-        rel_df = pd.DataFrame({
-            sut.FAM_INDEX_1: [0, 2],
-            sut.FAM_INDEX_2: [1, 3],
-            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING, sut.DEG_4TH],
-        })
+    def test__parent_outside_the_analysis__not_in_omega(self):
+        samples, _, _ = planned({**self.PHENOS, "dad" : -9.0}, self.KING_ROWS, self.RECORDS,
+                                ["S1"])
 
-        with pytest.raises(ValueError) as ex_info:
-            sut.calculate_omega(rel_df=rel_df, N=N, unresidualized_phenotypes=pheno,
-                labels=sut.get_relatedness_components(rel_df, N))
+        assert omega_members(samples) == ["kid", "sib"]
 
-        assert str(sut.DEG_4TH) in str(ex_info.value)
+    def test__sample_only_beyond_rel_degree__not_in_omega(self):
+        phenos = {"a" : 1.0, "b" : 2.0, "c" : 3.0}
+        samples, _, _ = planned(phenos, [("a", "b", "FS"), ("b", "c", "2nd")], rel_degree=1)
 
+        # c's only relative is 2nd-degree, beyond the cut-off, so c is focal in nothing
+        assert omega_members(samples) == ["a", "b"]
 
-class TestProcessRelatedness:
+    def test__nobody_used_by_any_regression__raises(self):
+        with pytest.raises(ValueError, match="No sample is used by any regression"):
+            planned({"a" : 1.0, "b" : 2.0}, [])
 
-    @pytest.mark.parametrize("tc_key, rel_degree", tcs.params("process_relatedness"))
-    def test__precanned_tcs__expected_results(self, tc_key, rel_degree, tmp_path):
-        rel_df, full_fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
 
-        # The analysis sample as the case states or the mocks derive it, in the form
-        # process_phenotypes() hands on -- rather than produced by production's process_phenotypes()
-        analysis = tcs.get(tc_key, "ANALYSIS_IIDS")
-        fam_df = full_fam_df[full_fam_df[bbf.FAM_IID_COL].astype(str).isin(analysis)].reset_index(
-            drop=True)
-        unres_pheno = tcs.get(tc_key, "PHENOTYPES")
+class TestPreparePhenotypes:
 
-        expected_R = tcs.get(tc_key, "R_MATRICES", rel_degree)
-        expected_R = expected_R.toarray() if sp.issparse(expected_R) else expected_R
-        expected_res_pheno = tcs.get(tc_key, "RESID_PHENOS", rel_degree)
-        expected_affected = sorted(a for a in tcs.get(tc_key, "AFFECTED") if a in analysis)
+    def test__no_covariates__centered_on_omega_samples_only(self):
+        # loner is in the analysis but not in Omega, so must not affect the mean
+        samples, _, _ = planned({"a" : 1.0, "b" : 5.0, "loner" : 100.0}, [("a", "b", "FS")])
 
-        # gls_weights is the pseudo-inverse of R @ omega @ R.T.  Production inverts it block by
-        # block over the relatedness components; the mocks take one pinv over the whole matrix, a
-        # separate route to the same answer.  Every input here is well-conditioned (worst condition
-        # number about 25), so the values can be compared directly.  If a case ever makes these
-        # matrices near-singular, fix the case rather than weakening this check -- see notes §7.4j
-        # for what happened last time.
-        expected_gls_weights = tcs.get(tc_key, "GLS_WEIGHTS", rel_degree)
+        assert np.allclose(sut.prepare_phenotypes(samples), [-2.0, 2.0])
 
+    def test__covariates__matches_a_separate_least_squares_solve(self):
+        phenos = {"a" : 1.0, "b" : 4.0, "c" : 2.0, "d" : 7.0, "e" : 3.0}
+        covars = {"a" : [30, 0.1], "b" : [40, -0.4], "c" : [35, 0.2], "d" : [50, 0.3],
+                  "e" : [45, -0.1]}
+        samples, _, _ = planned(phenos, [("a", "b", "FS"), ("c", "d", "FS"), ("d", "e", "FS")],
+                                covars=covars)
 
-        actual_R, actual_gls_weights, actual_res_pheno, actual_parental = \
-            sut.process_relatedness(rel_file=rel_df, fam_df=fam_df, rel_degree=rel_degree,
-                                    unresidualized_phenotypes=unres_pheno, fam_file=full_fam_df,
-                                    imputed_parental_file=tcs.write_imputed_file(tc_key, tmp_path))
+        actual = sut.prepare_phenotypes(samples)
 
+        y = np.array(list(phenos.values()))
+        X = np.column_stack([np.array(list(covars.values()), dtype=float), np.ones(5)])
+        expected = y - X @ np.linalg.solve(X.T @ X, X.T @ y)
+        assert np.allclose(actual, expected)
 
-        # affected_samples are positions in the full, unfiltered fam file
-        all_iids = full_fam_df[bbf.FAM_IID_COL].astype(str).to_numpy()
-        assert sorted(all_iids[actual_parental.affected_samples]) == expected_affected
-        assert np.allclose(expected_R, actual_R.toarray(), atol=0.001)
-        assert np.allclose(expected_res_pheno, actual_res_pheno, atol=0.001)
-        assert np.allclose(expected_gls_weights, actual_gls_weights.toarray(), atol=1e-6)
+    def test__phenotypes_shifted_by_a_constant__unchanged(self):
+        base = {"a" : 1.0, "b" : 5.0, "c" : 2.0}
+        rows = [("a", "b", "FS"), ("b", "c", "FS")]
+        samples, _, _ = planned(base, rows)
+        shifted, _, _ = planned({k : v + 10.0 for k, v in base.items()}, rows)
 
+        assert np.allclose(sut.prepare_phenotypes(samples), sut.prepare_phenotypes(shifted))
 
-    # ---- The same pair listed more than once (notes §7.4f) ----------------------------------
-    #
-    # Each runs TWO_FAMILY with a KING file that lists one pair again, and compares everything
-    # process_relatedness() returns against the same file without the repeat.
+    def test__all_phenotypes_the_same__raises(self):
+        samples, _, _ = planned({"a" : 3.0, "b" : 3.0}, [("a", "b", "FS")])
+
+        with pytest.raises(ValueError, match="nothing to estimate"):
+            sut.prepare_phenotypes(samples)
+
+    def test__covariate_explains_everything__raises(self):
+        samples, _, _ = planned({"a" : 2.0, "b" : 4.0}, [("a", "b", "FS")],
+                                covars={"a" : [1.0], "b" : [2.0]})
+
+        with pytest.raises(ValueError, match="nothing to estimate"):
+            sut.prepare_phenotypes(samples)
+
+
+class TestGetRelationshipCovariances:
+
+    def test__mean_over_distinct_samples__each_counted_once(self):
+        # p is in three PO pairs, with children valued 1, 2 and 6.  The mean counts p once:
+        # (4 + 1 + 2 + 6) / 4 = 3.25.  Averaging over pair members instead would count p three
+        # times and give 3.5.
+        phenotypes = np.array([4.0, 1.0, 2.0, 6.0])
+        first, second = np.array([0, 0, 0]), np.array([1, 2, 3])
+
+        relationship = np.array([sut.RELATIONSHIP_PO] * 3)
+
+        actual = sut.get_relationship_covariances(first, second, relationship, phenotypes)
+
+        expected = np.mean([(4 - 3.25) * (1 - 3.25), (4 - 3.25) * (2 - 3.25),
+                            (4 - 3.25) * (6 - 3.25)])
+        assert actual == {sut.RELATIONSHIP_PO : pytest.approx(expected)}
+
+    def test__each_relationship__its_own_mean_and_pairs(self):
+        phenotypes = np.array([1.0, 3.0, 10.0, 20.0])
+        actual = sut.get_relationship_covariances(
+            np.array([0, 2]), np.array([1, 3]),
+            np.array([sut.RELATIONSHIP_FS, sut.RELATIONSHIP_3RD]), phenotypes)
+
+        assert actual[sut.RELATIONSHIP_FS] == pytest.approx((1 - 2) * (3 - 2))
+        assert actual[sut.RELATIONSHIP_3RD] == pytest.approx((10 - 15) * (20 - 15))
+        assert set(actual) == {sut.RELATIONSHIP_FS, sut.RELATIONSHIP_3RD}
+
+
+class TestBuildOmega:
 
     @staticmethod
-    def run_relatedness(rel_df, fam_df):
-        phenos = fam_df[bbf.FAM_PHENO_COL].to_numpy(dtype=float)
-        R, W, resid, _ = sut.process_relatedness(
-            rel_file=rel_df, fam_file=fam_df, fam_df=fam_df, rel_degree=1,
-            unresidualized_phenotypes=phenos - phenos.mean())
-        return R.toarray(), W.toarray(), resid
-
-    @staticmethod
-    def assert_same(actual, expected):
-        for a, e in zip(actual, expected):
-            assert np.allclose(a, e)
-
-
-    def test__pair_repeated__counted_once_with_a_warning(self, caplog):
-        rel_df, fam_df = tcs.get(tcs.KEY_2FAM, "REL_DF"), tcs.get(tcs.KEY_2FAM, "FAM_DF")
-        repeated = pd.concat([rel_df, rel_df.iloc[[0]]], ignore_index=True)
-
-        with caplog.at_level(logging.WARNING):
-            actual = self.run_relatedness(repeated, fam_df)
-
-        self.assert_same(actual, self.run_relatedness(rel_df, fam_df))
-        assert "more than once" in caplog.text and "1-5" in caplog.text
-
-
-    def test__pair_listed_both_ways_round__counted_once(self, caplog):
-        rel_df, fam_df = tcs.get(tcs.KEY_2FAM, "REL_DF"), tcs.get(tcs.KEY_2FAM, "FAM_DF")
-        reversed_row = rel_df.iloc[[0]].rename(columns={
-            sut.KING_FID1_COL : sut.KING_FID2_COL, sut.KING_IID1_COL : sut.KING_IID2_COL,
-            sut.KING_FID2_COL : sut.KING_FID1_COL, sut.KING_IID2_COL : sut.KING_IID1_COL})
-        both_ways = pd.concat([rel_df, reversed_row[rel_df.columns]], ignore_index=True)
-
-        with caplog.at_level(logging.WARNING):
-            actual = self.run_relatedness(both_ways, fam_df)
-
-        self.assert_same(actual, self.run_relatedness(rel_df, fam_df))
-        assert "more than once" in caplog.text
-
-
-    def test__pair_given_two_degrees__raises_naming_both(self):
-        rel_df, fam_df = tcs.get(tcs.KEY_2FAM, "REL_DF"), tcs.get(tcs.KEY_2FAM, "FAM_DF")
-        contradiction = rel_df.iloc[[0]].copy()   # 1-5, parent-offspring in the file
-        contradiction[sut.KING_REL_COL] = sut.INF_3RD
-
-        with pytest.raises(ValueError, match="more than one degree") as error:
-            self.run_relatedness(pd.concat([rel_df, contradiction], ignore_index=True), fam_df)
-
-        message = str(error.value)
-        assert "1-5" in message
-        assert sut.INF_PARENT_OFFSPRING in message and sut.INF_3RD in message
-
-
-    def test__duplicate_involving_a_filtered_out_sample__ignored(self, caplog):
-        # Pairs with someone outside the analysis never reach the calculation, so neither a repeat
-        # nor a contradiction involving them should warn or stop the run
-        rel_df, full_fam = tcs.get(tcs.KEY_2FAM, "REL_DF"), tcs.get(tcs.KEY_2FAM, "FAM_DF")
-        fam_df = full_fam[full_fam[bbf.FAM_IID_COL] != 10].reset_index(drop=True)
-        involving_10 = rel_df[rel_df[sut.KING_IID2_COL] == 10].iloc[[0]]
-        contradiction = involving_10.copy()
-        contradiction[sut.KING_REL_COL] = sut.INF_3RD
-        noisy = pd.concat([rel_df, involving_10, contradiction], ignore_index=True)
-
-        with caplog.at_level(logging.WARNING):
-            actual = self.run_relatedness(noisy, fam_df)
-
-        self.assert_same(actual, self.run_relatedness(rel_df, fam_df))
-        assert "more than once" not in caplog.text
-
-
-    @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
-    @pytest.mark.parametrize("rng_seed", [1, 34])
-    @pytest.mark.parametrize("tc_key", [tcs.KEY_SIMPLE, tcs.KEY_2FAM, tcs.KEY_VARIED])
-    def test__randomized_phenos__expected_results(self, rel_degree, rng_seed, tc_key):
-        rng = np.random.default_rng(seed=rng_seed)
-
-        rel_df, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
-        N = len(fam_df)
-
-        expected_R = tcs.get(tc_key, "R_MATRICES", rel_degree)
-
-        unres_pheno = 10.0 * rng.random(N)
-        expected_omega = helper.mock_calc_omega(fam_df=fam_df, N=N, rel_df=rel_df,
-                                                unresidualized_phenotypes=unres_pheno)
-        expected_se_matrix = expected_R @ expected_omega @ expected_R.T
-        
-        expected_res_pheno = expected_R @ unres_pheno
-
-
-        actual_R, actual_gls_weights, actual_res_pheno, actual_parental = \
-            sut.process_relatedness(rel_file=rel_df, fam_df=fam_df, rel_degree=rel_degree,
-                                    unresidualized_phenotypes=unres_pheno, fam_file=fam_df)
-
-        assert np.allclose(expected_R.toarray(), actual_R.toarray(), atol=0.001)
-        assert np.allclose(expected_res_pheno, actual_res_pheno, atol=0.001)
-
-        # gls_weights is the pseudo-inverse of R @ omega @ R.T.  Production inverts it block by
-        # block over the relatedness components; one pinv over the whole matrix is a separate
-        # route to the same answer.  Every input here is well-conditioned (worst condition number
-        # about 25), so the values can be compared directly.  If a fixture ever makes these
-        # matrices near-singular, fix the fixture rather than weakening this check -- see notes
-        # §7.4j for what happened last time.
-        expected_gls_weights = np.linalg.pinv(expected_se_matrix.toarray())
-        assert np.allclose(expected_gls_weights, actual_gls_weights.toarray(), atol=1e-6)
-
-
-    @pytest.mark.parametrize("rel_degree", ["FS", "AbCd", ""])
-    def test__rel_degree_nonint_str__expected_error(self, rel_degree):
-
-        tc_key = tcs.KEY_SIMPLE
-        rel_df, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
-        unres_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy()
-
-        with pytest.raises(ValueError) as ex_info:
-            actual_R, actual_gls_weights, actual_res_pheno, actual_parental = \
-                sut.process_relatedness(rel_file=rel_df, fam_df=fam_df, rel_degree=rel_degree,
-                                        unresidualized_phenotypes=unres_pheno, fam_file=fam_df)
-
-        assert str(rel_degree) in str(ex_info.value)
-        assert str(0) in str(ex_info.value)
-        assert str(sut.MAX_GRMA_RELATEDNESS) in str(ex_info.value)
-
-
-    @pytest.mark.parametrize("rel_degree", [1.0, {1, 2, 3}])
-    def test__rel_degree_wrong_type__expected_error(self, rel_degree):
-
-        tc_key = tcs.KEY_SIMPLE
-        rel_df, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
-        unres_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy()
-
-        with pytest.raises(TypeError) as ex_info:
-            actual_R, actual_gls_weights, actual_res_pheno, actual_parental = \
-                sut.process_relatedness(rel_file=rel_df, fam_df=fam_df, rel_degree=rel_degree,
-                                        unresidualized_phenotypes=unres_pheno, fam_file=fam_df)
-
-        assert "str" in str(ex_info.value)
-        assert "int" in str(ex_info.value)
-        assert str(type(rel_degree)) in str(ex_info.value)
-
-
-    @pytest.mark.parametrize("rel_degree", [-1, sut.MAX_GRMA_RELATEDNESS + 1])
-    def test__rel_degree_out_of_range__expected_error(self, rel_degree):
-
-        tc_key = tcs.KEY_SIMPLE
-        rel_df, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
-        unres_pheno = fam_df[bbf.FAM_PHENO_COL].to_numpy()
-
-        with pytest.raises(ValueError) as ex_info:
-            actual_R, actual_gls_weights, actual_res_pheno, actual_parental = \
-                sut.process_relatedness(rel_file=rel_df, fam_df=fam_df, rel_degree=rel_degree,
-                                        unresidualized_phenotypes=unres_pheno, fam_file=fam_df)
-
-        assert str(rel_degree) in str(ex_info.value)
-        assert str(0) in str(ex_info.value)
-        assert str(sut.MAX_GRMA_RELATEDNESS) in str(ex_info.value)
-
-
-    @pytest.mark.parametrize("rng_seed", [1, 34])
-    def test__permute_rel_file__same_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        rel_degree = sut.MAX_GRMA_RELATEDNESS
-        tc_key = tcs.KEY_VARIED
-
-        rel_df_1, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
-        rel_df_2 = rel_df_1.sample(frac=1, random_state=rng_seed).reset_index(drop=True)
-        N = len(fam_df)
-
-
-        unres_pheno = 10.0 * rng.random(N)
-
-        actual_R_1, actual_gls_weights_1, actual_res_pheno_1, actual_parental_1 = \
-            sut.process_relatedness(rel_file=rel_df_1, fam_df=fam_df, rel_degree=rel_degree,
-                                    unresidualized_phenotypes=unres_pheno, fam_file=fam_df)
-
-        actual_R_2, actual_gls_weights_2, actual_res_pheno_2, actual_parental_2 = \
-            sut.process_relatedness(rel_file=rel_df_2, fam_df=fam_df, rel_degree=rel_degree,
-                                    unresidualized_phenotypes=unres_pheno, fam_file=fam_df)
-
-        assert np.allclose(actual_R_1.toarray(), actual_R_2.toarray(), atol=0.001)
-        assert np.allclose(actual_res_pheno_1, actual_res_pheno_2, atol=0.001)
-        assert np.allclose(actual_gls_weights_1.toarray(), actual_gls_weights_2.toarray(), atol=0.001)
-
-
-
-    @pytest.mark.parametrize("rng_seed", [5, 74])
-    def test__swap_id_cols_in_rel_file__same_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        rel_degree = sut.MAX_GRMA_RELATEDNESS
-        tc_key = tcs.KEY_VARIED
-
-        rel_df_1, fam_df = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
-        cols = sut.NEEDED_KING_COLS.copy()
-        fid1_index, iid1_index, fid2_index, iid2_index = \
-            cols.index(sut.KING_FID1_COL), cols.index(sut.KING_IID1_COL), \
-            cols.index(sut.KING_FID2_COL), cols.index(sut.KING_IID2_COL)
-        cols[fid1_index], cols[iid1_index], cols[fid2_index], cols[iid2_index] = \
-            cols[fid2_index], cols[iid2_index], cols[fid1_index], cols[iid1_index]
-        rel_df_2 = rel_df_1.copy()
-        rel_df_2.columns = cols
- 
-        N = len(fam_df)
-        unres_pheno = 10.0 * rng.random(N)
-
-        actual_R_1, actual_gls_weights_1, actual_res_pheno_1, actual_parental_1 = \
-            sut.process_relatedness(rel_file=rel_df_1, fam_df=fam_df, rel_degree=rel_degree,
-                                    unresidualized_phenotypes=unres_pheno, fam_file=fam_df)
-
-        actual_R_2, actual_gls_weights_2, actual_res_pheno_2, actual_parental_2 = \
-            sut.process_relatedness(rel_file=rel_df_2, fam_df=fam_df, rel_degree=rel_degree,
-                                    unresidualized_phenotypes=unres_pheno, fam_file=fam_df)
-
-        assert np.allclose(actual_R_1.toarray(), actual_R_2.toarray(), atol=0.001)
-        assert np.allclose(actual_res_pheno_1, actual_res_pheno_2, atol=0.001)
-        assert np.allclose(actual_gls_weights_1.toarray(), actual_gls_weights_2.toarray(), atol=0.001)
-
-
-    @pytest.mark.parametrize("rng_seed", [44, 90233])
-    def test__rearrange_fam_file__rearranged_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        rel_degree = sut.MAX_GRMA_RELATEDNESS
-        tc_key = tcs.KEY_2FAM
-
-        rel_df, fam_df_1 = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
-
-        N = len(fam_df_1)
-        permutation = rng.permutation(N)
-        fam_df_2 = fam_df_1.iloc[permutation].reset_index(drop=True)
-
-        
-        unres_pheno = 10.0 * rng.random(N)
-
-        actual_R_1, actual_gls_weights_1, actual_res_pheno_1, actual_parental_1 = \
-            sut.process_relatedness(rel_file=rel_df, fam_df=fam_df_1, rel_degree=rel_degree,
-                                    unresidualized_phenotypes=unres_pheno, fam_file=fam_df_1)
-
-        actual_R_2, actual_gls_weights_2, actual_res_pheno_2, actual_parental_2 = \
-            sut.process_relatedness(rel_file=rel_df, fam_df=fam_df_2, rel_degree=rel_degree,
-                                    unresidualized_phenotypes=unres_pheno[permutation], fam_file=fam_df_2)
-
-
-        assert np.allclose(actual_R_1.toarray()[permutation][:, permutation], actual_R_2.toarray(), atol=0.001)
-        assert np.allclose(actual_res_pheno_1[permutation], actual_res_pheno_2, atol=0.001)
-        assert np.allclose(actual_gls_weights_1.toarray()[permutation][:, permutation], actual_gls_weights_2.toarray(), atol=0.001)
-
-
-    @pytest.mark.parametrize("rng_seed", [64, 738])
-    def test__permute_ids__same_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        rel_degree = sut.MAX_GRMA_RELATEDNESS
-        tc_key = tcs.KEY_VARIED
-
-        rel_df_1, fam_df_1 = tcs.get(tc_key, "REL_DF"), tcs.get(tc_key, "FAM_DF")
-        N = len(fam_df_1)
-        permutation = rng.permutation(N)
-        mapping = {i : permutation[i] for i in range(N)}
-        
-        fam_df_2 = fam_df_1.copy()
-        fam_df_2[bbf.FAM_FID_COL] = fam_df_1[bbf.FAM_FID_COL].map(mapping)
-        fam_df_2[bbf.FAM_IID_COL] = fam_df_1[bbf.FAM_IID_COL].map(mapping)
-
-        rel_df_2 = rel_df_1.copy()
-        rel_df_2[sut.KING_FID1_COL] = rel_df_1[sut.KING_FID1_COL].map(mapping)
-        rel_df_2[sut.KING_IID1_COL] = rel_df_1[sut.KING_IID1_COL].map(mapping)
-        rel_df_2[sut.KING_FID2_COL] = rel_df_1[sut.KING_FID2_COL].map(mapping)
-        rel_df_2[sut.KING_IID2_COL] = rel_df_1[sut.KING_IID2_COL].map(mapping)
-
-
-        unres_pheno = 10.0 * rng.random(N)
-
-        actual_R_1, actual_gls_weights_1, actual_res_pheno_1, actual_parental_1 = \
-            sut.process_relatedness(rel_file=rel_df_1, fam_df=fam_df_1, rel_degree=rel_degree,
-                                    unresidualized_phenotypes=unres_pheno, fam_file=fam_df_1)
-
-        actual_R_2, actual_gls_weights_2, actual_res_pheno_2, actual_parental_2 = \
-            sut.process_relatedness(rel_file=rel_df_2, fam_df=fam_df_2, rel_degree=rel_degree,
-                                    unresidualized_phenotypes=unres_pheno, fam_file=fam_df_2)
-
-
-        assert np.allclose(actual_R_1.toarray(), actual_R_2.toarray(), atol=0.001)
-        assert np.allclose(actual_res_pheno_1, actual_res_pheno_2, atol=0.001)
-        assert np.allclose(actual_gls_weights_1.toarray(), actual_gls_weights_2.toarray(), atol=0.001)
-
-
-    def test__fully_randomized__expected_results(self):
-        pass
-
-
-class TestGetBlockAlphas:
-
-    def test__gershgorin_screen_is_safe(self):
-        # The Gershgorin screen skips blocks it can prove are definite.  Verify it never skips one
-        # that needed shrinking, by checking every returned alpha against a direct per-block
-        # eigendecomposition.
-        rng = np.random.default_rng(1234)
-        N = 60
-        pheno = rng.normal(size=N)
-        pairs = [(i, i + 1) for i in range(0, N - 1, 3)] + [(0, 3), (6, 9)]
-        rel_df = pd.DataFrame({
-            sut.FAM_INDEX_1: [p[0] for p in pairs],
-            sut.FAM_INDEX_2: [p[1] for p in pairs],
-            sut.KING_REL_COL: [sut.DEG_PARENT_OFFSPRING] * len(pairs),
-        })
-        rel_to_cov = sut.get_rel_covariances(rel_df=rel_df, unresidualized_phenotypes=pheno)
-        i1 = rel_df[sut.FAM_INDEX_1].to_numpy(np.int64)
-        i2 = rel_df[sut.FAM_INDEX_2].to_numpy(np.int64)
-        data = np.tile(rel_df[sut.KING_REL_COL].map(rel_to_cov).to_numpy(), 2)
-        off_diag = sp.coo_array((data, (np.concatenate([i1, i2]),
-                                        np.concatenate([i2, i1]))), shape=(N, N)).tocsr()
-        pheno_var = float(np.var(pheno))
-
-        labels = sut.get_relatedness_components(rel_df, N)
-        alphas = sut.get_block_alphas(off_diag, pheno_var, labels)
-
-        for c in range(labels.max() + 1):
-            idx = np.flatnonzero(labels == c)
-            if len(idx) < 2:
-                continue
-            block = off_diag[idx][:, idx].toarray()
-            lmin = float(np.linalg.eigvalsh(block).min())
-            expected = (min((sut.DEFAULT_OMEGA_EPSILON - pheno_var) / lmin, 1.0)
-                        if lmin < 0.0 else 1.0)
-            assert np.isclose(alphas[c], expected, atol=1e-6)
-
+    def expected_unshrunk(samples, graph, phenotypes):
+        """Omega built entry by entry, by a separate route"""
+        n = len(phenotypes)
+        omega = np.diag(np.full(n, np.var(phenotypes)))
+        idx = samples[sut.SAMPLE_OMEGA_IDX_COL].to_numpy()
+        by_relationship = {}
+        for r1, r2, rel in zip(graph[sut.GRAPH_ROW1_COL], graph[sut.GRAPH_ROW2_COL],
+                               graph[sut.GRAPH_RELATIONSHIP_COL]):
+            if idx[r1] != -1 and idx[r2] != -1:
+                by_relationship.setdefault(rel, []).append((idx[r1], idx[r2]))
+        for rel, members in by_relationship.items():
+            everyone = sorted({i for pair in members for i in pair})
+            mean = np.mean(phenotypes[everyone])
+            cov = np.mean([(phenotypes[i] - mean) * (phenotypes[j] - mean) for i, j in members])
+            for i, j in members:
+                omega[i, j] = omega[j, i] = cov
+        return omega
+
+    def test__definite_already__entries_as_built_by_hand(self):
+        # Phenotypes chosen so that Omega is comfortably definite (smallest eigenvalue 0.43 x the
+        # variance) and each relationship's covariance is clearly nonzero (0.23 to 0.44 x)
+        phenos = {"dad" : -3.0, "kid" : -1.2, "sib" : -0.8, "cousin" : 0.9, "other" : 2.1}
+        rows = [("dad", "kid", "PO"), ("dad", "sib", "PO"), ("kid", "sib", "FS"),
+                ("sib", "cousin", "3rd"), ("cousin", "other", "FS")]
+        records = [("S1", "kid", "dad", "0", True, False), ("S1", "sib", "dad", "0", True, False)]
+        samples, graph, _ = planned(phenos, rows, records, ["S1"])
+        phenotypes = sut.prepare_phenotypes(samples)
+
+        actual = sut.build_omega(samples, graph, phenotypes).toarray()
+
+        expected = self.expected_unshrunk(samples, graph, phenotypes)
+        assert np.linalg.eigvalsh(expected).min() > 0      # So no shrinking was needed
+        assert np.allclose(actual, expected)
+
+    def test__relationship_beyond_rel_degree__still_in_omega(self):
+        # At rel_degree 1, a and c are in FS regressions; their 3rd-degree link is not used for
+        # residualization, but they are still phenotypically correlated
+        phenos = {"a" : 1.0, "b" : 2.0, "c" : 4.0, "d" : 3.0}
+        samples, graph, _ = planned(phenos, [("a", "b", "FS"), ("c", "d", "FS"),
+                                             ("a", "c", "3rd")], rel_degree=1)
+
+        actual = sut.build_omega(samples, graph, sut.prepare_phenotypes(samples)).toarray()
+
+        assert actual[0, 2] != 0.0 and actual[0, 2] == actual[2, 0]
+
+    def test__block_needing_shrinkage__shrunk_others_untouched(self):
+        # Two families, each a parent with five children, at opposite phenotypic extremes: the PO
+        # covariance is then nearly the variance, and a parent with m children gives eigenvalues
+        # variance +/- covariance x sqrt(m), so each family's block is indefinite.  x-y is an
+        # ordinary pair, which must be left as it is.
+        kids1, kids2 = ["k1", "k2", "k3", "k4", "k5"], ["j1", "j2", "j3", "j4", "j5"]
+        phenos = {"d1" : 10.0, "k1" : 9.5, "k2" : 10.5, "k3" : 10.0, "k4" : 9.8, "k5" : 10.2,
+                  "d2" : -10.0, "j1" : -9.5, "j2" : -10.5, "j3" : -10.0, "j4" : -9.8,
+                  "j5" : -10.2, "x" : -1.0, "y" : 1.0}
+        rows = ([("d1", k, "PO") for k in kids1] + [("d2", k, "PO") for k in kids2] +
+                [("x", "y", "FS")])
+        records = ([("S1", k, "d1", "0", True, False) for k in kids1] +
+                   [("S2", k, "d2", "0", True, False) for k in kids2])
+        samples, graph, _ = planned(phenos, rows, records, ["S1", "S2"])
+        phenotypes = sut.prepare_phenotypes(samples)
+
+        actual = sut.build_omega(samples, graph, phenotypes).toarray()
+
+        unshrunk = self.expected_unshrunk(samples, graph, phenotypes)
+        family, pair = list(range(6)), [12, 13]
+        assert np.linalg.eigvalsh(unshrunk[np.ix_(family, family)]).min() < 0
+        assert np.linalg.eigvalsh(actual).min() > 0
+        assert np.isclose(np.linalg.eigvalsh(actual[np.ix_(family, family)]).min(),
+                          sut.DEFAULT_OMEGA_EPSILON, atol=1e-8)
+        # Diagonal unchanged; the family's off-diagonal only scaled down; the pair untouched
+        assert np.allclose(np.diag(actual), np.diag(unshrunk))
+        assert 0 < actual[0, 1] / unshrunk[0, 1] < 1
+        assert np.allclose(actual[np.ix_(pair, pair)], unshrunk[np.ix_(pair, pair)])
+
+    def test__symmetric__and_zero_between_unrelated_samples(self):
+        phenos = {"a" : 1.0, "b" : 2.0, "c" : 4.0, "d" : 3.0}
+        samples, graph, _ = planned(phenos, [("a", "b", "FS"), ("c", "d", "FS")])
+
+        actual = sut.build_omega(samples, graph, sut.prepare_phenotypes(samples)).toarray()
+
+        assert np.allclose(actual, actual.T)
+        assert actual[0, 2] == 0.0 and actual[1, 3] == 0.0
+
+
+# --------------------------------------------------------------------------------------------------
+# Copied unchanged from the original implementation's tests, with the function
 
 class TestGetLambdaMin:
 
@@ -994,1752 +739,221 @@ class TestGetLambdaMin:
         assert len(set(results)) == 1
 
 
+class TestGetLambdaMinRouting:
+    """Small matrices take the dense route, which is exact and faster at that size.  Both routes
+    give the same answer, so only this test can tell which was taken."""
+
+    def test__at_the_threshold__dense_route_without_arpack(self, monkeypatch):
+        def no_arpack(*args, **kwargs):
+            raise AssertionError("ARPACK was used for a matrix small enough for the dense route")
+        monkeypatch.setattr(sut.spla, "eigsh", no_arpack)
+        B = np.diag(np.linspace(-1.0, 1.0, sut.DENSE_LAMBDA_MIN_MAX_SIZE))
+
+        assert np.isclose(sut.get_lambda_min(B), -1.0)
+
+    def test__above_the_threshold__arpack_route(self, monkeypatch):
+        calls = []
+        real_eigsh = sut.spla.eigsh
+        def counting_eigsh(*args, **kwargs):
+            calls.append(1)
+            return real_eigsh(*args, **kwargs)
+        monkeypatch.setattr(sut.spla, "eigsh", counting_eigsh)
+        B = sp.diags_array(np.linspace(-1.0, 1.0, sut.DENSE_LAMBDA_MIN_MAX_SIZE + 1)).tocsr()
+
+        assert np.isclose(sut.get_lambda_min(B), -1.0, atol=1e-6)
+        assert len(calls) > 0
+
+
+class TestGetLambdaMinConvergence:
+    """ARPACK can fail to converge.  get_lambda_min() retries with a larger workspace, and gives up
+    with an error only after every attempt has failed."""
+
+    BIG = sut.DENSE_LAMBDA_MIN_MAX_SIZE + 1
+
+    def test__fails_then_converges__retried_with_a_larger_workspace(self, monkeypatch):
+        workspaces = []
+        real_eigsh = sut.spla.eigsh
+        def flaky_eigsh(*args, **kwargs):
+            workspaces.append(kwargs["ncv"])
+            if len(workspaces) < 3:
+                raise sut.spla.ArpackNoConvergence("no convergence", np.array([]), np.array([]))
+            return real_eigsh(*args, **kwargs)
+        monkeypatch.setattr(sut.spla, "eigsh", flaky_eigsh)
+        B = sp.diags_array(np.linspace(-1.0, 1.0, self.BIG)).tocsr()
+
+        assert np.isclose(sut.get_lambda_min(B), -1.0, atol=1e-6)
+        assert len(workspaces) == 3 and workspaces == sorted(workspaces)
+
+    def test__never_converges__raises(self, monkeypatch):
+        def never(*args, **kwargs):
+            raise sut.spla.ArpackNoConvergence("no convergence", np.array([]), np.array([]))
+        monkeypatch.setattr(sut.spla, "eigsh", never)
+        B = sp.diags_array(np.linspace(-1.0, 1.0, self.BIG)).tocsr()
+
+        with pytest.raises(RuntimeError, match="failed to converge"):
+            sut.get_lambda_min(B)
+
+
+# Adapted from the original implementation's test: its input is built here directly, since the
+# functions it used to build it belong to that implementation
+class TestGetBlockAlphas:
+
+    def test__gershgorin_screen_is_safe(self):
+        # The Gershgorin screen skips blocks it can prove are definite.  Verify it never skips one
+        # that needed shrinking, by checking every returned alpha against a direct per-block
+        # eigendecomposition.
+        rng = np.random.default_rng(1234)
+        N = 60
+        pheno = rng.normal(size=N)
+        pairs = [(i, i + 1) for i in range(0, N - 1, 3)] + [(0, 3), (6, 9)]
+        i1 = np.array([p[0] for p in pairs])
+        i2 = np.array([p[1] for p in pairs])
+        covariance = np.cov(np.concatenate([pheno[i1], pheno[i2]]),
+                            np.concatenate([pheno[i2], pheno[i1]]), ddof=0)[0, 1]
+        data = np.full(2 * len(pairs), covariance)
+        off_diag = sp.coo_array((data, (np.concatenate([i1, i2]),
+                                        np.concatenate([i2, i1]))), shape=(N, N)).tocsr()
+        pheno_var = float(np.var(pheno))
+        _, labels = csgraph.connected_components(off_diag, directed=False)
+
+        alphas = sut.get_block_alphas(off_diag, pheno_var, labels)
+
+        for c in range(labels.max() + 1):
+            idx = np.flatnonzero(labels == c)
+            if len(idx) < 2:
+                continue
+            block = off_diag[idx][:, idx].toarray()
+            lmin = float(np.linalg.eigvalsh(block).min())
+            expected = (min((sut.DEFAULT_OMEGA_EPSILON - pheno_var) / lmin, 1.0)
+                        if lmin < 0.0 else 1.0)
+            assert np.isclose(alphas[c], expected, atol=1e-6)
+
+    def test__strongly_correlated_block__shrunk_to_the_floor(self):
+        # A deliberately indefinite block alongside a definite one, so the screen and the shrinkage
+        # are both exercised: the first must come back below 1 and land exactly on the floor
+        off_diag = sp.csr_array(np.array([[0, 2, 2, 0, 0],
+                                          [2, 0, 2, 0, 0],
+                                          [2, 2, 0, 0, 0],
+                                          [0, 0, 0, 0, 0.1],
+                                          [0, 0, 0, 0.1, 0]], dtype=float))
+        labels = np.array([0, 0, 0, 1, 1])
+
+        alphas = sut.get_block_alphas(off_diag, 1.0, labels)
+
+        assert alphas[0] < 1.0 and alphas[1] == 1.0
+        shrunk = np.eye(3) + alphas[0] * off_diag[[0, 1, 2]][:, [0, 1, 2]].toarray()
+        assert np.isclose(np.linalg.eigvalsh(shrunk).min(), sut.DEFAULT_OMEGA_EPSILON, atol=1e-12)
 
-class TestProcessBimFile:
+    def test__screened_block_not_indefinite__left_alone(self):
+        # Defensive: an off-diagonal block has zeros on its diagonal, so any nonzero one has a
+        # negative eigenvalue.  Only an all-zero block, with a variance at or below epsilon, passes
+        # the screen without being indefinite -- and must then be left unshrunk.
+        off_diag = sp.csr_array((2, 2))
+        labels = np.array([0, 0])
 
-    @pytest.mark.parametrize("tc_key", tcs.key_params("process_bim_file"))
-    def test__precanned_tcs__expected_results(self, tc_key, tmp_path):
-        bim_df = tcs.get(tc_key, "BIM_DF")
+        alphas = sut.get_block_alphas(off_diag, 0.0, labels)
 
-        # In imputed mode the SNPs are aligned against the imputed file, which is the only thing
-        # process_bim_file() reads from the parental sources -- so only its metadata is filled in
-        parental_sources = None
-        imputed_file = tcs.write_imputed_file(tc_key, tmp_path)
-        if imputed_file is not None:
-            parental_sources = sut.ParentalSources(
-                affected_samples=np.array([], dtype=int),
-                observed_parent_cols=np.empty((0, 2), dtype=int),
-                imputed_rows=np.array([], dtype=int), imputed_file=imputed_file,
-                snipar_metadata=snipar_hdf5.read_snipar_metadata(imputed_file))
+        assert alphas.tolist() == [1.0]
 
-        expected_M_orig = len(bim_df)
-        expected_snp_filter = tcs.snp_filter(tc_key)
-        expected_M = len(expected_snp_filter) if expected_snp_filter is not None else expected_M_orig
 
-        actual_M_orig, actual_M, actual_snp_filter, _ = sut.process_bim_file(
-            bim_file=bim_df, snp_list=tcs.get(tc_key, "SNP_LIST"), parental_sources=parental_sources)
+# --------------------------------------------------------------------------------------------------
+# The sibling, 2nd- and 3rd-degree regressions
+#
+# The fixture: sibships a (three) and b (two); n, a nephew of all of sibship a; half-sibs m1 and m2;
+# c1, a cousin of b1; cousins c2 and c3.  a1 and b1 are cousins too, linking the families, so the
+# regressions' samples overlap and their estimates are correlated.
 
-        assert expected_M_orig == actual_M_orig
-        assert expected_M == actual_M
-        assert (expected_snp_filter is None and actual_snp_filter is None) or \
-               np.allclose(expected_snp_filter, actual_snp_filter)
+RELATIVE_PHENOS = {"a1" : 1.2, "a2" : 0.4, "a3" : 1.9, "b1" : -0.7, "b2" : -1.5, "n" : 0.8,
+                   "m1" : 2.2, "m2" : 1.1, "c1" : -0.3, "c2" : 0.6, "c3" : -2.0}
+RELATIVE_ROWS = [("a1", "a2", "FS"), ("a1", "a3", "FS"), ("a2", "a3", "FS"), ("b1", "b2", "FS"),
+                 ("n", "a1", "2nd"), ("n", "a2", "2nd"), ("n", "a3", "2nd"), ("m1", "m2", "2nd"),
+                 ("c1", "b1", "3rd"), ("c2", "c3", "3rd"), ("a1", "b1", "3rd")]
 
 
-    @staticmethod
-    def imputed_sources(path):
-        """Parental sources with only what process_bim_file() reads: the imputed file's metadata"""
-        return sut.ParentalSources(affected_samples=np.array([], dtype=int),
-                                   observed_parent_cols=np.empty((0, 2), dtype=int),
-                                   imputed_rows=np.array([], dtype=int), imputed_file=path,
-                                   snipar_metadata=snipar_hdf5.read_snipar_metadata(path))
+def relative_plan(phenos=None, rows=None, rel_degree=3):
+    samples, graph, _ = planned(phenos or RELATIVE_PHENOS, rows or RELATIVE_ROWS,
+                                rel_degree=rel_degree)
+    phenotypes = sut.prepare_phenotypes(samples)
+    omega = sut.build_omega(samples, graph, phenotypes)
+    regressions = sut.build_relative_regressions(samples, graph, phenotypes, omega,
+                                                 rel_degree=rel_degree)
+    cross = sut.build_cross_covariances(regressions, omega)
+    return samples, graph, phenotypes, omega, regressions, cross
 
 
-    def test__imputed_file_snps_out_of_order__raises(self, tmp_path):
-        # rs2 and rs3 are swapped in the imputed file relative to the bim (notes §13.2)
-        path = str(tmp_path / ("out_of_order" + snipar_hdf5.SNIPAR_FILE_SUFFIX))
-        snipar_hdf5.write_snipar_file(
-            path, **tc_parental.imputed_file_arrays(tc_parental.hdf5_rsids_out_of_order()))
+def genotypes_for(num_omega, num_snps=8, seed=4):
+    """Random genotypes for the Omega samples.  The seed is one where every regression has some
+    variation at every SNP, so every estimate exists; the no-variation case has its own test."""
+    return np.random.default_rng(seed).integers(0, 3, size=(num_snps, num_omega)).astype(float)
 
-        with pytest.raises(ValueError, match="different order") as error:
-            sut.process_bim_file(bim_file=tc_parental.BIM_DF, snp_list=None,
-                                 parental_sources=self.imputed_sources(path))
 
-        # The SNP that steps backwards is named, so the user can see where the orders diverge
-        assert "rs3" in str(error.value)
+def dense_regression(regression, omega, phenotypes, genotypes):
+    """A regression's estimates by the textbook route: dense matrices, one pseudo-inverse"""
+    A = regression.phenotype_map.toarray()
+    Q = np.linalg.pinv(A @ omega.toarray() @ A.T, rcond=1e-10, hermitian=True)
+    Z = genotypes @ A.T
+    y = A @ phenotypes
+    d = np.einsum("sf,fg,sg->s", Z, Q, Z)
+    return (Z @ Q @ y) / d, d, Z, Q
 
 
-    def test__imputed_file_snps_in_order__accepted(self, tmp_path):
-        path = str(tmp_path / ("in_order" + snipar_hdf5.SNIPAR_FILE_SUFFIX))
-        snipar_hdf5.write_snipar_file(path, **tc_parental.imputed_file_arrays())
+class TestBuildResidualizationMatrix:
 
-        _, _, _, alignment = sut.process_bim_file(bim_file=tc_parental.BIM_DF, snp_list=None,
-                                                  parental_sources=self.imputed_sources(path))
+    def test__rows__own_share_and_relatives_shares_summing_to_zero(self):
+        samples, graph, *_ = relative_plan()
+        idx = dict(zip(samples[sut.SAMPLE_IID_COL], samples[sut.SAMPLE_OMEGA_IDX_COL]))
 
-        assert np.all(np.diff(alignment.hdf5_indices) > 0)
+        focal, R = sut.build_residualization_matrix(samples, graph, sut.GROUP_FS)
 
+        assert [samples[sut.SAMPLE_IID_COL][samples[sut.SAMPLE_OMEGA_IDX_COL] == f].item()
+                for f in focal] == ["a1", "a2", "a3", "b1", "b2"]
+        dense = R.toarray()
+        assert np.allclose(dense.sum(axis=1), 0.0)
+        a1 = dense[0]
+        assert np.isclose(a1[idx["a1"]], 2 / 3)
+        assert np.isclose(a1[idx["a2"]], -1 / 3) and np.isclose(a1[idx["a3"]], -1 / 3)
+        assert np.count_nonzero(a1) == 3      # Not b1, though a1 and b1 are related: 3rd degree
 
-    def test__bim_lists_a_snp_twice__repeated_imputed_position_accepted(self, tmp_path):
-        # Both copies of rs2 align to the same SNP in the imputed file.  That repeats a position
-        # rather than stepping backwards, which the forward-only reader handles.
-        bim = pd.DataFrame({bbf.BIM_CHR_COL : 1, bbf.BIM_RSID_COL : ["rs1", "rs2", "rs2", "rs3"],
-                            bbf.BIM_CM_COL : 0.0, bbf.BIM_BP_COL : [100, 200, 200, 300],
-                            bbf.BIM_A1_COL : ["A", "G", "G", "C"],
-                            bbf.BIM_A2_COL : ["C", "T", "T", "T"]}, columns=bbf.BIM_COLS)
-        path = str(tmp_path / ("repeated" + snipar_hdf5.SNIPAR_FILE_SUFFIX))
-        snipar_hdf5.write_snipar_file(
-            path, imputed_gts=np.ones((1, 3)), num_obs_par_alleles=np.full((1, 3), 4.0),
-            standard_f=np.full(3, 0.3), parental_status=np.zeros((1, 3), dtype=bool),
-            pedigree=np.array([["F", "kid", "dad", "mum", "False", "False"]]),
-            families=np.array(["F"]),
-            bim_values=np.array([["1", "rs1", "0", "100", "A", "C"],
-                                 ["1", "rs2", "0", "200", "G", "T"],
-                                 ["1", "rs3", "0", "300", "C", "T"]]))
+    def test__relatives_from_any_group__used(self):
+        # n's 2nd-degree relatives are all in the FS group, and still enter n's row
+        samples, graph, *_ = relative_plan()
+        idx = dict(zip(samples[sut.SAMPLE_IID_COL], samples[sut.SAMPLE_OMEGA_IDX_COL]))
 
-        _, _, _, alignment = sut.process_bim_file(bim_file=bim, snp_list=None,
-                                                  parental_sources=self.imputed_sources(path))
+        focal, R = sut.build_residualization_matrix(samples, graph, sut.GROUP_2ND)
 
-        assert alignment.hdf5_indices.tolist() == [0, 1, 1, 2]
+        n_row = R.toarray()[list(focal).index(idx["n"])]
+        assert np.isclose(n_row[idx["n"]], 3 / 4)
+        assert all(np.isclose(n_row[idx[a]], -1 / 4) for a in ("a1", "a2", "a3"))
 
 
-    @pytest.mark.parametrize("rng_seed", [95, 301, 486])
-    def test__snp_list_no_missing__expected_filtering(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        M = 100
+class TestCalculateGlsWeights:
 
-        bim_df = make_bim_df(M)
+    def test__a_pseudo_inverse__matching_one_taken_whole(self):
+        _, _, _, omega, regressions, _ = relative_plan()
+        for regression in regressions:
+            A = regression.phenotype_map
+            vcv = (A @ omega @ A.T).toarray()
+            Q = regression.gls_weights.toarray()
 
-        snp_mask = rng.choice([True, False], size=M)
+            assert np.allclose(vcv @ Q @ vcv, vcv)
+            assert np.allclose(Q, np.linalg.pinv(vcv, rcond=1e-10, hermitian=True))
 
-        expected_M = np.sum(snp_mask)
-        expected_snp_filter = np.where(snp_mask)[0]
-        snp_list = bim_df[[bbf.BIM_RSID_COL]].loc[snp_mask]
-
-        actual_M_orig, actual_M, actual_snp_filter, _ = sut.process_bim_file(
-            bim_file=bim_df, snp_list=snp_list)
-
-        assert actual_M_orig == M
-        assert actual_M == expected_M
-        assert np.allclose(actual_snp_filter, expected_snp_filter)
-
-
-    @pytest.mark.parametrize("rng_seed", [1, 10])
-    def test__shuffle_snp_list__same_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        tc_key = tcs.KEY_VARIED
-        bim_df = tcs.get(tc_key, "BIM_DF")
-
-        expected_M_orig = len(bim_df)
-
-        expected_snp_filter = tcs.snp_filter(tc_key)
-        expected_M = len(expected_snp_filter) if expected_snp_filter is not None else expected_M_orig
-
-        actual_M_orig, actual_M, actual_snp_filter, _ = sut.process_bim_file(
-            bim_file=bim_df, snp_list=tcs.get(tc_key, "SNP_LIST").sample(frac=1, random_state=rng))
-
-        assert expected_M_orig == actual_M_orig
-        assert expected_M == actual_M
-        assert (expected_snp_filter is None and actual_snp_filter is None) or \
-               np.allclose(expected_snp_filter, actual_snp_filter)
-
-
-class TestGetResidualizedGenotypeData:
-
-    # TODO(jonbjala)  Test some with an actual bed file?
-    @pytest.mark.parametrize("rel_degree", range(sut.MAX_GRMA_RELATEDNESS + 1))
-    @pytest.mark.parametrize("tc_key", [tcs.KEY_SIMPLE, tcs.KEY_2FAM, tcs.KEY_VARIED])
-    def test__precanned_tcs__expected_results(self, tc_key, rel_degree):
-
-        snp_filter = tcs.snp_filter(tc_key)
-        sample_filter = tcs.sample_filter(tc_key)
-        expected_resid_G = tcs.get(tc_key, "RESID_GENOS", rel_degree)
-
-        orig_G = tcs.get(tc_key, "G")
-
-        actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=orig_G,
-            M_orig=orig_G.shape[0], N_orig=orig_G.shape[1], snp_filter=snp_filter,
-            sample_filter=sample_filter, R=tcs.get(tc_key, "R_MATRICES", rel_degree),
-            M_start=0, num_snps=orig_G.shape[0])
-
-        assert actual_resid_G.shape == expected_resid_G.shape
-        assert np.allclose(actual_resid_G, expected_resid_G)
-
-
-    @pytest.mark.parametrize("rng_seed", [2, 34])
-    def test__simple_bed_file_with_identity_R__return_unchanged(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        M = 20
-        N = 100
-
-        G = rng.choice([0.0, 1.0, 2.0], size=(M, N), replace=True)
-        R = sp.csr_array(np.identity(N))
-
-        actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-            M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=0, num_snps=M)
-
-
-        assert actual_M == M
-        assert actual_resid_G.shape == (M, N)
-        assert np.allclose(actual_resid_G, G)
-
-
-    @pytest.mark.parametrize("rng_seed", [33, 904])
-    def test__request_contiguous_subset_of_snps__return_expected(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        M = 20
-        N = 100
-
-        M_start = rng.integers(1, M >> 1)
-        num_snps = rng.integers(1, M >> 1)
-
-        G = rng.choice([0.0, 1.0, 2.0], size=(M, N), replace=True)
-        R = sp.csr_array(np.identity(N))
-
-        actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-            M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, 
-            M_start=M_start, num_snps=num_snps)
-
-
-        assert actual_M == num_snps
-        assert actual_resid_G.shape == (num_snps, N)
-        assert np.allclose(actual_resid_G, G[M_start:M_start+num_snps])
-
-
-    @pytest.mark.parametrize("rng_seed", [2, 4])
-    def test__request_snps_past_end_of_array__return_remainder(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        M = 20
-        N = 100
-
-        M_start = rng.integers(M >> 1, M)
-        num_snps = 10 * M
-        expected_M = M - M_start
-
-        G = rng.choice([0.0, 1.0, 2.0], size=(M, N), replace=True)
-        R = sp.csr_array(np.identity(N))
-
-        actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-            M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, 
-            M_start=M_start, num_snps=num_snps)
-
-        assert actual_M == expected_M
-        assert actual_resid_G.shape == (expected_M, N)
-        assert np.allclose(actual_resid_G, G[M_start:M_start+expected_M])
-
-
-    @pytest.mark.parametrize("rng_seed", [4, 86])
-    def test__simple_bed_file__expected_residualization(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        M = 20
-        N = 100
-
-        G = rng.choice([0.0, 1.0, 2.0], size=(M, N), replace=True)
-        R = sp.csr_array(rng.random(size=(N, N)))
-
-        actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-            M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=0, num_snps=M)
-
-
-        assert actual_M == M
-        assert actual_resid_G.shape == (M, N)
-        assert np.allclose(actual_resid_G, G @ R.T)
-
-
-    @pytest.mark.parametrize("rng_seed", [55, 76])
-    def test__include_nans__expected_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        M = 20
-        N = 100
-
-        G = rng.choice([0.0, 1.0, 2.0], size=(M, N), replace=True)
-        R = sp.csr_array(rng.random(size=(N, N)))
-
-        x, y = rng.integers(0, M), rng.integers(0, N)
-
-        G[x, y] = np.nan
-
-        actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-            M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=0, num_snps=M)
-
-        expected_resid_G = np.nan_to_num(G @ R.T)
-
-        assert actual_M == M
-        assert actual_resid_G.shape == (M, N)
-        assert np.allclose(actual_resid_G, expected_resid_G)
-
-
-    # The three simple filtering cases differ only in which filters are supplied, so they are one
-    # test over the combinations.  Filtering that interacts with a BLOCK -- where the filter's
-    # indices are offsets into the whole file rather than into what was read -- is a separate
-    # case below, since that is where the arithmetic actually gets interesting.
-    @pytest.mark.parametrize("use_snp_filter, use_sample_filter", [
-        pytest.param(True, False, id="snps_only"),
-        pytest.param(False, True, id="samples_only"),
-        pytest.param(True, True, id="snps_and_samples"),
-    ])
-    def test__filters__expected_filtering(self, use_snp_filter, use_sample_filter):
-        rng = np.random.default_rng(seed=7)
-        M = 20
-        N = 100
-
-        snp_filter = (np.sort(rng.choice(M, size=rng.integers(M // 3, 2 * M // 3), replace=False))
-                      if use_snp_filter else None)
-        sample_filter = (np.sort(rng.choice(N, size=rng.integers(N // 3, 2 * N // 3),
-                                            replace=False)) if use_sample_filter else None)
-
-        G = rng.choice([0.0, 1.0, 2.0], size=(M, N), replace=True)
-        R = sp.csr_array(np.identity(N if sample_filter is None else len(sample_filter)))
-
-        expected = G if snp_filter is None else G[snp_filter]
-        expected = expected if sample_filter is None else expected[:, sample_filter]
-
-        actual_resid_G, actual_M = sut.get_residualized_genotype_data(
-            bed_file=G, M_orig=M, N_orig=N, snp_filter=snp_filter, sample_filter=sample_filter,
-            R=R, M_start=0, num_snps=M)
-
-        assert actual_M == expected.shape[0]
-        assert actual_resid_G.shape == expected.shape
-        assert np.allclose(actual_resid_G, expected)
-
-
-    @pytest.mark.parametrize("rng_seed", [26, 47, 880])
-    def test__snp_filter_some_snps__expected_filtering(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        M = 20
-        N = 100
-
-        M_start = 2 * rng.integers(0, M >> 3) + 1
-        num_snps = M >> 1
-        snp_filter = np.array([2*i for i in range(M >> 1)])
-        snp_mask = np.zeros(M, dtype=bool); snp_mask[snp_filter] = True
-
-        expected_M = num_snps >> 1
-
-        G = rng.choice(M, size=(M, N), replace=True)
-        R = sp.csr_array(np.identity(N))
-
-        actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-            M_orig=M, N_orig=N, snp_filter=snp_filter, sample_filter=None, R=R, M_start=M_start, num_snps=num_snps)
-
-        assert actual_M == expected_M
-        assert actual_resid_G.shape == (expected_M, N)
-        assert np.allclose(actual_resid_G, G[M_start:M_start+num_snps][snp_mask[M_start:M_start+num_snps]])
-
-
-    @pytest.mark.parametrize("rng_seed", [8])
-    def test__invalid_M_start__expected_error(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        M = rng.integers(20, 40)
-        N = 100
-
-        G = rng.choice([0.0, 1.0, 2.0], size=(M, N), replace=True)
-        R = sp.csr_array(np.identity(N))
-
-        M_start = rng.integers(-2* M, -M)
-        with pytest.raises(ValueError) as ex_info:
-            actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-                M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=M_start, num_snps=N)
-
-
-        assert str(M_start) in str(ex_info.value)
-        assert str(M-1) in str(ex_info.value)
-
-
-        with pytest.raises(ValueError) as ex_info:
-            actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-                M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=M, num_snps=N)
-
-        assert str(M) in str(ex_info.value)
-
-
-    @pytest.mark.parametrize("rng_seed", [102])
-    def test__invalid_num_snps__expected_error(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-        M = rng.integers(20, 40)
-        N = 100
-
-        G = rng.choice([0.0, 1.0, 2.0], size=(M, N), replace=True)
-        R = sp.csr_array(np.identity(N))
-
-        num_snps = rng.integers(-2*M, -M)
-        with pytest.raises(ValueError) as ex_info:
-            actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-                M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=0, num_snps=num_snps)
-
-
-        assert str(num_snps) in str(ex_info.value)
-
-        with pytest.raises(ValueError) as ex_info:
-            actual_resid_G, actual_M = sut.get_residualized_genotype_data(bed_file=G,
-                M_orig=M, N_orig=N, snp_filter=None, sample_filter=None, R=R, M_start=0, num_snps=0)
-
-        assert "(0)" in str(ex_info.value)
-
-
-    # ---- Parental residualization --------------------------------------------------------
-
-    @staticmethod
-    def trio_sources(affected, parents, imputed_rows=None):
-        """Builds a ParentalSources from (affected sample, (father, mother)) positions"""
-
-        return sut.ParentalSources(
-            affected_samples=np.array(affected, dtype=np.int64),
-            observed_parent_cols=np.array(parents, dtype=np.int64).reshape(len(affected), 2),
-            imputed_rows=imputed_rows,
-            imputed_file=None if imputed_rows is None else "unused in these tests",
-            snipar_metadata=None if imputed_rows is None else {})
-
-
-    def test__affected_sample__differenced_against_its_parents(self):
-        # Sample 2 is the child of samples 0 and 1, and the only one residualized against parents.
-        # With an identity R, what comes back is the raw genotype for everyone else and the
-        # Mendelian residual for the child.
-        G = np.array([[2.0, 0.0, 1.0, 1.0],
-                      [1.0, 1.0, 2.0, 0.0]])
-        R = sp.csr_array(np.identity(4))
-
-        actual, _ = sut.get_residualized_genotype_data(
-            bed_file=G, M_orig=2, N_orig=4, snp_filter=None, sample_filter=None, R=R,
-            M_start=0, num_snps=2, parental_sources=self.trio_sources([2], [[0, 1]]))
-
-        # SNP 0: parents 2 and 0 -> mean 1.0, child 1.0 -> residual 0.0
-        # SNP 1: parents 1 and 1 -> mean 1.0, child 2.0 -> residual 1.0
-        assert np.allclose(actual[:, 2], [0.0, 1.0])
-
-        # Nobody else is touched
-        assert np.allclose(actual[:, [0, 1, 3]], G[:, [0, 1, 3]])
-
-
-    def test__relatives_of_an_affected_sample__center_against_the_differenced_value(self):
-        # The ordering that matters.  Subtracting the parental means BEFORE multiplying by R, or
-        # after, makes no difference to the affected individual -- their identity row passes them
-        # through either way.  It changes the answer for everyone centering against them.
-        #
-        # Samples 2 and 3 are siblings; 2 is a trio and so is differenced, 3 is not.  Sample 3's
-        # row centers the pair, so what it subtracts depends on whether sample 2 has already had
-        # its parents removed.
-        G = np.array([[2.0, 0.0, 1.0, 2.0]])
-        parental_sources = self.trio_sources([2], [[0, 1]])
-
-        # Sample 2 gets an identity row; sample 3 centers against both of them
-        R = sut.calculate_R(
-            pd.DataFrame({sut.FAM_INDEX_1 : [2], sut.FAM_INDEX_2 : [3],
-                          sut.KING_REL_COL : [sut.DEG_FULLSIB]}),
-            N=4, affected_samples=np.array([2]))
-
-        actual, _ = sut.get_residualized_genotype_data(
-            bed_file=G, M_orig=1, N_orig=4, snp_filter=None, sample_filter=None, R=R,
-            M_start=0, num_snps=1, parental_sources=parental_sources)
-
-        # Parents are 2 and 0, so the mean is 1.0 and sample 2 differences to 0.0.  Sample 3 then
-        # centers against that: 2.0 - (0.0 + 2.0) / 2 = 1.0.
-        #
-        # Had R been applied first, sample 3 would have centered against the RAW 1.0, giving
-        # 2.0 - (1.0 + 2.0) / 2 = 0.5, and its own parental mean would then have been subtracted
-        # from a value that had already been centered.
-        assert np.isclose(actual[0, 2], 0.0)
-        assert np.isclose(actual[0, 3], 1.0)
-
-
-    def test__parent_outside_the_analysis_sample__still_used(self):
-        # A parent dropped for a missing phenotype still has perfectly good genotypes, and the
-        # whole reason the parental means are taken before the sample filter is applied is so
-        # that they remain reachable.  Here sample 0 is the father and is NOT in sample_filter.
-        G = np.array([[2.0, 0.0, 1.0, 1.0]])
-        sample_filter = np.array([1, 2, 3])
-        R = sp.csr_array(np.identity(len(sample_filter)))
-
-        actual, _ = sut.get_residualized_genotype_data(
-            bed_file=G, M_orig=1, N_orig=4, snp_filter=None, sample_filter=sample_filter, R=R,
-            M_start=0, num_snps=1, parental_sources=self.trio_sources([2], [[0, 1]]))
-
-        # Sample 2 is at position 1 of the filtered array.  Its parents are 2 and 0, so the mean
-        # is 1.0 and the residual is 0.0 -- which needs the father's genotype, which the filter
-        # would have removed had it been applied first.
-        assert actual.shape == (1, 3)
-        assert np.isclose(actual[0, 1], 0.0)
-
-
-    def test__genotypes_passed_in_as_an_array__not_modified(self):
-        # With no SNP filter the block is a VIEW of the caller's array, so subtracting in place
-        # would reach back into it.  process_genotypes() reuses that array for every block, so the
-        # second block would be working from genotypes the first had already differenced.
-        G = np.array([[2.0, 0.0, 1.0, 1.0],
-                      [1.0, 1.0, 2.0, 0.0]])
-        before = G.copy()
-        R = sp.csr_array(np.identity(4))
-
-        sut.get_residualized_genotype_data(
-            bed_file=G, M_orig=2, N_orig=4, snp_filter=None, sample_filter=None, R=R,
-            M_start=0, num_snps=2, parental_sources=self.trio_sources([2], [[0, 1]]))
-
-        assert np.array_equal(before, G)
-
-
-    @pytest.mark.parametrize("parental_sources", [
-        pytest.param(None, id="no_parental_processing"),
-        pytest.param(sut.empty_parental_sources(), id="nobody_affected"),
-    ])
-    def test__no_parental_residualization__genotypes_untouched(self, parental_sources):
-        # Two separate guards: no imputed file and no trios at all, versus trios looked for and
-        # none found.  Both mean the same thing here.
-        G = np.array([[2.0, 0.0, 1.0, 1.0]])
-        R = sp.csr_array(np.identity(4))
-
-        actual, _ = sut.get_residualized_genotype_data(
-            bed_file=G, M_orig=1, N_orig=4, snp_filter=None, sample_filter=None, R=R,
-            M_start=0, num_snps=1, parental_sources=parental_sources)
-
-        assert np.allclose(actual, G)
-
-
-    def test__imputed_block_supplied__used_for_the_parent_that_was_not_genotyped(self):
-        # One parent genotyped and the other imputed.  The imputed arrays arrive already sliced to
-        # this block and already flipped, and are handed straight to the mean calculation.
-        G = np.array([[2.0, 9.0, 1.0, 9.0]])
-        R = sp.csr_array(np.identity(4))
-
-        imputed_block = {"imputed_gts" : np.array([[1.25]]),
-                         "num_obs_par_alleles" : np.array([[3.0]]),
-                         "standard_f" : np.array([0.25])}
-
-        actual, _ = sut.get_residualized_genotype_data(
-            bed_file=G, M_orig=1, N_orig=4, snp_filter=None, sample_filter=None, R=R,
-            M_start=0, num_snps=1,
-            parental_sources=self.trio_sources([2], [[0, -1]], imputed_rows=np.array([0])),
-            imputed_block=imputed_block)
-
-        # corrected = 1.25 - 0.25 * (4 - 3) = 1.0; mean = (2.0 + 1.0) / 2 = 1.5
-        assert np.isclose(actual[0, 2], 1.0 - 1.5)
-
-
-    def test__affected_sample_who_is_also_a_parent__differenced_against_raw_genotypes(self):
-        # Three generations.  Sample 2 is the child of 0 and 1, and the parent of 4 along with 3.
-        # Every mean is computed before any subtraction is applied, so sample 4 is differenced
-        # against sample 2's RAW genotype rather than against one already adjusted.
-        G = np.array([[2.0, 0.0, 1.0, 1.0, 1.0]])
-        R = sp.csr_array(np.identity(5))
-
-        actual, _ = sut.get_residualized_genotype_data(
-            bed_file=G, M_orig=1, N_orig=5, snp_filter=None, sample_filter=None, R=R,
-            M_start=0, num_snps=1, parental_sources=self.trio_sources([2, 4], [[0, 1], [2, 3]]))
-
-        # Sample 2: parents 2 and 0 -> mean 1.0 -> residual 0.0
-        # Sample 4: parents 1 (RAW sample 2) and 1 -> mean 1.0 -> residual 0.0
-        #
-        # Had sample 2 been differenced first, sample 4's mean would be (0.0 + 1.0) / 2 = 0.5 and
-        # its residual 0.5 instead.
-        assert np.allclose(actual[0, [2, 4]], [0.0, 0.0])
-
-
-    def test__missing_parental_genotype__knocks_out_the_relatedness_group(self):
-        # A parent missing at a SNP makes that SNP missing for the child, and the NaN then spreads
-        # through R to everyone centering against them before being zeroed.  The whole group loses
-        # the SNP rather than just the child.
-        #
-        # This is conservative rather than wrong: zeroing before R instead would treat the missing
-        # genotype as homozygous reference and bias the group's mean, where zeroing after discards
-        # a contrast that cannot be computed.
-        G = np.array([[np.nan, 0.0, 1.0, 2.0]])
-        R = sut.calculate_R(
-            pd.DataFrame({sut.FAM_INDEX_1 : [2], sut.FAM_INDEX_2 : [3],
-                          sut.KING_REL_COL : [sut.DEG_FULLSIB]}),
-            N=4, affected_samples=np.array([2]))
-
-        actual, _ = sut.get_residualized_genotype_data(
-            bed_file=G, M_orig=1, N_orig=4, snp_filter=None, sample_filter=None, R=R,
-            M_start=0, num_snps=1, parental_sources=self.trio_sources([2], [[0, 1]]))
-
-        # Sample 2 is missing, and sample 3 centers against it, so both come back as zero
-        assert np.allclose(actual[0, [2, 3]], [0.0, 0.0])
-
-
-class TestCalculateParentalMeans:
-
-    # Both parents genotyped means there is nothing to impute, and that arises in BOTH modes:
-    # in fam file trio mode there is no imputed file at all (imputed_rows is None), and in imputed
-    # parent mode the family simply has no row in it (imputed_rows is -1).  The two take different
-    # routes through calculate_parental_means() -- None short-circuits before the imputed branch
-    # is considered, -1 reaches the guard and is turned away by it -- and must agree, which is
-    # what running the same expectations through both asserts.
-    @pytest.mark.parametrize("imputed_rows, imputed_file, snipar_metadata", [
-        pytest.param(None, None, None, id="fam_file_trio_mode"),
-        pytest.param(np.array([-1]), "unused -- nobody has an imputed row", {},
-                     id="imputed_mode_family_has_no_imputed_row"),
-    ])
-    def test__both_parents_observed__expected_results(self, imputed_rows, imputed_file,
-                                                      snipar_metadata):
-        # Dimensions are all distinct -- 3 SNPs, 5 samples, 1 of them affected -- so that a
-        # transposition cannot pass unnoticed.
-        #
-        # Sample 0 is the father, 1 the mother, 2 their child; 3 and 4 are unrelated and should be
-        # untouched.  The three SNPs give three different parental means, so a bug returning a
-        # constant cannot pass:
-        #
-        #     SNP 0: father 2, mother 0 -> mean 1.0
-        #     SNP 1: father 1, mother 0 -> mean 0.5
-        #     SNP 2: father 2, mother 2 -> mean 2.0
-        #
-        # SNP 0 is worth checking by hand.  A parent with genotype 2 always transmits that allele
-        # and a parent with genotype 0 never does, so the child's genotype is forced to 1 and the
-        # residual must be exactly 0.  Subtracting half the TRANSMITTED ALLELE instead of half the
-        # GENOTYPE would give 0.5 here, which is the error this case exists to catch.
-        #
-        # The imputed arrays are deliberately NOT passed in either run: neither route needs them,
-        # and the function must not require them.
-        G = np.array([[2.0, 0.0, 1.0, 1.0, 0.0],
-                      [1.0, 0.0, 1.0, 0.0, 1.0],
-                      [2.0, 2.0, 2.0, 1.0, 2.0]])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([2]),
-            observed_parent_cols=np.array([[0, 1]]),
-            imputed_rows=imputed_rows,
-            imputed_file=imputed_file,
-            snipar_metadata=snipar_metadata)
-
-        expected = np.array([[1.0],
-                             [0.5],
-                             [2.0]])
-
-        actual = sut.calculate_parental_means(G=G, parental_sources=parental_sources)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-        # The homozygous SNP leaves no Mendelian variation, so the child residualizes to zero
-        assert np.isclose(G[0, 2] - actual[0, 0], 0.0)
-
-
-    # Which of the two parents was genotyped makes no difference to the result -- the parental
-    # mean is symmetric in them -- so the same expected values serve both.  Running it both ways
-    # catches a bug that masks only one of the two columns.
-    @pytest.mark.parametrize("observed_parent_cols", [
-        pytest.param(np.array([[0, -1]]), id="father_observed"),
-        pytest.param(np.array([[-1, 0]]), id="mother_observed"),
-    ])
-    def test__one_parent_observed__expected_results(self, observed_parent_cols):
-        # 3 SNPs, 5 samples, 1 affected.  Sample 0 is the genotyped parent, sample 1 the child;
-        # the other parent was not genotyped, so their contribution comes from the imputed file.
-        #
-        # The two parents are handled DIFFERENTLY and deliberately so.  For the observed parent
-        # the genotype is known, so half of it is the expected transmitted allele.  For the
-        # unobserved parent only the transmitted allele itself is known, and it is subtracted
-        # whole.  Per SNP:
-        #
-        #     corrected = imputed - standard_f * (4 - k)     <- the transmitted allele
-        #     mean      = (g_observed + corrected) / 2
-        #
-        #     SNP 0: f=0.25 k=3 imputed=1.25 -> corrected 1.0, observed 2.0 -> mean 1.5
-        #     SNP 1: f=0.50 k=3 imputed=0.50 -> corrected 0.0, observed 0.0 -> mean 0.0
-        #     SNP 2: f=0.10 k=2 imputed=1.20 -> corrected 1.0, observed 1.0 -> mean 1.0
-        #
-        # standard_f differs per SNP so that a bug using one SNP's frequency for all of them
-        # cannot pass, and k is not constant so that the (4 - k) multiplier is tested rather than
-        # merely the presence of a subtraction.
-        G = np.array([[2.0, 1.0, 0.0, 1.0, 2.0],
-                      [0.0, 0.0, 1.0, 2.0, 1.0],
-                      [1.0, 2.0, 2.0, 0.0, 0.0]])
-
-        # Two families in the imputed file, with the affected individual's in the SECOND row, so
-        # that a bug reading row 0 regardless cannot pass.  Shape is (families, SNPs).
-        imputed_gts = np.array([[9.0, 9.0, 9.0],
-                                [1.25, 0.5, 1.2]])
-        num_obs_par_alleles = np.array([[4.0, 4.0, 4.0],
-                                        [3.0, 3.0, 2.0]])
-        standard_f = np.array([0.25, 0.5, 0.1])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([1]),
-            observed_parent_cols=observed_parent_cols,
-            imputed_rows=np.array([1]),
-            imputed_file="unused -- the arrays are passed in directly",
-            snipar_metadata={})
-
-        expected = np.array([[1.5],
-                             [0.0],
-                             [1.0]])
-
-        actual = sut.calculate_parental_means(G=G, parental_sources=parental_sources,
-                                              imputed_gts=imputed_gts,
-                                              num_obs_par_alleles=num_obs_par_alleles,
-                                              standard_f=standard_f)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-
-    def test__neither_parent_observed__expected_results(self):
-        # 3 SNPs, 5 samples, 1 affected -- individual 2, who has no genotyped parent at all.  G is
-        # therefore never read for them; it is filled with a sentinel to make that explicit, and
-        # the test would fail loudly if any of it leaked into the result.
-        #
-        # This is the branch where imputed_par_gts holds the AVERAGE of two parents rather than
-        # one parent's genotype.  An average carries half the frequency contribution of a sum, so
-        # the correction is halved -- and the corrected value then stands for both parents, so it
-        # counts twice towards the sum:
-        #
-        #     corrected = imputed - standard_f * (4 - k) / 2
-        #     mean      = (corrected * 2) / 2 = corrected
-        #
-        # The doubling and the halving cancel, which is worth knowing before anyone "simplifies"
-        # them away: they do not cancel in the one-parent-observed branch, where only one applies.
-        # Without the divisor this case over-subtracts and can produce a NEGATIVE observed-allele
-        # count, which is impossible by construction and is how two earlier errors were caught.
-        #
-        #     k=[2,3,2]  imputed=[0.75, 1.25, 1.6]  ->  mean [0.5, 1.0, 1.5]
-        G = np.full((3, 5), 9.0)
-
-        # Two families, with the affected individual's at the SECOND row, so that a bug reading
-        # row 0 regardless cannot pass.  Indexing across SEVERAL live rows is covered by the
-        # mixed-configuration case rather than here.
-        imputed_gts = np.array([[9.0, 9.0, 9.0],
-                                [0.75, 1.25, 1.6]])
-        num_obs_par_alleles = np.array([[4.0, 4.0, 4.0],
-                                        [2.0, 3.0, 2.0]])
-        standard_f = np.array([0.25, 0.5, 0.1])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([2]),
-            observed_parent_cols=np.array([[-1, -1]]),
-            imputed_rows=np.array([1]),
-            imputed_file="unused -- the arrays are passed in directly",
-            snipar_metadata={})
-
-        expected = np.array([[0.5],
-                             [1.0],
-                             [1.5]])
-
-        actual = sut.calculate_parental_means(G=G, parental_sources=parental_sources,
-                                              imputed_gts=imputed_gts,
-                                              num_obs_par_alleles=num_obs_par_alleles,
-                                              standard_f=standard_f)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-    def test__missing_parental_genotype__snp_missing_for_the_child(self):
-        # A genotype missing for either parent at a SNP makes that SNP missing for the child as
-        # well: there is no way to say what the child inherited when half of what they inherited
-        # from is unknown, and GRMA has no fallback for it.  (The transmitted-allele rule used
-        # when one parent is ungenotyped does not help here -- that needs phasing information,
-        # which only an imputed parental genotype file provides.)
-        #
-        # The propagation is currently a consequence of the arithmetic rather than an explicit
-        # branch: a NaN enters the parental sum and survives the division.  That is the correct
-        # behaviour, but it is fragile -- replacing the sum with something NaN-tolerant, say
-        # np.nansum, would silently turn a missing parent into a parent with genotype 0 and make
-        # the mean wrong rather than absent.  Hence this test.
-        #
-        # Sample 0 is the father, 1 the mother, 2 their child.  The father is missing at SNP 1
-        # only, so SNPs 0 and 2 must still produce ordinary means:
-        #
-        #     SNP 0: father 2, mother 0   -> 1.0
-        #     SNP 1: father NaN, mother 1 -> NaN
-        #     SNP 2: father 1, mother 1   -> 1.0
-        G = np.array([[2.0, 0.0, 1.0, 1.0, 0.0],
-                      [np.nan, 1.0, 1.0, 0.0, 1.0],
-                      [1.0, 1.0, 2.0, 1.0, 2.0]])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([2]),
-            observed_parent_cols=np.array([[0, 1]]),
-            imputed_rows=None,
-            imputed_file=None,
-            snipar_metadata=None)
-
-        actual = sut.calculate_parental_means(G=G, parental_sources=parental_sources)
-
-        assert actual.shape == (G.shape[0], len(parental_sources.affected_samples))
-
-        # Missing at the SNP where a parent is missing, and ONLY there -- a NaN that spread to
-        # the other SNPs would mean one missing call knocked out the whole individual
-        assert np.isnan(actual[1, 0])
-        assert np.allclose([1.0, 1.0], [actual[0, 0], actual[2, 0]])
-
-
-    def test__no_affected_samples__empty_result(self):
-        # Nobody is residualized against their parents, which happens whenever the fam file lists
-        # no parents, or lists none that are usable.  The caller currently skips this function
-        # entirely in that case, so the guard lives outside it -- but a function that falls over
-        # on an empty input is one bad refactor away from a crash, and an empty result costs
-        # nothing to support.
-        #
-        # empty_parental_sources() is used rather than hand-built arrays so that whatever it
-        # produces is what gets tested; the two could otherwise drift apart.
-        G = np.array([[2.0, 0.0, 1.0, 1.0, 0.0],
-                      [1.0, 0.0, 1.0, 0.0, 1.0],
-                      [2.0, 2.0, 2.0, 1.0, 2.0]])
-
-        parental_sources = sut.empty_parental_sources()
-
-        actual = sut.calculate_parental_means(G=G, parental_sources=parental_sources)
-
-        # One column per affected individual, of which there are none.  The SNP dimension still
-        # has to be right: a (0, 0) result would subtract cleanly today and break the moment
-        # somebody is affected.
-        assert actual.shape == (G.shape[0], 0)
-
-        # Subtracting an empty result from an empty column selection is what the caller does, and
-        # it must leave the genotypes untouched
-        unchanged = G.copy()
-        unchanged[:, parental_sources.affected_samples] -= actual
-        assert np.array_equal(G, unchanged)
-
-
-    def test__siblings_share_both_parents__each_gets_its_own_column(self):
-        # Siblings are the ordinary case, not an edge case -- a couple with three children gives
-        # three affected individuals all pointing at the same two parent columns.  The parental
-        # sum is indexed by affected individual while the genotypes are indexed by parent, so
-        # repeated parent indices must not make two siblings collide into one column.
-        #
-        # Sample 0 is the father, 1 the mother, 2 through 4 their children.  All three have the
-        # same parents and so the same expected means, which is the point:
-        #
-        #     SNP 0: father 2, mother 0 -> 1.0
-        #     SNP 1: father 1, mother 0 -> 0.5
-        #     SNP 2: father 2, mother 2 -> 2.0
-        #
-        # Note what this canNOT catch: with every sibling expecting the same value, a bug that
-        # computes one column and broadcasts it to the rest passes.  Distinguishing those needs
-        # affected individuals whose expected values DIFFER, which the mixed-configuration case
-        # provides.
-        G = np.array([[2.0, 0.0, 1.0, 1.0, 0.0],
-                      [1.0, 0.0, 1.0, 0.0, 1.0],
-                      [2.0, 2.0, 2.0, 1.0, 2.0]])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([2, 3, 4]),
-            observed_parent_cols=np.array([[0, 1], [0, 1], [0, 1]]),
-            imputed_rows=None,
-            imputed_file=None,
-            snipar_metadata=None)
-
-        expected = np.array([[1.0, 1.0, 1.0],
-                             [0.5, 0.5, 0.5],
-                             [2.0, 2.0, 2.0]])
-
-        actual = sut.calculate_parental_means(G=G, parental_sources=parental_sources)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-
-    def test__affected_samples_out_of_order__columns_follow_that_order(self):
-        # Nothing requires affected_samples to be sorted.  It comes out of whichever parental
-        # processing branch ran, and in imputed parent mode that is the order of snipar's pedigree
-        # records, which bears no relation to the fam file's ordering.
-        #
-        # So the result's columns correspond to affected_samples POSITIONALLY, not to sample
-        # order.  Column 0 belongs to whoever affected_samples names first, whatever their sample
-        # index.  Getting this wrong would pair every affected individual with somebody else's
-        # parents -- plausible-looking numbers attached to the wrong people.
-        #
-        # Sample 4 is listed first and sample 1 second, deliberately reversing sample order.
-        # Their parents differ, so the two columns must differ too:
-        #
-        #     individual 4, parents 0 and 2: (2+1)/2, (1+0)/2, (2+0)/2 -> 1.5, 0.5, 1.0
-        #     individual 1, parents 3 and 0: (0+2)/2, (2+1)/2, (1+2)/2 -> 1.0, 1.5, 1.5
-        G = np.array([[2.0, 9.0, 1.0, 0.0, 9.0],
-                      [1.0, 9.0, 0.0, 2.0, 9.0],
-                      [2.0, 9.0, 0.0, 1.0, 9.0]])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([4, 1]),
-            observed_parent_cols=np.array([[0, 2], [3, 0]]),
-            imputed_rows=None,
-            imputed_file=None,
-            snipar_metadata=None)
-
-        expected = np.array([[1.5, 1.0],
-                             [0.5, 1.5],
-                             [1.0, 1.5]])
-
-        actual = sut.calculate_parental_means(G=G, parental_sources=parental_sources)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-
-    def test__affected_individual_is_also_a_parent__genotypes_not_modified(self):
-        # affected_samples and the parent columns can overlap: in a pedigree spanning three
-        # generations, somebody is both a child with parents of their own and a parent in turn.
-        # That individual's own parental mean is subtracted later, by the caller, but the mean
-        # computed for THEIR child must use their raw genotype, not an already-differenced one.
-        #
-        # What makes that work is that this function only ever reads G.  It computes every mean
-        # into a fresh array and leaves the genotypes untouched, so the caller can subtract them
-        # all in one go afterwards.  Were G used as scratch space -- an easy optimisation to
-        # reach for -- the order in which individuals happened to be processed would start
-        # changing the answers.
-        #
-        # Samples 0 and 1 are grandparents, 2 their child, 3 an unrelated spouse, 4 the grandchild.
-        # Individuals 2 and 4 are affected, and 2 appears in both roles:
-        #
-        #     individual 2, parents 0 and 1: 1.0, 1.0, 1.0
-        #     individual 4, parents 2 and 3: 1.0, 1.0, 1.5   <- from the RAW genotype of 2
-        #
-        # Had G been written to first, individual 4 would come out at 0.5, 0.5, 1.0 instead.
-        G = np.array([[2.0, 0.0, 1.0, 1.0, 1.0],
-                      [1.0, 1.0, 2.0, 0.0, 1.0],
-                      [0.0, 2.0, 1.0, 2.0, 2.0]])
-        G_before = G.copy()
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([2, 4]),
-            observed_parent_cols=np.array([[0, 1], [2, 3]]),
-            imputed_rows=None,
-            imputed_file=None,
-            snipar_metadata=None)
-
-        expected = np.array([[1.0, 1.0],
-                             [1.0, 1.0],
-                             [1.0, 1.5]])
-
-        actual = sut.calculate_parental_means(G=G, parental_sources=parental_sources)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-        # The genotypes the caller still needs must come back exactly as they went in
-        assert np.array_equal(G_before, G)
-
-
-    def test__no_parental_information__subtracts_nothing(self):
-        # An affected individual with neither a genotyped parent nor an imputed row has nothing
-        # to be residualized against, and gets a parental mean of zero.
-        #
-        # Nothing is raised and nothing is logged.  GRMA code excludes such
-        # individuals before they ever reach here -- both of its branches report how many were
-        # dropped -- so a check in this function would be a second place enforcing one rule, and
-        # would run once per block rather than once per run.  The behaviour is pinned anyway,
-        # because "zero" is what the arithmetic gives and somebody should have to change this test
-        # deliberately before changing that.
-        #
-        # G is filled with a sentinel rather than genotypes.  A -1 that escaped the mask would be
-        # read by numpy as the LAST sample rather than rejected, so the only way to see that go
-        # wrong is for the value it would pick up to be obviously not a parental mean.
-        G = np.full((3, 5), 9.0)
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([4]),
-            observed_parent_cols=np.array([[-1, -1]]),
-            imputed_rows=None,
-            imputed_file=None,
-            snipar_metadata=None)
-
-        expected = np.zeros((3, 1))
-
-        actual = sut.calculate_parental_means(G=G, parental_sources=parental_sources)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-
-    def test__mixed_configurations__each_individual_handled_independently(self):
-        # Real data has every configuration mixed together in one block, and the masking is what
-        # keeps them apart.  Each affected individual is handled by a boolean mask over the
-        # parent columns and another over the imputed rows, and the two have to stay aligned with
-        # each other and with the output columns.  The cases above each isolate one configuration;
-        # this one checks that none of them disturbs its neighbours.
-        #
-        # Every individual expects a DIFFERENT value, which matters: with identical expectations
-        # a bug that computes one column and broadcasts it to the rest would pass.
-        #
-        # Samples 0-3 are parents, 4 is unused, 5-9 are the affected individuals:
-        #
-        #   5  both parents observed (0 and 1), no imputed row
-        #   6  father observed (2), imputed row 1
-        #   7  mother observed (3), imputed row 3
-        #   8  neither observed, imputed row 4
-        #   9  nothing at all
-        #
-        # The imputed rows are non-contiguous, so a bug walking them in order rather than reading
-        # the row each individual names cannot pass.  k varies by individual AND by SNP, so the
-        # (4 - k) multiplier has to be applied per cell rather than per row or per SNP.
-        #
-        #   5: (2+0)/2, (1+1)/2, (0+2)/2                           -> 1.0,  1.0,   1.0
-        #   6: corrected 1.0, 0.5, 0.5; father 1, 2, 1             -> 1.0,  1.25,  0.75
-        #   7: corrected 0.5, 0.25, 2.0; mother 2, 0, 1            -> 1.25, 0.125, 1.5
-        #   8: corrected 0.5, 0.5, 1.5, halved correction, doubled -> 0.5,  0.5,   1.5
-        #   9: nothing                                             -> 0.0,  0.0,   0.0
-        G = np.array([[2.0, 0.0, 1.0, 2.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0],
-                      [1.0, 1.0, 2.0, 0.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0],
-                      [0.0, 2.0, 1.0, 1.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0]])
-
-        # Five families.  Rows 0 and 2 belong to nobody here and hold sentinels, so a bug reading
-        # the wrong row produces something obviously not a parental mean.
-        imputed_gts = np.array([[9.0, 9.0, 9.0],
-                                [1.25, 1.5, 0.6],
-                                [9.0, 9.0, 9.0],
-                                [1.0, 0.75, 2.0],
-                                [0.625, 1.0, 1.6]])
-        num_obs_par_alleles = np.array([[4.0, 4.0, 4.0],
-                                        [3.0, 2.0, 3.0],
-                                        [4.0, 4.0, 4.0],
-                                        [2.0, 3.0, 4.0],
-                                        [3.0, 2.0, 2.0]])
-        standard_f = np.array([0.25, 0.5, 0.1])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([5, 6, 7, 8, 9]),
-            observed_parent_cols=np.array([[0, 1], [2, -1], [-1, 3], [-1, -1], [-1, -1]]),
-            imputed_rows=np.array([-1, 1, 3, 4, -1]),
-            imputed_file="unused -- the arrays are passed in directly",
-            snipar_metadata={})
-
-        expected = np.array([[1.0, 1.0,   1.25,  0.5, 0.0],
-                             [1.0, 1.25,  0.125, 0.5, 0.0],
-                             [1.0, 0.75,  1.5,   1.5, 0.0]])
-
-        actual = sut.calculate_parental_means(G=G, parental_sources=parental_sources,
-                                              imputed_gts=imputed_gts,
-                                              num_obs_par_alleles=num_obs_par_alleles,
-                                              standard_f=standard_f)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-
-
-class TestCalculateImputedContribution:
-
-    # This function returns the imputed parents' contribution to the PARENTAL SUM, not a mean and
-    # not a corrected genotype.  Its caller halves the sum afterwards; nothing here does.
-    #
-    # Flipping happens before this function sees its inputs, in read_imputed_block(), so no case
-    # here involves a flip.
-
-    def test__one_parent_observed__frequency_removed_without_a_divisor(self):
-        # snipar fills the parental alleles it could not observe with the population allele
-        # frequency.  That term carries population structure, so GRMA takes it back out and keeps
-        # only genuinely observed alleles.
-        #
-        # Where ONE parent was genotyped, the imputed value is that single missing parent's
-        # genotype, so the whole frequency contribution is subtracted and the result counts once:
-        #
-        #     contribution = imputed - standard_f * (4 - k)
-        #
-        # 3 SNPs, 5 families, 1 affected individual -- all different, so a transposition cannot
-        # pass.  k differs between SNPs so that the (4 - k) multiplier is tested rather than
-        # merely the presence of a subtraction, and standard_f differs too so that a bug reusing
-        # one SNP's frequency fails.  k=4 is deliberately absent: it makes the correction zero,
-        # so that SNP would exercise nothing here.  The no-op case has its own test.
-        #
-        #     SNP 0: f=0.25 k=2 imputed=1.00 -> 1.00 - 0.50 = 0.50
-        #     SNP 1: f=0.50 k=3 imputed=0.75 -> 0.75 - 0.50 = 0.25
-        #     SNP 2: f=0.10 k=2 imputed=1.30 -> 1.30 - 0.20 = 1.10
-        #
-        # The affected individual reads family 3, with sentinels in the rows either side, so a bug
-        # reading the wrong row produces something obviously not an allele count.
-        imputed_gts = np.array([[9.0, 9.0, 9.0],
-                                [9.0, 9.0, 9.0],
-                                [9.0, 9.0, 9.0],
-                                [1.0, 0.75, 1.3],
-                                [9.0, 9.0, 9.0]])
-        num_obs_par_alleles = np.array([[-1.0, -1.0, -1.0],
-                                        [-1.0, -1.0, -1.0],
-                                        [-1.0, -1.0, -1.0],
-                                        [2.0, 3.0, 2.0],
-                                        [-1.0, -1.0, -1.0]])
-        standard_f = np.array([0.25, 0.5, 0.1])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([7]),
-            observed_parent_cols=np.array([[0, -1]]),
-            imputed_rows=np.array([3]),
-            imputed_file="unused -- the arrays are passed in directly",
-            snipar_metadata={})
-
-        expected = np.array([[0.5],
-                             [0.25],
-                             [1.1]])
-
-        actual = sut.calculate_imputed_contribution(
-            parental_sources=parental_sources, imputed_gts=imputed_gts,
-            num_obs_par_alleles=num_obs_par_alleles, standard_f=standard_f)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-
-    def test__neither_parent_observed__correction_halved_and_result_doubled(self):
-        # Where NEITHER parent was genotyped, imputed_par_gts holds the AVERAGE of the two rather
-        # than one parent's genotype.  An average carries half the frequency contribution of a
-        # sum, so the correction is halved -- and the corrected value then stands for both
-        # parents, so it counts twice towards the parental sum:
-        #
-        #     contribution = (imputed - standard_f * (4 - k) / 2) * 2
-        #
-        # Both operations are needed and they do NOT cancel, however much they look as though
-        # they might: the halving applies only here while the doubling applies only here too, and
-        # removing one leaves the other.  Dropping the divisor over-subtracts and can drive the
-        # recovered allele count below zero, which is impossible by construction.
-        #
-        # The inputs are deliberately identical to the one-parent-observed case, so the two tests
-        # differ only in which branch runs.  Same imputed values, same k, same frequencies:
-        #
-        #     one parent observed : 0.50, 0.25, 1.10
-        #     neither observed    : 1.50, 1.00, 2.40
-        #
-        #     SNP 0: f=0.25 k=2 imputed=1.00 -> (1.00 - 0.25) * 2 = 1.50
-        #     SNP 1: f=0.50 k=3 imputed=0.75 -> (0.75 - 0.25) * 2 = 1.00
-        #     SNP 2: f=0.10 k=2 imputed=1.30 -> (1.30 - 0.10) * 2 = 2.40
-        imputed_gts = np.array([[9.0, 9.0, 9.0],
-                                [9.0, 9.0, 9.0],
-                                [9.0, 9.0, 9.0],
-                                [1.0, 0.75, 1.3],
-                                [9.0, 9.0, 9.0]])
-        num_obs_par_alleles = np.array([[-1.0, -1.0, -1.0],
-                                        [-1.0, -1.0, -1.0],
-                                        [-1.0, -1.0, -1.0],
-                                        [2.0, 3.0, 2.0],
-                                        [-1.0, -1.0, -1.0]])
-        standard_f = np.array([0.25, 0.5, 0.1])
-
-        # Both parent columns are -1, which is what selects this branch
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([7]),
-            observed_parent_cols=np.array([[-1, -1]]),
-            imputed_rows=np.array([3]),
-            imputed_file="unused -- the arrays are passed in directly",
-            snipar_metadata={})
-
-        expected = np.array([[1.5],
-                             [1.0],
-                             [2.4]])
-
-        actual = sut.calculate_imputed_contribution(
-            parental_sources=parental_sources, imputed_gts=imputed_gts,
-            num_obs_par_alleles=num_obs_par_alleles, standard_f=standard_f)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-
-    # k = 4 means snipar observed all four parental alleles and filled in nothing, so there is no
-    # frequency contribution to remove.  The correction vanishes -- but the DOUBLING does not,
-    # and only one of the two branches has it.  Running both makes that visible: the same imputed
-    # values come back unchanged for one observed parent and doubled for none.
-    @pytest.mark.parametrize("observed_parent_cols, expected_multiplier", [
-        pytest.param(np.array([[0, -1]]), 1.0, id="one_parent_observed"),
-        pytest.param(np.array([[-1, -1]]), 2.0, id="neither_parent_observed"),
-    ])
-    def test__all_parental_alleles_observed__no_frequency_removed(self, observed_parent_cols,
-                                                                  expected_multiplier):
-        # standard_f is deliberately large and varied.  Nothing should be subtracted whatever it
-        # holds, so a frequency that leaked through would be obvious rather than marginal.
-        imputed_gts = np.array([[9.0, 9.0, 9.0],
-                                [9.0, 9.0, 9.0],
-                                [9.0, 9.0, 9.0],
-                                [1.0, 0.75, 1.3],
-                                [9.0, 9.0, 9.0]])
-        num_obs_par_alleles = np.full((5, 3), 4.0)
-        standard_f = np.array([0.4, 0.45, 0.5])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([7]),
-            observed_parent_cols=observed_parent_cols,
-            imputed_rows=np.array([3]),
-            imputed_file="unused -- the arrays are passed in directly",
-            snipar_metadata={})
-
-        expected = np.array([[1.0], [0.75], [1.3]]) * expected_multiplier
-
-        actual = sut.calculate_imputed_contribution(
-            parental_sources=parental_sources, imputed_gts=imputed_gts,
-            num_obs_par_alleles=num_obs_par_alleles, standard_f=standard_f)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-
-    def test__non_contiguous_imputed_rows__each_individual_reads_its_own(self):
-        # imputed_rows holds, for each affected individual, which row of the imputed arrays
-        # belongs to their family.  Those rows are not consecutive and bear no relation to the
-        # order of the individuals: families are stored sorted by ID, and which of them end up
-        # with affected offspring in a given analysis is arbitrary.
-        #
-        # Three individuals reading rows 0, 2 and 5 of a seven-row file, with sentinel rows
-        # between them.  A bug walking the rows in order, or reusing one row, or offsetting by
-        # the individual's position would all pick up a sentinel and fail obviously.
-        #
-        # The branches are mixed as well, so the row lookup is tested under both:
-        #
-        #     individual at row 0, one parent observed : 0.50, 0.25, 1.10
-        #     individual at row 2, neither observed    : 0.75, 1.50, 0.70
-        #     individual at row 5, one parent observed : 1.00, 0.25, 2.00
-        #
-        # Every imputed value is at least as large as the frequency contribution it contains,
-        # which is a property of real data: snipar's imputed genotype INCLUDES the filled-in
-        # frequency, so removing it cannot drive the recovered allele count below zero.
-        imputed_gts = np.array([[1.0, 0.75, 1.3],
-                                [9.0, 9.0, 9.0],
-                                [0.5, 1.25, 0.4],
-                                [9.0, 9.0, 9.0],
-                                [9.0, 9.0, 9.0],
-                                [1.5, 1.25, 2.0],
-                                [9.0, 9.0, 9.0]])
-        num_obs_par_alleles = np.array([[2.0, 3.0, 2.0],
-                                        [-1.0, -1.0, -1.0],
-                                        [3.0, 2.0, 3.0],
-                                        [-1.0, -1.0, -1.0],
-                                        [-1.0, -1.0, -1.0],
-                                        [2.0, 2.0, 4.0],
-                                        [-1.0, -1.0, -1.0]])
-        standard_f = np.array([0.25, 0.5, 0.1])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([11, 12, 13]),
-            observed_parent_cols=np.array([[0, -1], [-1, -1], [-1, 1]]),
-            imputed_rows=np.array([0, 2, 5]),
-            imputed_file="unused -- the arrays are passed in directly",
-            snipar_metadata={})
-
-        expected = np.array([[0.5,  0.75, 1.0],
-                             [0.25, 1.5,  0.25],
-                             [1.1,  0.7,  2.0]])
-
-        actual = sut.calculate_imputed_contribution(
-            parental_sources=parental_sources, imputed_gts=imputed_gts,
-            num_obs_par_alleles=num_obs_par_alleles, standard_f=standard_f)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-
-
-    def test__some_individuals_have_no_imputed_row__those_columns_are_zero(self):
-        # A -1 in imputed_rows means that family had both parents genotyped, so snipar imputed
-        # nothing for it and there is no row to read.  Those individuals contribute zero from
-        # this function; their parental mean comes entirely from the bed file.
-        #
-        # The zero has to land in that individual's OWN column.  The imputed arrays are indexed
-        # by the live rows only, so the results come back shorter than the list of individuals and
-        # have to be scattered back into the right positions -- dropping the -1 individuals
-        # instead, or packing the results from the left, would shift everybody after them onto
-        # somebody else's values.
-        #
-        # Four individuals, with the -1 ones second and last so that a shift is visible at both
-        # ends:
-        #
-        #     individual 0: row 1, one parent observed -> 0.50, 0.25, 1.10
-        #     individual 1: no imputed row             -> 0.00, 0.00, 0.00
-        #     individual 2: row 4, neither observed    -> 0.75, 1.50, 0.70
-        #     individual 3: no imputed row             -> 0.00, 0.00, 0.00
-        imputed_gts = np.array([[9.0, 9.0, 9.0],
-                                [1.0, 0.75, 1.3],
-                                [9.0, 9.0, 9.0],
-                                [9.0, 9.0, 9.0],
-                                [0.5, 1.25, 0.4]])
-        num_obs_par_alleles = np.array([[-1.0, -1.0, -1.0],
-                                        [2.0, 3.0, 2.0],
-                                        [-1.0, -1.0, -1.0],
-                                        [-1.0, -1.0, -1.0],
-                                        [3.0, 2.0, 3.0]])
-        standard_f = np.array([0.25, 0.5, 0.1])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([11, 12, 13, 14]),
-            observed_parent_cols=np.array([[0, -1], [0, 1], [-1, -1], [0, 1]]),
-            imputed_rows=np.array([1, -1, 4, -1]),
-            imputed_file="unused -- the arrays are passed in directly",
-            snipar_metadata={})
-
-        expected = np.array([[0.5,  0.0, 0.75, 0.0],
-                             [0.25, 0.0, 1.5,  0.0],
-                             [1.1,  0.0, 0.7,  0.0]])
-
-        actual = sut.calculate_imputed_contribution(
-            parental_sources=parental_sources, imputed_gts=imputed_gts,
-            num_obs_par_alleles=num_obs_par_alleles, standard_f=standard_f)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-
-
-    def test__no_individual_has_an_imputed_row__zero_contribution(self):
-        # Every affected individual in this block had both parents genotyped, so none of them has
-        # a row in the imputed file.  The whole contribution is zero.
-        #
-        # The pipeline never takes this path, since calculate_parental_means() guards against it,
-        # but the shape still has to be right for the addition the caller performs.
-        #
-        # Deliberately large frequencies and low allele counts, so that anything computed instead
-        # of returning zeros would come out visibly wrong rather than near zero.
-        imputed_gts = np.full((5, 3), 9.0)
-        num_obs_par_alleles = np.full((5, 3), -1.0)
-        standard_f = np.array([0.4, 0.45, 0.5])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([11, 12]),
-            observed_parent_cols=np.array([[0, 1], [2, 3]]),
-            imputed_rows=np.array([-1, -1]),
-            imputed_file="unused -- nobody has an imputed row",
-            snipar_metadata={})
-
-        expected = np.zeros((3, 2))
-
-        actual = sut.calculate_imputed_contribution(
-            parental_sources=parental_sources, imputed_gts=imputed_gts,
-            num_obs_par_alleles=num_obs_par_alleles, standard_f=standard_f)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-
-    def test__unknown_allele_count__contribution_missing_for_that_cell_only(self):
-        # snipar records NaN in num_observed_parental_alleles wherever its backup imputation path
-        # fired and it could not establish how many parental alleles it had actually seen.  That
-        # is not rare -- it was 13.3% of the cells in a file generated from snipar's own example
-        # data.
-        #
-        # Without the count there is no way to know how much frequency was folded in, so the
-        # correction cannot be computed and the contribution is missing for that family at that
-        # SNP.  It flows on to a missing parental mean and a SNP knocked out for that individual,
-        # which is how a missing parental genotype behaves too.  snipar's own robust estimator
-        # masks these entries rather than guessing at them.
-        #
-        # Two individuals, so that one family's missing count cannot take its neighbour with it,
-        # and the NaN sits at a single SNP so the other two must still come out as numbers:
-        #
-        #     individual 0 (row 1): k = 2, NaN, 3  ->  0.5, NaN, 1.2
-        #     individual 1 (row 3): no missing counts  ->  0.75, 1.5, 0.7
-        imputed_gts = np.array([[9.0, 9.0, 9.0],
-                                [1.0, 0.75, 1.3],
-                                [9.0, 9.0, 9.0],
-                                [0.5, 1.25, 0.4],
-                                [9.0, 9.0, 9.0]])
-        num_obs_par_alleles = np.array([[-1.0, -1.0, -1.0],
-                                        [2.0, np.nan, 3.0],
-                                        [-1.0, -1.0, -1.0],
-                                        [3.0, 2.0, 3.0],
-                                        [-1.0, -1.0, -1.0]])
-        standard_f = np.array([0.25, 0.5, 0.1])
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.array([11, 12]),
-            observed_parent_cols=np.array([[0, -1], [-1, -1]]),
-            imputed_rows=np.array([1, 3]),
-            imputed_file="unused -- the arrays are passed in directly",
-            snipar_metadata={})
-
-        actual = sut.calculate_imputed_contribution(
-            parental_sources=parental_sources, imputed_gts=imputed_gts,
-            num_obs_par_alleles=num_obs_par_alleles, standard_f=standard_f)
-
-        assert actual.shape == (len(standard_f), len(parental_sources.affected_samples))
-
-        # Missing where the count is missing, and nowhere else
-        assert np.isnan(actual[1, 0])
-        assert not np.isnan(np.delete(actual, 1, axis=0)).any()
-        assert not np.isnan(actual[:, 1]).any()
-
-        # The cells either side of the missing one, and the whole of the neighbouring individual,
-        # are unaffected
-        assert np.allclose([0.5, 1.2], [actual[0, 0], actual[2, 0]])
-        assert np.allclose([0.75, 1.5, 0.7], actual[:, 1])
-
-
-    # Several seeds rather than one.  Each draws a different mix of allele counts, frequencies and
-    # branches, and a failure names the seed that produced it.
-    @pytest.mark.parametrize("seed", [11, 404, 7919, 90210])
-    def test__randomized_snipar_inputs__observed_alleles_recovered(self, seed):
-        # The strongest statement that can be made about this function: whatever snipar folded in,
-        # taking it back out must leave exactly the parental alleles snipar actually observed.
-        # The helper builds those inputs forwards, from alleles to imputed value; this checks that
-        # the function runs the same thing backwards.
-        #
-        # Two errors found during development both showed up here first, and both produced
-        # NEGATIVE recovered allele counts -- impossible, since an allele count cannot be below
-        # zero.  Hand-written cases pin the arithmetic that was expected; this one catches
-        # rearrangements nobody thought to expect.
-        rng = np.random.default_rng(seed)
-
-        # Six families, mixed between the two branches, over seven SNPs.  Family count, SNP count
-        # and affected count all differ, so a transposition cannot pass.
-        neither_observed = rng.random(6) < 0.5
-        imputed_gts, num_obs_par_alleles, standard_f, expected = helper.mock_snipar_imputation(
-            rng=rng, num_snps=7, neither_observed=neither_observed)
-
-        # Every family has an affected individual here, in order, so that the recovered values
-        # line up with the helper's output.  Which parent is genotyped does not matter beyond
-        # whether one is, so a single arbitrary column index serves.
-        observed_parent_cols = np.where(neither_observed[:, None],
-                                        np.array([-1, -1]), np.array([0, -1]))
-
-        parental_sources = sut.ParentalSources(
-            affected_samples=np.arange(len(neither_observed)),
-            observed_parent_cols=observed_parent_cols,
-            imputed_rows=np.arange(len(neither_observed)),
-            imputed_file="unused -- the arrays are passed in directly",
-            snipar_metadata={})
-
-        actual = sut.calculate_imputed_contribution(
-            parental_sources=parental_sources, imputed_gts=imputed_gts,
-            num_obs_par_alleles=num_obs_par_alleles, standard_f=standard_f)
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual)
-
-        # Stated separately because it is the property that caught the real errors, and it fails
-        # more legibly than a mismatch against an array of expectations
-        assert (actual >= 0.0).all()
-
-
-class TestClassifyAlleleOrientation:
-
-    # The three masks are NOT mutually exclusive, and the palindromic cases are why.  A caller
-    # that treated them as a choice of one would get the ambiguous SNPs wrong.
-    @pytest.mark.parametrize("grma_alleles, snipar_alleles, agrees, swapped, strand_differs", [
-        # The two files record the same variant the same way round
-        pytest.param(("A", "G"), ("A", "G"), True, False, False, id="identical"),
-        # The same variant, counted from the other allele -- the imputed genotypes need flipping
-        pytest.param(("A", "G"), ("G", "A"), False, True, False, id="swapped"),
-        # Read from opposite strands: the letters differ but describe the same two bases
-        pytest.param(("A", "G"), ("T", "C"), False, False, True, id="opposite_strand"),
-        pytest.param(("A", "G"), ("C", "T"), False, False, True, id="opposite_strand_and_swapped"),
-        # Not the same variant at all
-        pytest.param(("A", "G"), ("A", "C"), False, False, False, id="incompatible"),
-        # A/T and C/G are their own complements, so a strand difference is INDISTINGUISHABLE from
-        # the letters agreeing.  Both masks come back true, and nothing here can separate them.
-        pytest.param(("A", "T"), ("A", "T"), True, False, True, id="palindromic_at_identical"),
-        pytest.param(("A", "T"), ("T", "A"), False, True, True, id="palindromic_at_swapped"),
-        pytest.param(("C", "G"), ("C", "G"), True, False, True, id="palindromic_cg_identical"),
-        pytest.param(("C", "G"), ("G", "C"), False, True, True, id="palindromic_cg_swapped"),
-    ])
-    def test__allele_pairs__expected_classification(self, grma_alleles, snipar_alleles, agrees,
-                                                    swapped, strand_differs):
-        actual = sut.classify_allele_orientation(np.array([grma_alleles]),
-                                                 np.array([snipar_alleles]))
-
-        assert [bool(mask[0]) for mask in actual] == [agrees, swapped, strand_differs]
-
-
-    def test__many_snps_at_once__classified_independently(self):
-        # The masks are computed over whole columns, so a SNP's classification must not depend on
-        # what its neighbours look like.  Every category appears, in an order that puts unlike
-        # cases next to each other.
-        grma_alleles = np.array([("A", "T"), ("A", "G"), ("C", "G"), ("A", "G"),
-                                 ("A", "G"), ("A", "T"), ("A", "G")])
-        snipar_alleles = np.array([("T", "A"), ("A", "G"), ("C", "G"), ("A", "C"),
-                                   ("G", "A"), ("A", "T"), ("T", "C")])
-
-        agrees, swapped, strand_differs = sut.classify_allele_orientation(grma_alleles,
-                                                                          snipar_alleles)
-
-        assert agrees.shape == swapped.shape == strand_differs.shape == (len(grma_alleles),)
-        assert list(agrees) == [False, True, True, False, False, True, False]
-        assert list(swapped) == [True, False, False, False, True, False, False]
-        assert list(strand_differs) == [True, False, True, False, False, True, True]
-
-
-
-class TestGetBlockSnpBounds:
-
-    # A SNP filter retaining 10, 11, 12, then 20, 21, then 30.  The gaps matter: a block can fall
-    # entirely inside one, and the ends of the retained range have to be clamped rather than run
-    # past.
-    SNP_FILTER = np.array([10, 11, 12, 20, 21, 30])
-
-    @pytest.mark.parametrize("M_start, num_to_read, expected", [
-        # Ordinary case -- the block covers SNPs 15 to 24, catching the middle pair
-        pytest.param(15, 10, (3, 5), id="retained_snps_inside_the_block"),
-        # Nothing retained before SNP 10, so a block ending at 9 selects nothing from the front
-        pytest.param(0, 10, (0, 0), id="block_entirely_before_any_retained_snp"),
-        # Nothing retained after SNP 30 either
-        pytest.param(40, 10, (6, 6), id="block_entirely_after_every_retained_snp"),
-        # SNPs 15 to 19 fall in the gap between 12 and 20 -- a real case whenever a SNP list
-        # skips a region, and the one that makes the caller's lower == upper check worth having
-        pytest.param(15, 5, (3, 3), id="block_falls_in_a_gap"),
-        # The block starts below the first retained SNP, so the lower bound clamps at 0
-        pytest.param(5, 10, (0, 3), id="block_starts_before_the_retained_range"),
-        # ...and above the last, so the upper bound clamps at the end
-        pytest.param(25, 10, (5, 6), id="block_ends_after_the_retained_range"),
-        # Both bounds land exactly on a retained SNP.  The one at M_start belongs to this block;
-        # the one at M_start + num_to_read belongs to the NEXT.  A right-sided search on the
-        # upper bound would hand SNP 20 to both blocks, and since these bounds slice the
-        # genotypes and the imputed data alike, it would be counted twice rather than rejected.
-        pytest.param(10, 10, (0, 3), id="retained_snps_exactly_on_both_boundaries"),
-    ])
-    def test__various_blocks__expected_bounds(self, M_start, num_to_read, expected):
-        actual = sut.get_block_snp_bounds(self.SNP_FILTER, M_start, num_to_read)
-
-        assert actual == expected
-
-
-    # The positions are run separately rather than in a loop so that a failure at one does not
-    # hide the others: an off-by-one only at the start of the file looks very different from one
-    # everywhere.
-    @pytest.mark.parametrize("M_start", [
-        pytest.param(0, id="first_block"),
-        pytest.param(17, id="middle_block"),
-        pytest.param(40, id="last_full_block"),
-        pytest.param(45, id="short_final_block"),
-    ])
-    def test__nothing_filtered_out__bounds_are_the_block_itself(self, M_start):
-        # With every SNP retained, the positions into the filter and the SNP indices are the same
-        # thing, so the bounds come back as the block's own range.  Worth pinning because it is
-        # the common case -- most runs have no SNP list -- and because an off-by-one that the
-        # gapped filter above absorbs would show up here plainly.
-        M_orig = 50
-        snp_filter = np.arange(M_orig)
-        num_to_read = min(10, M_orig - M_start)
-
-        assert sut.get_block_snp_bounds(snp_filter, M_start, num_to_read) == (
-            M_start, M_start + num_to_read)
-
-
-
-class TestGetRelatednessComponents:
-
-    @staticmethod
-    def partition(labels):
-        """Groups sample indices by their component label
-
-        The labels themselves are whatever the graph library chose to number things with, and
-        nothing downstream depends on the numbering -- only on which samples share a component.
-        Comparing partitions rather than label arrays keeps these tests from breaking over a
-        renumbering that changes nothing.
-        """
-
-        groups = {}
-        for sample, label in enumerate(labels):
-            groups.setdefault(label, set()).add(sample)
-
-        return {frozenset(group) for group in groups.values()}
-
-
-    @staticmethod
-    def relatedness(pairs, degrees=None):
-        """Builds a relatedness frame of the shape this function expects"""
-
-        degrees = degrees if degrees is not None else [sut.DEG_FULLSIB] * len(pairs)
-
-        return pd.DataFrame({sut.FAM_INDEX_1 : [pair[0] for pair in pairs],
-                             sut.FAM_INDEX_2 : [pair[1] for pair in pairs],
-                             sut.KING_REL_COL : degrees})
-
-
-    def test__chain_of_relatives__all_one_component(self):
-        # Components are transitive, and over any distance.  The chain here runs 0-1-2-3, so the
-        # two ends are two hops apart and appear in no row together -- nothing pairs 0 with 3, or
-        # even with anyone 3 is paired with.  They still share a component.
-        #
-        # That is the whole reason for computing components rather than grouping pairs.  Omega is
-        # block diagonal over components, not over pairs, and a block has to hold everyone
-        # reachable within it or the shrinkage is applied to the wrong thing.
-        actual = sut.get_relatedness_components(
-            self.relatedness([(0, 1), (1, 2), (2, 3)]), N=6)
-
-        assert self.partition(actual) == {frozenset({0, 1, 2, 3}), frozenset({4}), frozenset({5})}
-
-
-    def test__disjoint_families__separate_components(self):
-        # Two families sharing nobody stay apart.  Were they merged, per-block shrinkage would
-        # hand one family's worst eigenvalue to the other, which is precisely what shrinking per
-        # block rather than globally exists to avoid.
-        actual = sut.get_relatedness_components(self.relatedness([(0, 1), (2, 3)]), N=4)
-
-        assert self.partition(actual) == {frozenset({0, 1}), frozenset({2, 3})}
-
-
-    def test__samples_with_no_relatives__each_alone(self):
-        # Samples 2, 3 and 4 appear in no pair.  This is not a degenerate case to be guarded
-        # against but the ordinary one: most samples in a large cohort have no relatives in it.
-        # They still need labels, since everything indexed by label has to line up with the full
-        # sample space.
-        actual = sut.get_relatedness_components(self.relatedness([(0, 1)]), N=5)
-
-        assert self.partition(actual) == {frozenset({0, 1}), frozenset({2}),
-                                          frozenset({3}), frozenset({4})}
-
-
-    def test__no_related_pairs_at_all__every_sample_alone(self):
-        # An empty relatedness frame, which is a different path from merely having isolated
-        # samples: the adjacency is assembled from zero-length arrays rather than from some.
-        actual = sut.get_relatedness_components(self.relatedness([]), N=4)
-
-        assert self.partition(actual) == {frozenset({0}), frozenset({1}),
-                                          frozenset({2}), frozenset({3})}
-        assert len(actual) == 4
-
-
-    # The partition depends only on WHICH pairs exist, never on how closely related they are.
-    # That is what lets the components be worked out before any phenotype has been read, and it is
-    # why this is a function of its own rather than something calculate_omega() derives.
-    #
-    # Three components, one of them with three members, so a bug sensitive to the degrees would
-    # have somewhere to show up rather than collapsing everything either way.
-    @pytest.mark.parametrize("degrees", [
-        pytest.param([sut.DEG_FULLSIB] * 4, id="all_full_siblings"),
-        pytest.param([sut.DEG_PARENT_OFFSPRING, sut.DEG_3RD, sut.DEG_FULLSIB, sut.DEG_2ND],
-                     id="mixed_degrees"),
-        pytest.param([sut.DEG_3RD] * 4, id="all_third_degree"),
-    ])
-    def test__same_pairs_different_degrees__same_partition(self, degrees):
-        actual = sut.get_relatedness_components(
-            self.relatedness([(0, 1), (1, 2), (4, 5), (6, 7)], degrees), N=8)
-
-        assert self.partition(actual) == {frozenset({0, 1, 2}), frozenset({3}),
-                                          frozenset({4, 5}), frozenset({6, 7})}
-
-
-    def test__duplicated_and_reversed_pairs__same_partition(self):
-        # The relatedness file may list a pair either way round, and may list it more than once;
-        # nothing upstream deduplicates.  The adjacency stacks both directions regardless, so a
-        # duplicate becomes a repeated entry, and it is worth knowing that changes nothing here.
-        #
-        # It does NOT follow that duplicates are harmless everywhere: calculate_omega() sums
-        # entries that land in the same cell, so a pair listed twice contributes its covariance
-        # twice there.  This function is immune because a graph does not care how many times an
-        # edge is mentioned.
-        messy = self.relatedness([(0, 1), (1, 0), (0, 1), (2, 3)])
-        tidy = self.relatedness([(0, 1), (2, 3)])
-
-        assert (self.partition(sut.get_relatedness_components(messy, N=5)) ==
-                self.partition(sut.get_relatedness_components(tidy, N=5)))
-
-
-    @pytest.mark.parametrize("seed", [3, 58, 1024])
-    def test__rows_in_any_order__same_partition(self, seed):
-        # Nothing orders the relatedness file, and nothing should need to.
-        pairs = [(0, 1), (1, 2), (2, 3), (5, 6), (7, 8)]
-        expected = self.partition(sut.get_relatedness_components(self.relatedness(pairs), N=9))
-
-        shuffled = list(pairs)
-        np.random.default_rng(seed).shuffle(shuffled)
-
-        actual = sut.get_relatedness_components(self.relatedness(shuffled), N=9)
-
-        assert self.partition(actual) == expected
-
-
-class TestCalculateGLSWeights:
-
-    @staticmethod
-    def sibling_pair(variance=2.0, covariance=0.5):
-        """Returns (R, omega) for two full siblings and nobody else
-
-        R centers them against each other; omega gives them a shared phenotypic covariance.  Small
-        enough that the result can be worked out by hand.
-        """
-
-        R = sp.csr_array(np.array([[0.5, -0.5], [-0.5, 0.5]]))
-        omega = sp.csr_array(np.array([[variance, covariance], [covariance, variance]]))
-
-        return R, omega
-
-
-    def test__one_sibling_pair__expected_values(self):
-        # Worth following through by hand, since everything else here checks properties rather
-        # than numbers.  With variance 2 and covariance 0.5:
-        #
-        #     R omega R' = (variance - covariance) * R = 1.5 * [[0.5, -0.5], [-0.5, 0.5]]
-        #
-        # which is rank 1 -- the siblings' contrast is the only direction with any variance, and
-        # their shared family mean has none.  Its one non-zero eigenvalue is 1.5, so the
-        # pseudo-inverse is that same contrast scaled by 1/1.5, giving 1/3 on the diagonal.
-        R, omega = self.sibling_pair(variance=2.0, covariance=0.5)
-
-        expected = np.array([[1.0 / 3.0, -1.0 / 3.0],
-                             [-1.0 / 3.0, 1.0 / 3.0]])
-
-        actual = sut.calculate_gls_weights(R=R, omega=omega, labels=np.array([0, 0]))
-
-        assert actual.shape == expected.shape
-        assert np.allclose(expected, actual.toarray())
-
-
-    def test__block_diagonal_inverse__matches_a_single_pinv(self):
-        # Inverting block by block is not an approximation: the pseudo-inverse of a block diagonal
-        # matrix IS the block diagonal matrix of pseudo-inverses.  Checking that against one pinv
-        # over the whole thing is a genuinely separate route to the same answer -- a different
-        # algorithm on different sized inputs -- rather than a restatement of what the code does.
-        #
-        # Two families of three, so the blocks are large enough for the two routes to diverge if
-        # the assembly were wrong.
-        R = sp.csr_array(np.kron(np.eye(2), np.eye(3) - np.ones((3, 3)) / 3.0))
-        omega = sp.csr_array(np.kron(np.eye(2), 2.0 * np.eye(3) + 0.5 * (np.ones((3, 3))
-                                                                         - np.eye(3))))
-        labels = np.array([0, 0, 0, 1, 1, 1])
-
-        actual = sut.calculate_gls_weights(R=R, omega=omega, labels=labels)
-        expected = np.linalg.pinv((R @ omega @ R.T).toarray())
-
-        assert np.allclose(expected, actual.toarray())
-
-
-    def test__several_components__no_weight_crosses_between_them(self):
-        # The result has to stay as sparse as the input.  A dense inverse of a biobank-sized
-        # matrix is not something that can be held, let alone multiplied, so a weight linking two
-        # samples who are not related at all is a correctness problem and a scaling one at once.
-        R = sp.csr_array(np.kron(np.eye(3), np.eye(2) - np.ones((2, 2)) / 2.0))
-        omega = sp.csr_array(np.kron(np.eye(3), np.array([[2.0, 0.5], [0.5, 2.0]])))
-        labels = np.array([0, 0, 1, 1, 2, 2])
-
-        actual = sut.calculate_gls_weights(R=R, omega=omega, labels=labels).toarray()
-
-        different_components = labels[:, None] != labels[None, :]
-        assert np.allclose(actual[different_components], 0.0)
-
-
-    def test__sample_with_no_relatives__contributes_nothing(self):
-        # Somebody with no relatives and no parental data has a zero row in R, so their row and
-        # column of R omega R' are zero as well.  The pseudo-inverse of a zero block is zero, not
-        # an infinity: they carry no information and are weighted accordingly.
-        R = sp.csr_array(np.array([[0.5, -0.5, 0.0], [-0.5, 0.5, 0.0], [0.0, 0.0, 0.0]]))
-        omega = sp.csr_array(np.array([[2.0, 0.5, 0.0], [0.5, 2.0, 0.0], [0.0, 0.0, 2.0]]))
-
-        actual = sut.calculate_gls_weights(R=R, omega=omega, labels=np.array([0, 0, 1])).toarray()
-
-        assert np.isclose(actual[2, 2], 0.0)
-        assert np.isfinite(actual).all()
-
-
-    def test__affected_sample_with_no_relatives__weighted_by_its_own_variance(self):
-        # The same person, but residualized against their parents instead.  Their row of R is the
-        # identity rather than zero, so their block is their own phenotypic variance and the
-        # weight is its reciprocal.  This is how parental residualization recovers somebody who
-        # would otherwise have contributed nothing -- the contrast between this case and the one
-        # above is the whole point of the feature.
-        R = sp.csr_array(np.array([[0.5, -0.5, 0.0], [-0.5, 0.5, 0.0], [0.0, 0.0, 1.0]]))
-        omega = sp.csr_array(np.array([[2.0, 0.5, 0.0], [0.5, 2.0, 0.0], [0.0, 0.0, 2.0]]))
-
-        actual = sut.calculate_gls_weights(R=R, omega=omega, labels=np.array([0, 0, 1])).toarray()
-
-        assert np.isclose(actual[2, 2], 1.0 / 2.0)
-
-
-    def test__every_sample_unrelated__diagonal_of_reciprocals(self):
-        # The ordinary case for most of a cohort: no relatives, so every component holds one
-        # sample and every block is a single number.  Nothing about the block machinery should
-        # misbehave at that size.
-        variances = np.array([2.0, 0.5, 4.0])
-        R = sp.identity(3, format="csr")
-        omega = sp.csr_array(np.diag(variances))
-
-        actual = sut.calculate_gls_weights(R=R, omega=omega, labels=np.arange(3))
-
-        assert np.allclose(np.diag(1.0 / variances), actual.toarray())
-
-
-    def test__badly_conditioned_block__still_a_pseudo_inverse(self):
-        # A block can be badly conditioned and still be entirely real.  Here the two directions
-        # differ by a factor of 10^9, and both have to survive: the smaller one is a genuine
-        # phenotypic variance, not numerical noise, and discarding it would silently drop that
-        # sample from the regression.
-        #
-        # What this does NOT do is pin the cutoff that separates real directions from noise.  The
-        # explicit rcond and numpy's default give the same answer at this ratio, so the test
-        # cannot tell them apart, and the right threshold has not been settled in any case -- see
-        # the note on it in calculate_gls_weights().  The assertions are therefore about the
-        # result being a pseudo-inverse of whatever was kept, which holds under either cutoff.
-        R = sp.identity(2, format="csr")
-        omega = sp.csr_array(np.diag([1.0, 1e-9]))
-
-        actual = sut.calculate_gls_weights(R=R, omega=omega, labels=np.array([0, 0])).toarray()
-
-        V = (R @ omega @ R.T).toarray()
-        assert np.allclose(V @ actual @ V, V)
-        assert np.isclose(actual[1, 1], 1e9)
-
+    def test__empty__empty(self):
+        assert sut.calculate_gls_weights(sp.csr_array((0, 0))).shape == (0, 0)
 
     def test__large_component__rounding_noise_not_inverted(self):
         """One component of 1,000 people: 250 sibships of 4, chained by weak cousin links.
 
-        R removes each sibship's mean, so the block has 250 exactly-zero eigenvalues, which come out
-        as rounding noise that grows with the block.  numpy's default cutoff is a fixed 1e-15 of the
-        largest singular value, and at this size enough of the noise exceeds it to give weights
-        around 1e13 to 1e14 (notes §8.10).  1,000 rather than the few hundred where the failure
-        begins: where it begins depends on the numerical library, and this is well past it
-        everywhere.  The data is built here, from a fixed seed.
+        R removes each sibship's mean, so the covariance has 250 exactly-zero eigenvalues, which
+        come out as rounding noise that grows with the block.  numpy's default cutoff is a fixed
+        1e-15 of the largest singular value, and at this size enough of the noise exceeds it to
+        give weights around 1e13 to 1e14.  1,000 rather than the few hundred where the failure
+        begins: where it begins depends on the numerical library, and this is well past it.
         """
 
         rng = np.random.default_rng(seed=810)
         num_sibships, sibship_size = 250, 4
         N = num_sibships * sibship_size
-
         omega = np.identity(N)
         R = np.identity(N)
         for sibship in range(num_sibships):
@@ -2748,2672 +962,917 @@ class TestCalculateGLSWeights:
             omega[idx, idx] = 1.0
             R[np.ix_(idx, idx)] -= 1.0 / sibship_size
             if sibship > 0:
-                # A cousin link to the previous sibship, so that all of them form ONE component
                 omega[idx[0], idx[0] - 1] = omega[idx[0] - 1, idx[0]] = 0.1
-        omega *= rng.uniform(0.5, 3.0)  # An arbitrary phenotype scale
+        omega *= rng.uniform(0.5, 3.0)
+        vcv = R @ omega @ R.T
 
-        actual = sut.calculate_gls_weights(R=sp.csr_array(R), omega=sp.csr_array(omega),
-                                           labels=np.zeros(N, dtype=int)).toarray()
+        actual = sut.calculate_gls_weights(sp.csr_array(vcv)).toarray()
 
-        resid_pheno_cov = R @ omega @ R.T
         assert np.abs(actual).max() < 10.0
-        assert np.allclose(resid_pheno_cov @ actual @ resid_pheno_cov, resid_pheno_cov, atol=1e-8)
+        assert np.allclose(vcv @ actual @ vcv, vcv, atol=1e-8)
 
 
-    def test__no_samples__empty_matrix(self):
-        # Nothing to invert.  grma() rejects an empty sample filter long before this, so the
-        # pipeline never arrives here -- but the assembly concatenates a list of blocks, and an
-        # empty list cannot be concatenated, so without the guard this is a crash rather than an
-        # empty result.
-        empty = sp.csr_array((0, 0))
+class TestBuildRelativeRegressions:
 
-        actual = sut.calculate_gls_weights(R=empty, omega=empty, labels=np.array([], dtype=int))
+    def test__each_group__its_regression_in_order(self):
+        _, _, _, _, regressions, _ = relative_plan()
 
-        assert actual.shape == (0, 0)
-        assert actual.nnz == 0
+        assert [r.name for r in regressions] == [sut.GROUP_FS, sut.GROUP_2ND, sut.GROUP_3RD]
+        assert [len(r.focal) for r in regressions] == [5, 3, 3]
 
+    def test__phenotypes__the_residualized_ones(self):
+        _, _, phenotypes, _, regressions, _ = relative_plan()
 
-    def test__components_of_R_rather_than_omega__no_longer_a_pseudo_inverse(self):
-        # The partition must be omega's, not R's.  R only ever holds pairs within the user's
-        # relatedness threshold while omega holds everything out to third degree, so R's
-        # components are a refinement of omega's -- and a refinement splits blocks that R omega R'
-        # genuinely connects.
-        #
-        # Four samples: 0-1 and 2-3 are sibling pairs, and 1-2 are third-degree relatives.  That
-        # is one omega component but two R components, and R omega R' has entries linking them.
-        # Splitting on R's partition discards those entries, and what comes back is no longer a
-        # pseudo-inverse of anything.
-        #
-        # Nothing here guards against it: the check is that the caller passes the right labels.
-        R = sp.csr_array(np.array([[0.5, -0.5, 0.0, 0.0],
-                                   [-0.5, 0.5, 0.0, 0.0],
-                                   [0.0, 0.0, 0.5, -0.5],
-                                   [0.0, 0.0, -0.5, 0.5]]))
-        omega = sp.csr_array(np.array([[2.0, 0.5, 0.0, 0.0],
-                                       [0.5, 2.0, 0.2, 0.0],
-                                       [0.0, 0.2, 2.0, 0.5],
-                                       [0.0, 0.0, 0.5, 2.0]]))
-        V = (R @ omega @ R.T).toarray()
+        for regression in regressions:
+            assert np.allclose(regression.phenotypes, regression.phenotype_map @ phenotypes)
 
-        from_omega = sut.calculate_gls_weights(R=R, omega=omega,
-                                               labels=np.array([0, 0, 0, 0])).toarray()
-        from_R = sut.calculate_gls_weights(R=R, omega=omega,
-                                           labels=np.array([0, 0, 1, 1])).toarray()
+    def test__rel_degree__later_regressions_left_out_without_a_warning(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _, _, _, _, regressions, _ = relative_plan(rel_degree=1)
 
-        assert np.allclose(V @ from_omega @ V, V)
-        assert not np.allclose(V @ from_R @ V, V)
+        assert [r.name for r in regressions] == [sut.GROUP_FS]
+        # Regressions the options exclude are not "empty": warning about them would mislead
+        assert "No sample qualifies" not in caplog.text
+
+    def test__empty_group__left_out_with_a_warning(self, caplog):
+        rows = [r for r in RELATIVE_ROWS if r[2] != "2nd"]
+        phenos = {k : v for k, v in RELATIVE_PHENOS.items() if k not in ("n", "m1", "m2")}
+
+        with caplog.at_level(logging.WARNING):
+            _, _, _, _, regressions, _ = relative_plan(phenos, rows)
+
+        assert [r.name for r in regressions] == [sut.GROUP_FS, sut.GROUP_3RD]
+        assert "No sample qualifies for the 2ND regression" in caplog.text
 
 
-    def test__affected_sample_among_relatives__R_not_treated_as_symmetric(self):
-        # R is generally NOT symmetric.  An affected sample's ROW is the identity, since their
-        # genotypes were already residualized against their parents -- but their COLUMN keeps the
-        # entries their relatives use to center against them.  Three siblings with one of them
-        # affected is the smallest case that shows it.
-        #
-        # The covariance being inverted is R omega R', and with an asymmetric R the transposes
-        # cannot be swapped: R' omega R is a different matrix.  Every other case here happens to
-        # use a symmetric R, so this is the one that pins the order.
-        relatedness = pd.DataFrame({sut.FAM_INDEX_1 : [0, 0, 1],
-                                    sut.FAM_INDEX_2 : [1, 2, 2],
-                                    sut.KING_REL_COL : [sut.DEG_FULLSIB] * 3})
-        R = sut.calculate_R(relatedness, 3, affected_samples=np.array([2]))
-        omega = sp.csr_array(2.0 * np.eye(3) + 0.5 * (np.ones((3, 3)) - np.eye(3)))
+class TestReportedEstimates:
 
-        assert not np.allclose(R.toarray(), R.toarray().T), "fixture is meant to be asymmetric"
-
-        actual = sut.calculate_gls_weights(R=R, omega=omega, labels=np.zeros(3, dtype=int)
-                                           ).toarray()
-
-        V = (R @ omega @ R.T).toarray()
-        assert np.allclose(V @ actual @ V, V)
-        assert np.allclose(actual @ V @ actual, actual)
+    @pytest.mark.parametrize("has_po, rel_degree, expected", [
+        (True, 3, [("PO",), ("PO", "FS"), ("PO", "FS", "2ND"), ("PO", "FS", "2ND", "3RD")]),
+        (True, 2, [("PO",), ("PO", "FS"), ("PO", "FS", "2ND")]),
+        (True, 1, [("PO",), ("PO", "FS")]),
+        (True, 0, [("PO",), ("PO", "FS")]),
+        (False, 3, [("FS",), ("FS", "2ND"), ("FS", "2ND", "3RD")]),
+        (False, 1, [("FS",)])])
+    def test__cumulative__as_far_as_rel_degree_allows(self, has_po, rel_degree, expected):
+        assert sut.reported_estimates(has_po, rel_degree) == expected
 
 
-class TestCalculateGLSEstimates:
+class TestRegressionEstimates:
 
-    # Every case asserts XtWX first, then the standard errors, then the betas.  The three are a
-    # chain -- XtWX is shared, the standard errors are its reciprocal square root, and the betas
-    # divide a separate numerator by it -- so a failure on the first assertion to break says which
-    # link went, where checking the betas first would blame the numerator for everything.
+    def test__estimates__match_a_dense_textbook_regression(self):
+        samples, _, phenotypes, omega, regressions, _ = relative_plan()
+        genotypes = genotypes_for(len(phenotypes))
 
-    def test__diagonal_weights__expected_values(self):
-        # Hand-workable: three samples weighted 1, 2 and 4, and two SNPs with different answers so
-        # that a result computed once and broadcast cannot pass.
-        #
-        #     SNP 0, g = [1, 0, 2]:  XtWX = 1*1 + 0*2 + 4*4  = 17
-        #                            g'Wy = 1*1 + 0*6 + 2*2  = 5     -> beta 5/17
-        #     SNP 1, g = [2, 1, 0]:  XtWX = 4*1 + 1*2 + 0*4  = 6
-        #                            g'Wy = 2*1 + 1*6 + 0*2  = 8     -> beta 8/6
-        #
-        # with Wy = [1, 6, 2] from phenotypes [1, 3, 0.5] under those weights.
-        genotypes = np.array([[1.0, 0.0, 2.0],
-                              [2.0, 1.0, 0.0]])
-        gls_weights = sp.csr_array(np.diag([1.0, 2.0, 4.0]))
-        weighted_phenotypes = np.array([1.0, 6.0, 2.0])
+        for regression in regressions:
+            residuals = sut.relative_genotype_residuals(genotypes, regression)
+            _, d, beta = sut.regression_statistics(residuals, regression)
+            expected_beta, expected_d, _, _ = dense_regression(regression, omega, phenotypes,
+                                                               genotypes)
 
-        betas, ses, XtWX = sut.calculate_gls_estimates(
-            genotypes=genotypes, gls_weights=gls_weights,
-            weighted_phenotypes=weighted_phenotypes)
+            assert np.allclose(beta, expected_beta) and np.allclose(d, expected_d)
 
-        assert np.allclose([17.0, 6.0], XtWX)
-        assert np.allclose([1.0 / np.sqrt(17.0), 1.0 / np.sqrt(6.0)], ses)
-        assert np.allclose([5.0 / 17.0, 8.0 / 6.0], betas)
+    def test__missing_genotype__zeroes_only_the_residuals_it_enters(self):
+        samples, _, phenotypes, _, regressions, _ = relative_plan()
+        idx = dict(zip(samples[sut.SAMPLE_IID_COL], samples[sut.SAMPLE_OMEGA_IDX_COL]))
+        genotypes = genotypes_for(len(phenotypes))
+        genotypes[0, idx["a2"]] = np.nan
+        fs = regressions[0]
 
+        residuals = sut.relative_genotype_residuals(genotypes, fs)
 
-    def test__correlated_weights__matches_a_per_snp_reference(self):
-        # A weight matrix with off-diagonal entries, which is the real case: relatives are
-        # correlated, and that is the whole reason for weighting at all.  Five SNPs over four
-        # samples, with the two counts differing so a transposition cannot pass.
-        rng = np.random.default_rng(176)
-        genotypes = rng.integers(0, 3, (5, 4)).astype(float)
-        weighted_phenotypes = rng.normal(size=4)
+        # a2's own residual and its sibs' are lost at SNP 0.  b1's and b2's do not involve a2, so
+        # they are exactly what R gives with a2's genotype left out; and every other SNP is intact.
+        complete = genotypes_for(len(phenotypes))
+        expected = complete @ fs.phenotype_map.T.toarray()
+        assert np.all(residuals[0, :3] == 0.0)
+        assert np.allclose(residuals[0, 3:], expected[0, 3:])
+        assert np.allclose(residuals[1:], expected[1:])
+        assert not np.isnan(residuals).any()
 
-        # Two families of two, each with a correlated block
-        block = np.array([[2.0, -0.7], [-0.7, 2.0]])
-        gls_weights = sp.csr_array(np.kron(np.eye(2), block))
+    def test__snp_with_no_variation__no_estimate(self):
+        _, _, phenotypes, _, regressions, _ = relative_plan()
+        genotypes = genotypes_for(len(phenotypes))
+        genotypes[2] = 1.0
 
-        expected_betas, expected_ses, expected_XtWX = helper.mock_gls_estimates(
-            genotypes=genotypes, gls_weights=gls_weights,
-            weighted_phenotypes=weighted_phenotypes)
+        for regression in regressions:
+            residuals = sut.relative_genotype_residuals(genotypes, regression)
+            _, d, beta = sut.regression_statistics(residuals, regression)
 
-        betas, ses, XtWX = sut.calculate_gls_estimates(
-            genotypes=genotypes, gls_weights=gls_weights,
-            weighted_phenotypes=weighted_phenotypes)
-
-        assert np.allclose(expected_XtWX, XtWX)
-        assert np.allclose(expected_ses, ses)
-        assert np.allclose(expected_betas, betas)
+            assert d[2] == 0.0 and np.isnan(beta[2])
+            assert np.all(residuals[2] == 0.0)
 
 
-    def test__identity_weights__reduces_to_ordinary_least_squares(self):
-        # Weighting every observation equally is what ordinary least squares does, so the
-        # estimates have to come out as the familiar (g'y) / (g'g).  A recognisable special case
-        # is worth having: it would catch the weights being ignored, applied on the wrong side, or
-        # applied twice.
-        genotypes = np.array([[1.0, 0.0, 2.0, 1.0],
-                              [2.0, 1.0, 0.0, 1.0]])
-        phenotypes = np.array([1.0, 3.0, 0.5, 2.0])
-        gls_weights = sp.identity(4, format="csr")
+class TestCovarianceOfEstimates:
 
-        betas, ses, XtWX = sut.calculate_gls_estimates(
-            genotypes=genotypes, gls_weights=gls_weights, weighted_phenotypes=phenotypes)
+    def test__matches_w_omega_w_with_weights_over_all_of_omega(self):
+        _, _, phenotypes, omega, regressions, cross = relative_plan()
+        genotypes = genotypes_for(len(phenotypes))
+        names = [r.name for r in regressions]
+        stats = [sut.regression_statistics(sut.relative_genotype_residuals(genotypes, r), r)
+                 for r in regressions]
 
-        expected_XtX = np.einsum("ij,ij->i", genotypes, genotypes)
+        actual = sut.covariance_of_estimates([s[0] for s in stats], [s[1] for s in stats], names,
+                                             cross)
 
-        assert np.allclose(expected_XtX, XtWX)
-        assert np.allclose(1.0 / np.sqrt(expected_XtX), ses)
-        assert np.allclose(np.einsum("ij,j->i", genotypes, phenotypes) / expected_XtX, betas)
+        # The specification's formula: w = A'QZ / d over all of Omega, then C = W Omega W'
+        W = []
+        for regression in regressions:
+            _, d, Z, Q = dense_regression(regression, omega, phenotypes, genotypes)
+            W.append((regression.phenotype_map.toarray().T @ Q @ Z.T / d).T)   # (snps, omega)
+        W = np.stack(W, axis=1)                                                  # (snps, k, omega)
+        expected = np.einsum("sko,op,slp->skl", W, omega.toarray(), W)
+        assert np.allclose(actual, expected)
 
+    def test__diagonal__each_regressions_own_gls_variance(self):
+        _, _, phenotypes, _, regressions, cross = relative_plan()
+        genotypes = genotypes_for(len(phenotypes))
+        stats = [sut.regression_statistics(sut.relative_genotype_residuals(genotypes, r), r)
+                 for r in regressions]
 
-    def test__snp_with_no_information__missing_beta_and_infinite_standard_error(self):
-        # A SNP that survives filtering can still carry nothing -- monomorphic in this sample,
-        # missing for everybody, or residualized away to zero -- and then XtWX is zero.
-        #
-        # Nothing is substituted for the results.  An infinite standard error means ZERO weight in
-        # any inverse-variance meta-analysis downstream, which is the safe direction to fail in; a
-        # small positive number in its place would mean near-infinite confidence instead.  The
-        # beta is left as NaN rather than zero for the same reason: no estimate, rather than an
-        # estimate of no effect.
-        #
-        # The second SNP carries real information and must be unaffected, so that one dead SNP
-        # cannot take the rest of the block with it.
-        genotypes = np.array([[0.0, 0.0, 0.0],
-                              [2.0, 1.0, 0.0]])
-        gls_weights = sp.csr_array(np.diag([1.0, 2.0, 4.0]))
-        weighted_phenotypes = np.array([1.0, 6.0, 2.0])
+        C = sut.covariance_of_estimates([s[0] for s in stats], [s[1] for s in stats],
+                                        [r.name for r in regressions], cross)
 
-        betas, ses, XtWX = sut.calculate_gls_estimates(
-            genotypes=genotypes, gls_weights=gls_weights,
-            weighted_phenotypes=weighted_phenotypes)
+        for k, (_, d, _) in enumerate(stats):
+            assert np.allclose(C[:, k, k], 1.0 / d)
 
-        assert np.allclose([0.0, 6.0], XtWX)
-        assert np.isinf(ses[0]) and np.isclose(ses[1], 1.0 / np.sqrt(6.0))
-        assert np.isnan(betas[0]) and np.isclose(betas[1], 8.0 / 6.0)
+    def test__regression_without_an_estimate__its_row_and_column_nan(self):
+        _, _, phenotypes, _, regressions, cross = relative_plan()
+        genotypes = genotypes_for(len(phenotypes))
+        stats = [sut.regression_statistics(sut.relative_genotype_residuals(genotypes, r), r)
+                 for r in regressions]
+        ds = [s[1].copy() for s in stats]
+        ds[1][4] = 0.0
 
+        C = sut.covariance_of_estimates([s[0] for s in stats], ds,
+                                        [r.name for r in regressions], cross)
 
-    def test__returns_one_value_per_snp(self):
-        # Genotypes arrive as (SNPs, samples) and the phenotypes as (samples,); everything coming
-        # back is per SNP.  The two counts differ here so that a transposition shows up as a shape
-        # error rather than as plausible numbers.
-        num_snps, num_samples = 6, 4
-        rng = np.random.default_rng(4242)
-        genotypes = rng.integers(0, 3, (num_snps, num_samples)).astype(float)
-        gls_weights = sp.identity(num_samples, format="csr")
-        weighted_phenotypes = rng.normal(size=num_samples)
-
-        betas, ses, XtWX = sut.calculate_gls_estimates(
-            genotypes=genotypes, gls_weights=gls_weights,
-            weighted_phenotypes=weighted_phenotypes)
-
-        assert XtWX.shape == (num_snps,)
-        assert ses.shape == (num_snps,)
-        assert betas.shape == (num_snps,)
+        assert np.all(np.isnan(C[4, 1, :])) and np.all(np.isnan(C[4, :, 1]))
+        assert not np.isnan(C[4, 0, 2])
 
 
-class TestAlignImputedFileToBim:
-
-    # snipar stores the NAMES of its bim columns alongside the values, because the spellings
-    # differ between its own code paths -- a file written from real data gives Chr / id /
-    # coordinate where the simulation path gives chrom / rsid / position.  These are the real
-    # file's spellings; one case below uses the others.
-    REAL_FILE_COLUMNS = ["Chr", "id", "morgans", "coordinate", "allele1", "allele2"]
+class TestMetaAnalyze:
 
     @staticmethod
-    def bim(variants):
-        """Builds a bim frame from (rsid, position, A1, A2) tuples, all on chromosome 1"""
+    def by_hand(betas, C):
+        """Each SNP separately, with an ordinary inverse over the estimates present"""
+        estimates, ses = [], []
+        for b, c in zip(betas, C):
+            keep = ~np.isnan(b)
+            inv = np.linalg.inv(c[np.ix_(keep, keep)])
+            a = inv.sum(axis=1) / inv.sum()
+            estimates.append(a @ b[keep])
+            ses.append(np.sqrt(a @ c[np.ix_(keep, keep)] @ a))
+        return np.array(estimates), np.array(ses)
 
-        return pd.DataFrame({bbf.BIM_CHR_COL : ["1"] * len(variants),
-                             bbf.BIM_RSID_COL : [variant[0] for variant in variants],
-                             bbf.BIM_CM_COL : ["0"] * len(variants),
-                             bbf.BIM_BP_COL : [str(variant[1]) for variant in variants],
-                             bbf.BIM_A1_COL : [variant[2] for variant in variants],
-                             bbf.BIM_A2_COL : [variant[3] for variant in variants]})
+    BETAS = np.array([[0.5, 0.3, -0.1], [1.0, 1.2, 0.8], [0.2, np.nan, 0.4]])
+    C = np.array([[[0.04, 0.01, 0.0], [0.01, 0.09, 0.02], [0.0, 0.02, 0.16]]] * 3)
 
-    @classmethod
-    def metadata(cls, variants, columns=None):
-        """Builds the imputed file's view of the same variants, as read_snipar_metadata returns it
+    def test__optimal_weights__match_a_per_snp_calculation(self):
+        C = self.C.copy()
+        C[2, 1, :] = C[2, :, 1] = np.nan
 
-        Everything in bim_values is a string, including the position: snipar converts the whole
-        table at once when it writes the file.
+        actual = sut.meta_analyze(self.BETAS, C)
 
-        Columns are laid out to match whatever spellings are asked for, by name rather than by
-        position, so that a caller can reorder them to check that the code does the same.
-        """
+        expected = self.by_hand(self.BETAS, C)
+        assert np.allclose(actual[0], expected[0]) and np.allclose(actual[1], expected[1])
 
-        columns = columns if columns is not None else cls.REAL_FILE_COLUMNS
+    def test__single_estimate__returned_as_it_is(self):
+        estimate, se = sut.meta_analyze(self.BETAS[:, :1], self.C[:, :1, :1])
 
-        by_name = {}
-        for spellings, values in (
-                (snipar_hdf5.SNIPAR_BIM_CHR_NAMES, ["1"] * len(variants)),
-                (snipar_hdf5.SNIPAR_BIM_ID_NAMES, [variant[0] for variant in variants]),
-                (snipar_hdf5.SNIPAR_BIM_BP_NAMES, [str(variant[1]) for variant in variants]),
-                (snipar_hdf5.SNIPAR_BIM_A1_NAMES, [variant[2] for variant in variants]),
-                (snipar_hdf5.SNIPAR_BIM_A2_NAMES, [variant[3] for variant in variants])):
-            for spelling in spellings:
-                by_name[spelling] = values
+        assert np.allclose(estimate, self.BETAS[:, 0]) and np.allclose(se, 0.2)
 
-        # Anything the aligner does not look up -- the genetic map column, say -- is filler
-        filler = ["0"] * len(variants)
+    def test__every_estimate_missing__nan(self):
+        estimate, se = sut.meta_analyze(np.full((1, 2), np.nan), np.full((1, 2, 2), np.nan))
 
-        return {
-            snipar_hdf5.SNIPAR_BIM_VALUES_KEY : np.array(
-                [by_name.get(column, filler) for column in columns]).T,
-            snipar_hdf5.SNIPAR_BIM_COLUMNS_KEY : np.array(columns)
-        }
+        assert np.isnan(estimate[0]) and np.isnan(se[0])
 
-    def test__every_variant_matches__all_kept_and_nothing_logged(self, caplog):
-        # The ordinary case by a long way: snipar was run on the same bfile GRMA is being run on,
-        # so the two bim tables are the same table.
-        variants = [("rs1", 100, "A", "G"), ("rs2", 200, "C", "T"), ("rs3", 300, "A", "C")]
+    def test__singular_covariance__pseudo_inverse_still_gives_weights_summing_to_one(self):
+        # Two identical estimates: C singular.  Any split of the weight is optimal; the result is
+        # their common value, with their common variance.
+        betas = np.array([[0.7, 0.7]])
+        C = np.array([[[0.04, 0.04], [0.04, 0.04]]])
 
-        with caplog.at_level(logging.DEBUG):
-            keep, hdf5_indices, flip = sut.align_imputed_file_to_bim(
-                bim_df=self.bim(variants), metadata=self.metadata(variants))
+        estimate, se = sut.meta_analyze(betas, C)
 
-        assert list(keep) == [True, True, True]
-        assert list(hdf5_indices) == [0, 1, 2]
-        assert not flip.any()
-
-        # Nothing was dropped, so nothing is said.  A line reporting zero drops on every run
-        # would be noise.
-        assert caplog.records == []
+        assert np.isclose(estimate[0], 0.7) and np.isclose(se[0], 0.2)
 
 
-    def test__alleles_the_other_way_round__kept_and_flagged_for_flipping(self, caplog):
-        # The same variant counted from the other allele.  The imputed genotypes are usable, but
-        # only after being subtracted from 2, so the SNP is kept and marked rather than dropped.
-        bim_variants = [("rs1", 100, "A", "G"), ("rs2", 200, "C", "T"), ("rs3", 300, "A", "C")]
-        imputed_variants = [("rs1", 100, "A", "G"), ("rs2", 200, "T", "C"),
-                            ("rs3", 300, "C", "A")]
+class TestEstimateBlock:
 
-        with caplog.at_level(logging.DEBUG):
-            keep, _, flip = sut.align_imputed_file_to_bim(
-                bim_df=self.bim(bim_variants), metadata=self.metadata(imputed_variants))
+    def test__alleles_recoded__every_estimate_negated_ses_unchanged(self):
+        _, _, phenotypes, _, regressions, cross = relative_plan()
+        genotypes = genotypes_for(len(phenotypes))
+        estimates = sut.reported_estimates(has_po=False)
 
-        assert list(keep) == [True, True, True]
-        assert list(flip) == [False, True, True]
-        assert caplog.records == []
+        betas, ses = sut.estimate_block(genotypes, regressions, cross, estimates)
+        recoded_betas, recoded_ses = sut.estimate_block(2.0 - genotypes, regressions, cross,
+                                                        estimates)
 
+        assert np.allclose(recoded_betas, -betas) and np.allclose(recoded_ses, ses)
 
-    def test__variants_missing_from_the_imputed_file__dropped_and_counted(self, caplog):
-        # snipar imputes only the variants it was given, and restricts to unique ones at that, so
-        # its table can be a subset of GRMA's.  Those SNPs simply cannot be residualized against
-        # parents, and are dropped rather than half-processed.
-        bim_variants = [("rs1", 100, "A", "G"), ("rs2", 200, "C", "T"), ("rs3", 300, "A", "C"),
-                        ("rs4", 400, "G", "T")]
-        imputed_variants = [("rs1", 100, "A", "G"), ("rs3", 300, "A", "C")]
+    def test__phenotypes_shifted__estimates_unchanged(self):
+        shifted = {k : v + 5.0 for k, v in RELATIVE_PHENOS.items()}
+        plans = [relative_plan(), relative_plan(phenos=shifted)]
+        genotypes = genotypes_for(len(plans[0][2]))
+        estimates = sut.reported_estimates(has_po=False)
 
-        with caplog.at_level(logging.INFO):
-            keep, _, _ = sut.align_imputed_file_to_bim(
-                bim_df=self.bim(bim_variants), metadata=self.metadata(imputed_variants))
+        results = [sut.estimate_block(genotypes, p[4], p[5], estimates) for p in plans]
 
-        assert list(keep) == [True, False, True, False]
+        assert np.allclose(results[0][0], results[1][0]) and np.allclose(results[0][1],
+                                                                          results[1][1])
 
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "2 SNP(s) (50.0%) dropped" in logged
-        assert "2 not present in the imputed parental genotype file" in logged
+    def test__first_estimate__the_first_regression_alone(self):
+        _, _, phenotypes, _, regressions, cross = relative_plan()
+        genotypes = genotypes_for(len(phenotypes))
 
+        betas, ses = sut.estimate_block(genotypes, regressions, cross,
+                                        sut.reported_estimates(has_po=False))
 
-    def test__different_alleles_entirely__dropped_as_a_different_variant(self, caplog):
-        # Same ID, same position, but the alleles do not correspond under any reading -- not
-        # swapped, not complemented.  The two files disagree about what the variant is, and
-        # nothing can be salvaged from that.
-        bim_variants = [("rs1", 100, "A", "G"), ("rs2", 200, "C", "T")]
-        imputed_variants = [("rs1", 100, "A", "G"), ("rs2", 200, "C", "A")]
+        _, d, beta = sut.regression_statistics(
+            sut.relative_genotype_residuals(genotypes, regressions[0]), regressions[0])
+        assert np.allclose(betas[:, 0], beta) and np.allclose(ses[:, 0], 1 / np.sqrt(d))
 
-        with caplog.at_level(logging.INFO):
-            keep, _, _ = sut.align_imputed_file_to_bim(
-                bim_df=self.bim(bim_variants), metadata=self.metadata(imputed_variants))
+    def test__empty_regression__estimates_including_it_equal_those_without(self):
+        rows = [r for r in RELATIVE_ROWS if r[2] != "2nd"]
+        phenos = {k : v for k, v in RELATIVE_PHENOS.items() if k not in ("n", "m1", "m2")}
+        _, _, phenotypes, _, regressions, cross = relative_plan(phenos, rows)
 
-        assert list(keep) == [True, False]
+        betas, ses = sut.estimate_block(genotypes_for(len(phenotypes)), regressions, cross,
+                                        sut.reported_estimates(has_po=False))
 
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "1 SNP(s) (50.0%) dropped" in logged
-        assert "1 incompatible alleles, so not the same variant" in logged
+        # FS, FS+2ND, FS+2ND+3RD: with no 2ND regression, the first two coincide
+        assert np.allclose(betas[:, 0], betas[:, 1]) and np.allclose(ses[:, 0], ses[:, 1])
+        assert not np.allclose(betas[:, 1], betas[:, 2])
 
+    def test__no_regressions__every_estimate_nan(self):
+        betas, ses = sut.estimate_block(np.zeros((3, 2)), [], {},
+                                        sut.reported_estimates(has_po=False, rel_degree=1))
 
-    def test__palindromic_variants_with_no_strand_evidence__kept(self, caplog):
-        # A/T and C/G cannot have their strand read off the letters: on the opposite strand an
-        # A/T variant still presents as A/T, with only the two alleles exchanged.  So their
-        # orientation is ambiguous in isolation.
-        #
-        # It is resolved by looking at the UNAMBIGUOUS variants instead.  None of them shows a
-        # strand difference here, so the two files share a strand, and the palindromic ones can
-        # be read at face value.
-        variants = [("rs1", 100, "A", "G"), ("rs2", 200, "A", "T"), ("rs3", 300, "C", "G")]
-
-        with caplog.at_level(logging.DEBUG):
-            keep, _, flip = sut.align_imputed_file_to_bim(
-                bim_df=self.bim(variants), metadata=self.metadata(variants))
-
-        assert list(keep) == [True, True, True]
-        assert not flip.any()
-        assert caplog.records == []
+        assert betas.shape == (3, 1) and np.all(np.isnan(betas)) and np.all(np.isnan(ses))
 
 
-    def test__strand_difference_somewhere__palindromic_variants_dropped_too(self, caplog):
-        # One unambiguous variant recorded on the opposite strand is enough to settle the
-        # question the other way: the two files do NOT share a strand, so no palindromic variant
-        # can be trusted, including the ones whose letters happen to agree.
-        #
-        # rs1 matches, rs2 is complemented, rs3 and rs4 are palindromic and agree letter for
-        # letter.  Only rs1 survives.
-        bim_variants = [("rs1", 100, "A", "G"), ("rs2", 200, "A", "G"), ("rs3", 300, "A", "T"),
-                        ("rs4", 400, "C", "G")]
-        imputed_variants = [("rs1", 100, "A", "G"), ("rs2", 200, "T", "C"),
-                            ("rs3", 300, "A", "T"), ("rs4", 400, "C", "G")]
+# --------------------------------------------------------------------------------------------------
+# SNPs
 
-        with caplog.at_level(logging.INFO):
-            keep, _, _ = sut.align_imputed_file_to_bim(
-                bim_df=self.bim(bim_variants), metadata=self.metadata(imputed_variants))
-
-        assert list(keep) == [True, False, False, False]
-
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "1 SNP(s) are recorded on opposite strands" in logged
-        assert "3 SNP(s) (75.0%) dropped" in logged
-        assert "2 palindromic, and the two files disagree about strand" in logged
-        assert "1 recorded on the opposite strand" in logged
+def bim_of(rows):
+    """A bim frame from (rsid, bp, a1, a2) rows, all on chromosome 1"""
+    return grma_io.read_bim(pd.DataFrame([("1", r, 0.0, bp, a1, a2) for r, bp, a1, a2 in rows],
+                                          columns=list(bbf.BIM_COLS)))
 
 
-    def test__same_id_at_a_different_position__raises(self, caplog):
-        # An ID matching while the position does not means the two files are using one name for
-        # two different variants.  That is not something to drop quietly: every other match is
-        # then suspect, and the user needs to know before any of it is used.
-        bim_variants = [("rs1", 100, "A", "G"), ("rs2", 200, "C", "T")]
-        imputed_variants = [("rs1", 100, "A", "G"), ("rs2", 999, "C", "T")]
+def snipar_bim(rows):
+    """snipar metadata holding only bim values, from (rsid, bp, allele1, allele2) rows"""
+    return {snipar_hdf5.SNIPAR_BIM_VALUES_KEY :
+                np.array([["1", r, "0", str(bp), a1, a2] for r, bp, a1, a2 in rows]),
+            snipar_hdf5.SNIPAR_BIM_COLUMNS_KEY :
+                np.array(["Chr", "id", "morgans", "coordinate", "allele1", "allele2"])}
 
-        with pytest.raises(ValueError) as error:
-            sut.align_imputed_file_to_bim(bim_df=self.bim(bim_variants),
-                                          metadata=self.metadata(imputed_variants))
+
+class TestPlanSnps:
+
+    BIM = [("rs1", 100, "A", "C"), ("rs2", 200, "G", "T"), ("rs3", 300, "A", "T"),
+           ("rs4", 400, "C", "A")]
+
+    def test__no_snipar_file__every_snp_no_alignment(self):
+        actual = sut.plan_snps(bim_of(self.BIM))
+
+        assert actual.bim_rows.tolist() == [0, 1, 2, 3]
+        assert actual.snipar_positions is None and actual.flip is None
+
+    def test__snp_list__only_listed_kept_unknown_ones_warned(self, caplog):
+        snp_list = grma_io.read_snp_list(pd.DataFrame({0 : ["rs3", "rs1", "rs99"]}))
+
+        with caplog.at_level(logging.WARNING):
+            actual = sut.plan_snps(bim_of(self.BIM), snp_list=snp_list)
+
+        assert actual.bim_rows.tolist() == [0, 2]
+        assert "1 SNP(s) in the SNP list are not in the bim file" in caplog.text
+
+    def test__snp_list_naming_only_known_snps__no_warning(self, caplog):
+        snp_list = grma_io.read_snp_list(pd.DataFrame({0 : ["rs2", "rs4"]}))
+
+        with caplog.at_level(logging.WARNING):
+            actual = sut.plan_snps(bim_of(self.BIM), snp_list=snp_list)
+
+        assert actual.bim_rows.tolist() == [1, 3]
+        assert "not in the bim file" not in caplog.text
+
+    def test__snp_list_naming_none__raises(self):
+        snp_list = grma_io.read_snp_list(pd.DataFrame({0 : ["rs99"]}))
+
+        with pytest.raises(ValueError, match="No SNP is left to analyse"):
+            sut.plan_snps(bim_of(self.BIM), snp_list=snp_list)
+
+    def test__aligned__positions_and_flips(self, caplog):
+        # rs1 as in the bim; rs2 swapped; rs3 (palindromic) usable, since no SNP shows opposite
+        # strands; rs4 not in snipar's file
+        snipar = snipar_bim([("rs1", 100, "A", "C"), ("rs2", 200, "T", "G"),
+                             ("rs3", 300, "A", "T"), ("rs5", 500, "A", "G")])
+
+        with caplog.at_level(logging.WARNING):
+            actual = sut.plan_snps(bim_of(self.BIM), snipar_metadata=snipar)
+
+        assert actual.bim_rows.tolist() == [0, 1, 2, 3]
+        assert actual.snipar_positions.tolist() == [0, 1, 2, -1]
+        assert actual.flip.tolist() == [False, True, False, False]
+        assert "1 of 4 SNP(s) have no usable imputed parental data" in caplog.text
+
+    def test__alleles_irreconcilable__no_usable_data(self):
+        snipar = snipar_bim([("rs1", 100, "A", "G"), ("rs2", 200, "G", "T"),
+                             ("rs3", 300, "A", "T"), ("rs4", 400, "C", "A")])
+
+        actual = sut.plan_snps(bim_of(self.BIM), snipar_metadata=snipar)
+
+        assert actual.snipar_positions.tolist() == [-1, 1, 2, 3]
+
+    def test__opposite_strands__those_and_every_palindromic_snp_unusable(self, caplog):
+        # rs2 is on the opposite strand (G/T against C/A); that makes rs3's strand unknowable
+        snipar = snipar_bim([("rs1", 100, "A", "C"), ("rs2", 200, "C", "A"),
+                             ("rs3", 300, "A", "T"), ("rs4", 400, "C", "A")])
+
+        with caplog.at_level(logging.WARNING):
+            actual = sut.plan_snps(bim_of(self.BIM), snipar_metadata=snipar)
+
+        assert actual.snipar_positions.tolist() == [0, -1, -1, 3]
+        assert "opposite strands" in caplog.text
+
+    def test__rsid_at_a_different_position__raises(self):
+        snipar = snipar_bim([("rs1", 101, "A", "C")])
+
+        with pytest.raises(ValueError, match="different positions") as error:
+            sut.plan_snps(bim_of(self.BIM[:1]), snipar_metadata=snipar)
+
+        assert "rs1" in str(error.value)
+
+    def test__rsid_repeated_in_snipar_and_named_by_the_bim__raises(self):
+        snipar = snipar_bim([("rs1", 100, "A", "C"), ("rs1", 100, "A", "C")])
+
+        with pytest.raises(ValueError, match="more than once") as error:
+            sut.plan_snps(bim_of(self.BIM[:1]), snipar_metadata=snipar)
+
+        assert "rs1" in str(error.value)
+
+    def test__repeated_rsid_the_bim_does_not_name__no_error(self):
+        snipar = snipar_bim([(".", 50, "A", "G"), (".", 60, "A", "G"), ("rs1", 100, "A", "C")])
+
+        actual = sut.plan_snps(bim_of(self.BIM[:1]), snipar_metadata=snipar)
+
+        assert actual.snipar_positions.tolist() == [2]
+
+    def test__snipar_in_a_different_order__raises_naming_the_snp(self):
+        snipar = snipar_bim([("rs2", 200, "G", "T"), ("rs1", 100, "A", "C")])
+
+        with pytest.raises(ValueError, match="different order") as error:
+            sut.plan_snps(bim_of(self.BIM[:2]), snipar_metadata=snipar)
 
         assert "rs2" in str(error.value)
 
+    def test__bim_listing_a_snp_twice__repeated_position_accepted(self):
+        bim = bim_of([("rs1", 100, "A", "C"), ("rs2", 200, "G", "T"), ("rs2", 200, "G", "T")])
+        snipar = snipar_bim([("rs1", 100, "A", "C"), ("rs2", 200, "G", "T")])
 
-    def test__alternate_column_spellings__aligned_the_same_way(self, caplog):
-        # The names are looked up rather than assumed, so a file from snipar's simulation path
-        # aligns exactly as one from real data does.
-        #
-        # Both the spellings AND the order differ, since the order is not fixed either -- storing
-        # the names in the file would be pointless if it were.
-        variants = [("rs1", 100, "A", "G"), ("rs2", 200, "C", "T")]
-        simulate_path_columns = ["allele2", "position", "rsid", "map", "chrom", "allele1"]
+        actual = sut.plan_snps(bim, snipar_metadata=snipar)
 
-        from_real = sut.align_imputed_file_to_bim(
-            bim_df=self.bim(variants), metadata=self.metadata(variants))
-        from_simulated = sut.align_imputed_file_to_bim(
-            bim_df=self.bim(variants),
-            metadata=self.metadata(variants, columns=simulate_path_columns))
+        assert actual.snipar_positions.tolist() == [0, 1, 1]
 
-        for real_mask, simulated_mask in zip(from_real, from_simulated):
-            assert np.array_equal(real_mask, simulated_mask)
 
-
-    def test__dropped_variant_in_the_middle__later_rows_not_shifted(self, caplog):
-        # The three returned arrays are positional against the bim's rows, and the caller narrows
-        # all of them with the same mask.  A dropped variant must therefore leave a hole rather
-        # than closing the gap: packing the survivors leftwards here would hand rs4 the imputed
-        # row belonging to rs3.
-        #
-        # The imputed file also holds the variants in a different ORDER, so the indices are not
-        # merely a range and a bug producing one would be visible.
-        bim_variants = [("rs1", 100, "A", "G"), ("rs2", 200, "C", "T"), ("rs3", 300, "A", "C"),
-                        ("rs4", 400, "G", "T")]
-        imputed_variants = [("rs4", 400, "G", "T"), ("rs3", 300, "A", "C"),
-                            ("rs1", 100, "A", "G")]
-
-        with caplog.at_level(logging.INFO):
-            keep, hdf5_indices, flip = sut.align_imputed_file_to_bim(
-                bim_df=self.bim(bim_variants), metadata=self.metadata(imputed_variants))
-
-        assert list(keep) == [True, False, True, True]
-        assert len(hdf5_indices) == len(bim_variants)
-        assert len(flip) == len(bim_variants)
-
-        # Each surviving variant points at its own row of the imputed file
-        assert hdf5_indices[0] == 2
-        assert hdf5_indices[2] == 1
-        assert hdf5_indices[3] == 0
-
-
-class TestLogDroppedSnps:
-
-    # Testing this through align_imputed_file_to_bim() can only reach some of it: a palindromic
-    # SNP is dropped only when the two files disagree about strand, so that reason never arrives
-    # on its own there.  Calling it directly allows each reason to be isolated.
-
-    @staticmethod
-    def bim(num_snps):
-        return pd.DataFrame({bbf.BIM_RSID_COL : [f"rs{index}" for index in range(num_snps)]})
-
-    @classmethod
-    def log(cls, caplog, num_snps, keep, matched=None, palindromic=None, strand_differs=None,
-            strands_agree=True, level=logging.INFO):
-        """Calls the function with masks given as lists of booleans, and returns what it logged
-
-        Everything but keep defaults to all-False, so a case naming one mask is describing one
-        reason and nothing else.
-        """
-
-        def mask(values):
-            return np.array(values if values is not None else [False] * num_snps, dtype=bool)
-
-        caplog.clear()
-        with caplog.at_level(level):
-            sut.log_dropped_snps(bim_df=cls.bim(num_snps),
-                                 matched=mask(matched),
-                                 keep_mask=np.array(keep, dtype=bool),
-                                 palindromic=mask(palindromic),
-                                 strand_differs=mask(strand_differs),
-                                 strands_agree=strands_agree)
-
-        return "\n".join(record.message for record in caplog.records)
-
-
-    def test__nothing_dropped__says_nothing(self, caplog):
-        # A line reporting zero drops would appear on every ordinary run, where snipar was given
-        # the same bfile and everything matches.  Silence is the right output.
-        logged = self.log(caplog, num_snps=4, keep=[True] * 4, matched=[True] * 4)
-
-        assert logged == ""
-        assert caplog.records == []
-
-
-    # Each reason in isolation.  The last two are not reachable through the aligner: a
-    # palindromic SNP is kept whenever the strands agree, and dropped alongside the strand
-    # mismatches when they do not, so neither wording ever appears alone there.
-    @pytest.mark.parametrize("masks, expected_phrase", [
-        pytest.param({"matched" : [True, False, True, True]},
-                     "1 not present in the imputed parental genotype file",
-                     id="absent_from_the_imputed_file"),
-        pytest.param({"matched" : [True] * 4, "strand_differs" : [False, True, False, False]},
-                     "1 recorded on the opposite strand",
-                     id="opposite_strand"),
-        pytest.param({"matched" : [True] * 4},
-                     "1 incompatible alleles, so not the same variant",
-                     id="incompatible_alleles"),
-        pytest.param({"matched" : [True] * 4, "palindromic" : [False, True, False, False],
-                      "strands_agree" : True},
-                     "1 palindromic, so their orientation is ambiguous",
-                     id="palindromic_while_strands_agree"),
-        pytest.param({"matched" : [True] * 4, "palindromic" : [False, True, False, False],
-                      "strands_agree" : False},
-                     "1 palindromic, and the two files disagree about strand",
-                     id="palindromic_while_strands_disagree"),
-    ])
-    def test__one_reason_at_a_time__reported_with_its_own_phrase(self, caplog, masks,
-                                                                expected_phrase):
-        logged = self.log(caplog, num_snps=4, keep=[True, False, True, True], **masks)
-
-        assert "1 SNP(s) (25.0%) dropped" in logged
-        assert expected_phrase in logged
-
-
-    def test__several_reasons_at_once__each_counted_separately(self, caplog):
-        # Eight SNPs, four of them dropped, one for each reason.  A single total with no breakdown
-        # would leave the user unable to tell a version mismatch from a strand problem.
-        logged = self.log(
-            caplog, num_snps=8,
-            keep=[False, True, False, True, False, True, False, True],
-            matched=[False, True, True, True, True, True, True, True],
-            palindromic=[False, False, True, False, False, False, False, False],
-            strand_differs=[False, False, False, False, True, False, False, False],
-            strands_agree=False)
-
-        assert "4 SNP(s) (50.0%) dropped" in logged
-        assert "1 not present in the imputed parental genotype file" in logged
-        assert "1 palindromic, and the two files disagree about strand" in logged
-        assert "1 recorded on the opposite strand" in logged
-        assert "1 incompatible alleles, so not the same variant" in logged
-
-
-    def test__percentage__taken_against_the_whole_bim(self, caplog):
-        # 2 of 8, which is 25% -- and distinguishable from the alternatives.  Against the number
-        # dropped it would be 100%, and against the number matched 28.6%.
-        logged = self.log(caplog, num_snps=8,
-                          keep=[True, False, True, True, False, True, True, True],
-                          matched=[True, False, True, True, True, True, True, True])
-
-        assert "2 SNP(s) (25.0%) dropped" in logged
-
-
-    def test__ordinary_logging__counts_without_the_identities(self, caplog):
-        # The convention is counts at the normal level and per-item detail only when asked for.
-        # A run dropping tens of thousands of SNPs would otherwise be unreadable.
-        logged = self.log(caplog, num_snps=4, keep=[True, False, True, False],
-                          matched=[True, False, True, False], level=logging.INFO)
-
-        assert "2 not present in the imputed parental genotype file" in logged
-        assert "rs1" not in logged
-        assert "rs3" not in logged
-
-
-    def test__verbose_logging__identities_as_well(self, caplog):
-        # Asked for the detail, the user gets the IDs, so that a handful of unexpected drops can
-        # actually be chased down.
-        logged = self.log(caplog, num_snps=4, keep=[True, False, True, False],
-                          matched=[True, False, True, False], level=logging.DEBUG)
-
-        assert "2 not present in the imputed parental genotype file" in logged
-        assert "rs1" in logged
-        assert "rs3" in logged
-
-
-
-class TestReadImputedBlock:
-
-    # The chunk cache exists because HDF5 cannot serve part of a chunk: asking for a block's worth
-    # of SNPs reads the whole chunk containing them and throws the rest away.  Chunk widths run
-    # from a few hundred SNPs to several thousand while a block is typically a hundred, so reading
-    # per block costs an order of magnitude more than it needs to.
-
-    CHUNK_WIDTH = 8
-    NUM_SNPS = 40
-    NUM_FAMILIES = 5
-
-    @classmethod
-    def imputed_file(cls, tmp_path, seed=99):
-        """Writes a small imputed parental genotype file and returns its path and contents
-
-        Written to disk rather than faked, because the chunking is the subject: a stand-in handle
-        would not have any.  The width is forced narrow so that a block can span several chunks at
-        sizes small enough to read in a test.
-        """
-
-        rng = np.random.default_rng(seed)
-        neither_observed = rng.random(cls.NUM_FAMILIES) < 0.5
-        imputed_gts, num_obs_par_alleles, standard_f, _ = helper.mock_snipar_imputation(
-            rng=rng, num_snps=cls.NUM_SNPS, neither_observed=neither_observed)
-
-        path = str(tmp_path / "chr_1.hdf5")
-        snipar_hdf5.write_snipar_file(
-            imputed_filename=path,
-            imputed_gts=imputed_gts,
-            num_obs_par_alleles=num_obs_par_alleles,
-            standard_f=standard_f,
-            parental_status=np.zeros((cls.NUM_FAMILIES, 3), dtype=bool),
-            pedigree=np.array([[f"F{family}", f"I{family}", "P", "M", "False", "False"]
-                               for family in range(cls.NUM_FAMILIES)]),
-            families=np.array([f"F{family}" for family in range(cls.NUM_FAMILIES)]),
-            bim_values=np.array([["1", f"rs{snp}", "0", str(snp * 100), "A", "G"]
-                                 for snp in range(cls.NUM_SNPS)]),
-            chunk_snps=cls.CHUNK_WIDTH)
-
-        return path, imputed_gts, num_obs_par_alleles, standard_f
-
-    @staticmethod
-    def new_cache():
-        return {"cached_start" : -1, "cached_stop" : -1, "gts" : None, "counts" : None}
-
-    @staticmethod
-    def reads(caplog):
-        """Returns the (start, stop) of every chunk actually read, from what the function logged
-
-        The alternative would be to patch the reading function, which reaches further into the
-        module than this does.  It depends on the bracketed range in that debug line staying as it
-        is, which is the price of observing the cache without opening it up.
-        """
-
-        return [tuple(int(bound) for bound in match.groups())
-                for record in caplog.records
-                for match in [re.search(r"\[(\d+), (\d+)\)", record.message)] if match]
-
-
-    @pytest.mark.parametrize("block_size", [
-        pytest.param(3, id="several_blocks_per_chunk"),
-        pytest.param(8, id="block_exactly_one_chunk"),
-        pytest.param(20, id="block_spans_several_chunks"),
-        pytest.param(40, id="one_block_for_the_whole_file"),
-    ])
-    def test__consecutive_blocks__same_data_as_a_direct_read(self, tmp_path, block_size):
-        # The property the cache has to preserve: what comes back is what is in the file,
-        # whatever size the blocks happen to be relative to the chunks.  Block sizes above and
-        # below the chunk width both matter, since the two take different paths through the
-        # advance loop.
-        path, imputed_gts, num_obs_par_alleles, _ = self.imputed_file(tmp_path)
-
-        with snipar_hdf5.open_snipar_file(path) as handle:
-            cache = self.new_cache()
-            for start in range(0, self.NUM_SNPS, block_size):
-                indices = np.arange(start, min(start + block_size, self.NUM_SNPS))
-
-                block = sut.read_imputed_block(
-                    imputed_hdf5=handle, metadata=snipar_hdf5.read_snipar_metadata(path),
-                    block_hdf5_indices=indices,
-                    block_flip_mask=np.zeros(len(indices), dtype=bool), chunk=cache)
-
-                assert np.allclose(imputed_gts[:, indices], block["imputed_gts"],
-                                   equal_nan=True, atol=1e-3)
-                assert np.allclose(num_obs_par_alleles[:, indices],
-                                   block["num_obs_par_alleles"], equal_nan=True, atol=1e-3)
-
-
-    def test__non_contiguous_snps__each_one_read_from_its_own_position(self, tmp_path):
-        # What a SNP list, or alignment dropping variants, leaves behind: the block's SNPs are
-        # scattered through the file rather than being a run of them.  The gaps here are wide
-        # enough to skip whole chunks, so a bug treating the indices as a range would be reading
-        # from entirely the wrong place.
-        path, imputed_gts, _, _ = self.imputed_file(tmp_path)
-        indices = np.array([0, 1, 9, 17, 18, 33, 39])
-
-        with snipar_hdf5.open_snipar_file(path) as handle:
-            block = sut.read_imputed_block(
-                imputed_hdf5=handle, metadata=snipar_hdf5.read_snipar_metadata(path),
-                block_hdf5_indices=indices,
-                block_flip_mask=np.zeros(len(indices), dtype=bool), chunk=self.new_cache())
-
-        assert np.allclose(imputed_gts[:, indices], block["imputed_gts"],
-                           equal_nan=True, atol=1e-3)
-
-
-    def test__some_snps_flipped__only_those_are_turned_round(self, tmp_path):
-        # A SNP the two files count from opposite alleles has its imputed genotypes subtracted
-        # from 2 and its frequency from 1.  Both are applied HERE, to the raw values, rather than
-        # to the corrected ones downstream -- a genotype always flips as 2 - g and a frequency as
-        # 1 - f, where flipping a corrected value needs a constant that varies with how many
-        # parental alleles were observed.
-        #
-        # Allele counts are NOT flipped: how many alleles were seen does not depend on which one
-        # is being counted.
-        path, imputed_gts, num_obs_par_alleles, standard_f = self.imputed_file(tmp_path)
-        indices = np.arange(10, 18)
-        flip = np.array([False, True, False, False, True, True, False, False])
-
-        with snipar_hdf5.open_snipar_file(path) as handle:
-            block = sut.read_imputed_block(
-                imputed_hdf5=handle, metadata=snipar_hdf5.read_snipar_metadata(path),
-                block_hdf5_indices=indices, block_flip_mask=flip, chunk=self.new_cache())
-
-        expected_gts = imputed_gts[:, indices].astype(float)
-        expected_gts[:, flip] = sut.SNIPAR_ALLELES_PER_PARENT - expected_gts[:, flip]
-        expected_f = standard_f[indices].copy()
-        expected_f[flip] = 1.0 - expected_f[flip]
-
-        assert np.allclose(expected_gts, block["imputed_gts"], equal_nan=True, atol=1e-3)
-        assert np.allclose(expected_f, block["standard_f"])
-        assert np.allclose(num_obs_par_alleles[:, indices], block["num_obs_par_alleles"],
-                           equal_nan=True, atol=1e-3)
-
-
-    def test__frequencies__indexed_by_the_file_not_by_the_chunk(self, tmp_path):
-        # standard_f comes from the metadata read once at setup, so it is indexed by position in
-        # the whole file -- unlike the two genotype arrays, which are indexed into the cached
-        # chunk.  Mixing the two up is easy and would go unnoticed for any block starting at a
-        # chunk boundary, where the two indices coincide.
-        #
-        # This block starts at 21, which is 5 into its chunk, so they do not.
-        path, _, _, standard_f = self.imputed_file(tmp_path)
-        indices = np.arange(21, 27)
-
-        with snipar_hdf5.open_snipar_file(path) as handle:
-            block = sut.read_imputed_block(
-                imputed_hdf5=handle, metadata=snipar_hdf5.read_snipar_metadata(path),
-                block_hdf5_indices=indices,
-                block_flip_mask=np.zeros(len(indices), dtype=bool), chunk=self.new_cache())
-
-        assert np.allclose(standard_f[indices], block["standard_f"])
-
-
-    def test__blocks_within_one_chunk__read_once_and_reused(self, tmp_path, caplog):
-        # Four blocks of two SNPs each, all inside the first chunk.  Only the first should cause
-        # a read; the rest are the cache earning its keep.
-        path, _, _, _ = self.imputed_file(tmp_path)
-
-        with snipar_hdf5.open_snipar_file(path) as handle:
-            metadata = snipar_hdf5.read_snipar_metadata(path)
-            cache = self.new_cache()
-            caplog.clear()
-            with caplog.at_level(logging.DEBUG):
-                for start in (0, 2, 4, 6):
-                    indices = np.arange(start, start + 2)
-                    sut.read_imputed_block(
-                        imputed_hdf5=handle, metadata=metadata, block_hdf5_indices=indices,
-                        block_flip_mask=np.zeros(2, dtype=bool), chunk=cache)
-
-        assert self.reads(caplog) == [(0, self.CHUNK_WIDTH)]
-
-
-    def test__block_spanning_chunks__one_chunk_held_at_a_time(self, tmp_path, caplog):
-        # A block covering 20 SNPs crosses three chunks of 8.  Each is read on its own and
-        # replaces the last, so the memory held stays bounded at one chunk however the block size
-        # and the chunk width line up.  Reading the span in one go would be simpler and would
-        # keep all three resident -- which at a real file's width is gigabytes rather than
-        # kilobytes.
-        path, _, _, _ = self.imputed_file(tmp_path)
-
-        with snipar_hdf5.open_snipar_file(path) as handle:
-            caplog.clear()
-            with caplog.at_level(logging.DEBUG):
-                sut.read_imputed_block(
-                    imputed_hdf5=handle, metadata=snipar_hdf5.read_snipar_metadata(path),
-                    block_hdf5_indices=np.arange(0, 20),
-                    block_flip_mask=np.zeros(20, dtype=bool), chunk=self.new_cache())
-
-        reads = self.reads(caplog)
-        assert reads == [(0, 8), (8, 16), (16, 24)]
-        assert all(stop - start == self.CHUNK_WIDTH for start, stop in reads)
-
-
-    def test__last_chunk__read_stops_at_the_end_of_the_file(self, tmp_path, caplog):
-        # 40 SNPs over chunks of 8 divides evenly, so the final chunk ends exactly at the end of
-        # the file.  The read range is clamped rather than running past it.
-        path, _, _, _ = self.imputed_file(tmp_path)
-
-        with snipar_hdf5.open_snipar_file(path) as handle:
-            caplog.clear()
-            with caplog.at_level(logging.DEBUG):
-                sut.read_imputed_block(
-                    imputed_hdf5=handle, metadata=snipar_hdf5.read_snipar_metadata(path),
-                    block_hdf5_indices=np.array([36, 39]),
-                    block_flip_mask=np.zeros(2, dtype=bool), chunk=self.new_cache())
-
-        assert self.reads(caplog) == [(32, 40)]
-
-
-class TestDescribeOffenders:
-
-    # A message formatter, so the tests pin what the caller relies on -- the count being right and
-    # the list being capped -- rather than the punctuation, which is free to change.
-    #
-    # The cases below pass an explicit limit so that they describe the BEHAVIOUR rather than
-    # whatever MAX_REPORTED_OFFENDERS currently happens to be; two cases at the end cover the
-    # default separately.
-    LIMIT = 5
-
-    def test__fewer_than_the_limit__all_of_them_named(self):
-        ids = [f"IND{index}" for index in range(self.LIMIT - 2)]
-
-        described = sut.describe_offenders(ids, limit=self.LIMIT)
-
-        assert described.startswith(f"{self.LIMIT - 2} individual(s):")
-        assert all(identifier in described for identifier in ids)
-        assert "..." not in described
-
-
-    def test__exactly_at_the_limit__still_all_of_them(self):
-        # The boundary, since an off-by-one here would truncate a list that fits
-        ids = [f"IND{index}" for index in range(self.LIMIT)]
-
-        described = sut.describe_offenders(ids, limit=self.LIMIT)
-
-        assert described.startswith(f"{self.LIMIT} individual(s):")
-        assert all(identifier in described for identifier in ids)
-        assert "..." not in described
-
-
-    def test__over_the_limit__true_count_with_a_capped_sample(self):
-        # The case this function exists for.  A fam file using something other than "0" for an
-        # absent parent makes every individual an offender, and naming all of them turns one
-        # error message into hundreds of thousands of lines.
-        #
-        # WHICH ones are named is deliberately not asserted: the docstring says that is arbitrary,
-        # so pinning it here would contradict the contract.
-        ids = [f"IND{index:06d}" for index in range(5000)]
-
-        described = sut.describe_offenders(ids, limit=self.LIMIT)
-
-        assert described.startswith("5000 individual(s), including:")
-        assert described.count("IND") == self.LIMIT
-        assert described.endswith(", ...]")
-
-
-    def test__noun__used_in_the_phrase(self):
-        # Callers name what they are reporting, so that the result reads as part of a sentence
-        described = sut.describe_offenders(["rs1", "rs2"], noun="SNP(s)", limit=self.LIMIT)
-
-        assert described.startswith("2 SNP(s):")
-
-
-    def test__numpy_array__reads_the_same_as_a_list(self):
-        # Several callers hold their IDs as numpy arrays, whose elements print their type
-        # alongside their value unless they are converted first
-        ids = [f"IND{index}" for index in range(self.LIMIT - 2)]
-
-        assert (sut.describe_offenders(np.array(ids), limit=self.LIMIT) ==
-                sut.describe_offenders(ids, limit=self.LIMIT))
-
-
-    def test__nothing_to_report__says_so_without_failing(self):
-        # Not reachable through the validators, which only call this once they have offenders,
-        # but a formatter that falls over on an empty list is a poor one
-        assert sut.describe_offenders([], limit=self.LIMIT).startswith("0 individual(s):")
-
-
-    def test__no_limit_given__capped_at_the_module_default(self):
-        # The callers all rely on the default, so it is worth knowing it is the constant rather
-        # than something the function decided for itself
-        ids = [f"IND{index:06d}" for index in range(sut.MAX_REPORTED_OFFENDERS + 1)]
-
-        described = sut.describe_offenders(ids)
-
-        assert described.count("IND") == sut.MAX_REPORTED_OFFENDERS
-        assert described.endswith(", ...]")
-
-
-    def test__no_limit_given__a_list_that_fits_is_not_capped(self):
-        # The other side of the same boundary, at the default
-        ids = [f"IND{index:06d}" for index in range(sut.MAX_REPORTED_OFFENDERS)]
-
-        described = sut.describe_offenders(ids)
-
-        assert described.count("IND") == sut.MAX_REPORTED_OFFENDERS
-        assert "..." not in described
-
-
-class TestValidatePedigreeSanity:
-
-    # Two conditions kill the run here.  Both mean the fam file is WRONG rather than merely
-    # incomplete: an individual cannot be their own parent, and one person cannot be both of
-    # somebody's parents.  Neither has a reading under which the analysis would be meaningful.
-
-    @staticmethod
-    def candidates(rows):
-        """Builds the frame determine_fam_file_trios() passes in, from (iid, father, mother)"""
-
-        return pd.DataFrame({bbf.FAM_FID_COL : ["FAM"] * len(rows),
-                             bbf.FAM_IID_COL : [row[0] for row in rows],
-                             bbf.FAM_IIDF_COL : [row[1] for row in rows],
-                             bbf.FAM_IIDM_COL : [row[2] for row in rows]})
-
-
-    def test__ordinary_pedigree__accepted(self):
-        sut.validate_pedigree_sanity(self.candidates([("C1", "DAD", "MUM"),
-                                                      ("C2", "DAD", "MUM"),
-                                                      ("C3", "OTHER_DAD", "OTHER_MUM")]))
-
-
-    def test__nobody_to_check__accepted(self):
-        # determine_fam_file_trios() returns early on an empty frame, so this is unreachable
-        # through it -- but a validator that falls over on nothing to validate is a poor one
-        sut.validate_pedigree_sanity(self.candidates([]))
-
-
-    @pytest.mark.parametrize("rows, expected_in_message", [
-        pytest.param([("C1", "C1", "MUM")], "C1", id="listed_as_their_own_father"),
-        pytest.param([("C1", "DAD", "C1")], "C1", id="listed_as_their_own_mother"),
-    ])
-    def test__individual_is_their_own_parent__raises(self, rows, expected_in_message):
-        with pytest.raises(ValueError) as error:
-            sut.validate_pedigree_sanity(self.candidates(rows))
-
-        assert "own parent" in str(error.value)
-        assert expected_in_message in str(error.value)
-
-
-    def test__one_person_as_both_parents__raises(self):
-        with pytest.raises(ValueError) as error:
-            sut.validate_pedigree_sanity(self.candidates([("C1", "DAD", "MUM"),
-                                                          ("C2", "SAME", "SAME")]))
-
-        assert "both parents" in str(error.value)
-        assert "C2" in str(error.value)
-
-
-    def test__both_parents_absent__accepted(self):
-        # PLINK's marker for "no parent here" in both columns is not one person listed twice, it
-        # is nobody listed at all.  The caller filters these rows out before getting here, but
-        # that is the caller's business rather than something this function should depend on.
-        sut.validate_pedigree_sanity(self.candidates(
-            [("C1", sut.FAM_MISSING_PARENT, sut.FAM_MISSING_PARENT)]))
-
-
-    def test__several_offenders__all_of_them_reported(self):
-        # The user will want to fix them in one pass, so the error names everyone it found rather
-        # than stopping at the first
-        with pytest.raises(ValueError) as error:
-            sut.validate_pedigree_sanity(self.candidates([("C1", "SAME", "SAME"),
-                                                          ("C2", "DAD", "MUM"),
-                                                          ("C3", "ALSO", "ALSO")]))
-
-        assert "C1" in str(error.value)
-        assert "C3" in str(error.value)
-
-
-    def test__many_offenders__the_list_is_capped(self):
-        # A fam file using something other than PLINK's marker for an absent parent makes EVERY
-        # individual look like one person listed twice.  Naming them all turns a single error
-        # into one line per sample, so the message gives the count and a sample.
-        offenders = sut.MAX_REPORTED_OFFENDERS + 20
-
-        with pytest.raises(ValueError) as error:
-            sut.validate_pedigree_sanity(self.candidates(
-                [(f"C{index:04d}", "-9", "-9") for index in range(offenders)]))
-
-        assert f"{offenders} individual(s), including:" in str(error.value)
-        assert str(error.value).count("'C0") == sut.MAX_REPORTED_OFFENDERS
-
-
-class TestValidateParentSexes:
-
-    # Two same-sex genetic parents warn rather than stopping the run.  The parental mean is
-    # symmetric in the two parents, so which is which changes no result -- but a pedigree or a sex
-    # column wrong in that way is likely wrong in others, which the user should hear about.
-    #
-    # A trio where either parent's sex is unknown cannot be checked at all, and that is reported
-    # too: silence would otherwise mean both "checked and fine" and "could not be checked".
-
-    @staticmethod
-    def fam(sexes):
-        """Builds an unfiltered fam frame whose rows are the parents, in the given order"""
-
-        num_samples = len(sexes)
-
-        return pd.DataFrame({bbf.FAM_FID_COL : ["FAM"] * num_samples,
-                             bbf.FAM_IID_COL : [f"P{index}" for index in range(num_samples)],
-                             bbf.FAM_IIDF_COL : [sut.FAM_MISSING_PARENT] * num_samples,
-                             bbf.FAM_IIDM_COL : [sut.FAM_MISSING_PARENT] * num_samples,
-                             bbf.FAM_SEX_COL : list(sexes),
-                             bbf.FAM_PHENO_COL : [1.0] * num_samples})
-
-    @staticmethod
-    def children(iids):
-        return pd.DataFrame({bbf.FAM_IID_COL : list(iids)})
-
-    @classmethod
-    def check(cls, caplog, sexes, father_pos, mother_pos, iids=None, level=logging.INFO):
-        """Runs the validator and returns everything it logged"""
-
-        iids = iids if iids is not None else [f"C{index}" for index in range(len(father_pos))]
-
-        caplog.clear()
-        with caplog.at_level(level):
-            # dtype is given explicitly because an empty list would otherwise come out as
-            # float64, which cannot be used as an index.  The positions production passes come
-            # from Index.get_indexer(), which is integer-typed however few there are.
-            sut.validate_parent_sexes(cls.fam(sexes), cls.children(iids),
-                                      np.array(father_pos, dtype=np.int64),
-                                      np.array(mother_pos, dtype=np.int64))
-
-        return "\n".join(record.message for record in caplog.records)
-
-
-    # Which parent is which is not something GRMA knows or needs to: the fam file's father column
-    # may hold either, and the result is the same regardless.  What matters is only that the two
-    # differ.
-    @pytest.mark.parametrize("sexes", [
-        pytest.param([sut.FAM_MALE_SEX, sut.FAM_FEMALE_SEX], id="father_male_mother_female"),
-        pytest.param([sut.FAM_FEMALE_SEX, sut.FAM_MALE_SEX], id="father_female_mother_male"),
-    ])
-    def test__parents_of_different_sexes__nothing_said(self, caplog, sexes):
-        assert self.check(caplog, sexes, father_pos=[0], mother_pos=[1]) == ""
-
-
-    @pytest.mark.parametrize("sex", [
-        pytest.param(sut.FAM_MALE_SEX, id="both_male"),
-        pytest.param(sut.FAM_FEMALE_SEX, id="both_female"),
-    ])
-    def test__parents_of_the_same_sex__warns(self, caplog, sex):
-        logged = self.check(caplog, [sex, sex], father_pos=[0], mother_pos=[1], iids=["KID"])
-
-        assert "same recorded sex" in logged
-        assert "KID" in logged
-
-
-    # Anything outside the two known codes means the sex was not recorded.  PLINK writes 0, but
-    # -9 turns up as a missing marker too, and neither can be checked.
-    @pytest.mark.parametrize("unknown", [
-        pytest.param(sut.FAM_UNKNOWN_SEX, id="plink_unknown_code"),
-        pytest.param("-9", id="another_missing_marker"),
-    ])
-    def test__a_parent_whose_sex_is_unrecorded__reported_as_unchecked(self, caplog, unknown):
-        logged = self.check(caplog, [sut.FAM_MALE_SEX, unknown],
-                            father_pos=[0], mother_pos=[1], iids=["KID"])
-
-        assert "could not be checked" in logged
-        assert "KID" in logged
-        assert "same recorded sex" not in logged
-
-
-    def test__a_parent_who_is_not_genotyped__nothing_said(self, caplog):
-        # -1 means that parent is not in the fam file at all, so there is no sex to compare and
-        # nothing was skipped either -- this is not the same as a sex that is simply unrecorded.
-        #
-        # The LAST sample is given the same sex as the father deliberately.  A -1 used as an index
-        # rather than as a sentinel reads the last row, so without that the two sexes would differ
-        # by luck and this would pass whether the sentinel was honoured or not.
-        sexes = [sut.FAM_MALE_SEX, sut.FAM_FEMALE_SEX, sut.FAM_MALE_SEX]
-
-        assert self.check(caplog, sexes, father_pos=[0], mother_pos=[-1]) == ""
-
-
-    def test__several_offenders__all_of_them_named(self, caplog):
-        # Three trios, the first and last with same-sex parents
-        sexes = [sut.FAM_MALE_SEX, sut.FAM_MALE_SEX,
-                 sut.FAM_MALE_SEX, sut.FAM_FEMALE_SEX,
-                 sut.FAM_FEMALE_SEX, sut.FAM_FEMALE_SEX]
-
-        logged = self.check(caplog, sexes, father_pos=[0, 2, 4], mother_pos=[1, 3, 5],
-                            iids=["KID_A", "KID_OK", "KID_B"])
-
-        assert "KID_A" in logged
-        assert "KID_B" in logged
-        assert "KID_OK" not in logged
-
-
-    def test__many_offenders__the_list_is_capped(self, caplog):
-        # A sex column filled in wrongly across the whole file would otherwise name every trio
-        offenders = sut.MAX_REPORTED_OFFENDERS + 20
-        sexes = [sut.FAM_MALE_SEX] * (2 * offenders)
-
-        logged = self.check(caplog, sexes,
-                            father_pos=list(range(0, 2 * offenders, 2)),
-                            mother_pos=list(range(1, 2 * offenders, 2)),
-                            iids=[f"C{index:04d}" for index in range(offenders)])
-
-        assert f"{offenders} individual(s), including:" in logged
-        assert logged.count("'C0") == sut.MAX_REPORTED_OFFENDERS
-
-
-    def test__nobody_to_check__nothing_said(self, caplog):
-        assert self.check(caplog, [sut.FAM_MALE_SEX, sut.FAM_FEMALE_SEX],
-                          father_pos=[], mother_pos=[], iids=[]) == ""
-
-
-class TestValidateParentsAgainstKing:
-
-    # A stated parent-offspring relationship that KING does not confirm kills the run.  The fam
-    # file and snipar's pedigree are potentially independent of KING -- a user may have been given
-    # one and produced the other -- so agreement between them is real evidence rather than a
-    # restatement, and disagreement means at least one of the two is wrong about this sample.
-    #
-    # A pair KING does not mention at all counts as contradiction too: KING reports the
-    # relationships it detects, so the absence of a parent-offspring pair means it did not detect
-    # one.
-
-    @staticmethod
-    def king(pairs, degree=None):
-        """Builds a relatedness frame from (index1, index2) pairs, parent-offspring by default"""
-
-        degree = degree if degree is not None else sut.DEG_PARENT_OFFSPRING
-
-        return pd.DataFrame({sut.FAM_INDEX_1 : [pair[0] for pair in pairs],
-                             sut.FAM_INDEX_2 : [pair[1] for pair in pairs],
-                             sut.KING_REL_COL : [degree] * len(pairs)})
-
-    @staticmethod
-    def validate(rel_df, child_pos, father_pos, mother_pos, usable=None, iids=None,
-                 source="The fam file"):
-        """Runs the validator over positions given as plain lists"""
-
-        count = len(child_pos)
-        iids = iids if iids is not None else [f"C{index}" for index in range(count)]
-        usable = usable if usable is not None else [True] * count
-
-        sut.validate_parents_against_king(
-            iids=np.array(iids), child_pos=np.array(child_pos, dtype=np.int64),
-            father_pos=np.array(father_pos, dtype=np.int64),
-            mother_pos=np.array(mother_pos, dtype=np.int64),
-            usable=np.array(usable, dtype=bool), rel_df=rel_df, source=source)
-
-
-    def test__every_relationship_confirmed__accepted(self):
-        # Child 0 with parents 1 and 2, both reported by KING as parent-offspring
-        self.validate(self.king([(0, 1), (0, 2)]),
-                      child_pos=[0], father_pos=[1], mother_pos=[2])
-
-
-    def test__pairs_listed_the_other_way_round__accepted(self):
-        # KING writes each pair once, in whichever order it happened to consider them, so the
-        # lookup is keyed both ways.  Requiring the stated direction would reject half of a
-        # perfectly good file, and which half would depend on how KING happened to sort its input.
-        self.validate(self.king([(1, 0), (2, 0)]),
-                      child_pos=[0], father_pos=[1], mother_pos=[2])
-
-
-    @pytest.mark.parametrize("degree", [
-        pytest.param(sut.DEG_FULLSIB, id="king_says_full_siblings"),
-        pytest.param(sut.DEG_2ND, id="king_says_second_degree"),
-        pytest.param(sut.DEG_UNRELATED, id="king_says_unrelated"),
-    ])
-    def test__king_classifies_the_pair_as_something_else__raises(self, degree):
-        with pytest.raises(ValueError) as error:
-            self.validate(self.king([(0, 1), (0, 2)], degree=degree),
-                          child_pos=[0], father_pos=[1], mother_pos=[2], iids=["KID"])
-
-        assert "KID" in str(error.value)
-
-
-    def test__king_does_not_mention_the_pair__raises(self):
-        # The mother is confirmed; the father appears nowhere in the KING data.  Absence is a
-        # contradiction rather than a gap, since KING would have reported the pair had it found
-        # one.
-        with pytest.raises(ValueError) as error:
-            self.validate(self.king([(0, 2)]),
-                          child_pos=[0], father_pos=[1], mother_pos=[2], iids=["KID"])
-
-        assert "KID (father)" in str(error.value)
-        assert "mother" not in str(error.value)
-
-
-    def test__a_parent_who_is_not_genotyped__nothing_to_confirm(self):
-        # -1 means that parent is not a sample, so the fam file has asserted nothing about them
-        # that KING could either confirm or contradict.  The mother is confirmed and the father
-        # is simply absent.
-        self.validate(self.king([(0, 2)]),
-                      child_pos=[0], father_pos=[-1], mother_pos=[2])
-
-
-    def test__individuals_who_will_not_be_used__not_checked(self):
-        # Both sources describe people beyond those contributing to this analysis.  Failing over a
-        # pedigree error involving somebody whose genotypes affect no result would be unhelpful,
-        # so only the relationships that will actually be used are checked.
-        #
-        # Child 0 is contradicted but unusable; child 3 is fine.  Nothing is raised.
-        self.validate(self.king([(3, 4)]),
-                      child_pos=[0, 3], father_pos=[1, 4], mother_pos=[-1, -1],
-                      usable=[False, True])
-
-
-    def test__several_contradictions__all_of_them_named_with_their_roles(self):
-        # The user will want to fix them in one pass, and which parent of which child is what
-        # they need to know -- an individual named without the role leaves them checking both.
-        with pytest.raises(ValueError) as error:
-            self.validate(self.king([(0, 1)]),
-                          child_pos=[0, 3], father_pos=[1, 4], mother_pos=[2, 5],
-                          iids=["KID_A", "KID_B"])
-
-        message = str(error.value)
-        assert "KID_A (mother)" in message
-        assert "KID_B (father)" in message
-        assert "KID_B (mother)" in message
-        assert "KID_A (father)" not in message
-
-
-    def test__many_contradictions__the_list_is_capped(self):
-        # A KING file covering a different sample set contradicts every stated relationship at
-        # once, which would otherwise name two entries per trio for the whole cohort.
-        trios = sut.MAX_REPORTED_OFFENDERS + 20
-
-        with pytest.raises(ValueError) as error:
-            self.validate(self.king([]),
-                          child_pos=list(range(trios)),
-                          father_pos=[trios + index for index in range(trios)],
-                          mother_pos=[-1] * trios,
-                          iids=[f"C{index:04d}" for index in range(trios)])
-
-        assert f"{trios} relationship(s), including:" in str(error.value)
-        assert str(error.value).count("(father)") == sut.MAX_REPORTED_OFFENDERS
-
-
-    def test__nobody_to_check__accepted(self):
-        self.validate(self.king([]), child_pos=[], father_pos=[], mother_pos=[], iids=[])
-
-
-    def test__the_source_is_named__so_the_user_knows_which_file_to_fix(self):
-        # Both parental processing branches call this, and they are told apart only by what they
-        # pass here.  A message blaming the fam file for snipar's pedigree would send the user to
-        # the wrong place entirely.
-        with pytest.raises(ValueError) as error:
-            self.validate(self.king([]), child_pos=[0], father_pos=[1], mother_pos=[-1],
-                          source="the imputed parental genotype file's pedigree")
-
-        assert str(error.value).startswith("the imputed parental genotype file's pedigree")
-
-
-class TestMapSamplesToImputedFamilies:
-
-    # Three lookups: the child and each parent into the fam file, and the family into the imputed
-    # file's own list.  All three are keyed by value rather than by position, which matters --
-    # snipar writes families sorted while the pedigree keeps whatever order it was built in.
-
-    @staticmethod
-    def pedigree(records):
-        """Builds pedigree rows from (fid, iid, father, mother), with the header already dropped"""
-
-        return np.array([[record[0], record[1], record[2], record[3], "False", "False"]
-                         for record in records])
-
-    @staticmethod
-    def fam(samples):
-        """Builds the unfiltered fam ID columns from (fid, iid) pairs"""
-
-        return pd.DataFrame({bbf.FAM_FID_COL : [sample[0] for sample in samples],
-                             bbf.FAM_IID_COL : [sample[1] for sample in samples]})
-
-
-    def test__everything_resolves__positions_line_up_with_the_pedigree(self):
-        # Two families of three, and the fam file in a different order from the pedigree, so that
-        # positions have to come from the lookup rather than from the row number
-        full_fam_ids = self.fam([("F2", "DAD2"), ("F1", "KID1"), ("F2", "KID2"),
-                                 ("F1", "DAD1"), ("F2", "MUM2"), ("F1", "MUM1")])
-        pedigree = self.pedigree([("F1", "KID1", "DAD1", "MUM1"),
-                                  ("F2", "KID2", "DAD2", "MUM2")])
-
-        child_pos, parent_pos, imputed_rows = sut.map_samples_to_imputed_families(
-            pedigree=pedigree, families=np.array(["F1", "F2"]), full_fam_ids=full_fam_ids)
-
-        assert list(child_pos) == [1, 2]
-        assert parent_pos.tolist() == [[3, 5], [0, 4]]
-        assert list(imputed_rows) == [0, 1]
-
-
-    def test__families_sorted_but_the_pedigree_is_not__matched_by_value(self):
-        # snipar writes families lexicographically, and the pedigree in the order it built them.
-        # Taking the imputed row from the pedigree's position rather than by looking the family up
-        # would hand every individual another family's parental genotypes -- plausible numbers
-        # attached to the wrong people.
-        full_fam_ids = self.fam([("ZZZ", "KID_Z"), ("AAA", "KID_A")])
-        pedigree = self.pedigree([("ZZZ", "KID_Z", "DAD_Z", "MUM_Z"),
-                                  ("AAA", "KID_A", "DAD_A", "MUM_A")])
-
-        _, _, imputed_rows = sut.map_samples_to_imputed_families(
-            pedigree=pedigree, families=np.array(["AAA", "ZZZ"]), full_fam_ids=full_fam_ids)
-
-        assert list(imputed_rows) == [1, 0]
-
-
-    def test__child_not_in_the_fam_file__no_position(self):
-        # The pedigree covers everyone snipar saw, which can exceed the bfile being analysed now
-        full_fam_ids = self.fam([("F1", "DAD1"), ("F1", "MUM1")])
-        pedigree = self.pedigree([("F1", "ABSENT", "DAD1", "MUM1")])
-
-        child_pos, parent_pos, _ = sut.map_samples_to_imputed_families(
-            pedigree=pedigree, families=np.array(["F1"]), full_fam_ids=full_fam_ids)
-
-        assert list(child_pos) == [-1]
-        assert parent_pos.tolist() == [[0, 1]]
-
-
-    @pytest.mark.parametrize("father, mother, expected", [
-        pytest.param("DAD1", "ABSENT", [0, -1], id="mother_not_genotyped"),
-        pytest.param("ABSENT", "MUM1", [-1, 1], id="father_not_genotyped"),
-        pytest.param("ABSENT", "ALSO_ABSENT", [-1, -1], id="neither_genotyped"),
-    ])
-    def test__a_parent_not_in_the_fam_file__no_position_for_that_one(self, father, mother,
-                                                                     expected):
-        # One parent genotyped and the other not is the commonest configuration in real data, and
-        # the two columns have to be resolved independently for it to come out right
-        full_fam_ids = self.fam([("F1", "DAD1"), ("F1", "MUM1"), ("F1", "KID1")])
-        pedigree = self.pedigree([("F1", "KID1", father, mother)])
-
-        child_pos, parent_pos, _ = sut.map_samples_to_imputed_families(
-            pedigree=pedigree, families=np.array(["F1"]), full_fam_ids=full_fam_ids)
-
-        assert list(child_pos) == [2]
-        assert parent_pos.tolist() == [expected]
-
-
-    def test__family_absent_from_the_imputed_file__no_imputed_row(self):
-        # A family whose parents were both genotyped had nothing to impute, so snipar wrote no row
-        # for it.  The individuals still resolve: their parental genotypes come from the bed file.
-        full_fam_ids = self.fam([("F1", "KID1"), ("F1", "DAD1"), ("F1", "MUM1")])
-        pedigree = self.pedigree([("F1", "KID1", "DAD1", "MUM1")])
-
-        child_pos, parent_pos, imputed_rows = sut.map_samples_to_imputed_families(
-            pedigree=pedigree, families=np.array(["F2", "F3"]), full_fam_ids=full_fam_ids)
-
-        assert list(imputed_rows) == [-1]
-        assert list(child_pos) == [0]
-        assert parent_pos.tolist() == [[1, 2]]
-
-
-    def test__siblings__share_a_family_row_but_not_a_position(self):
-        # One imputed row serves a whole sibship, since snipar imputes the parents FROM the
-        # siblings.  Nothing deduplicates, and nothing should.
-        full_fam_ids = self.fam([("F1", "KID1"), ("F1", "KID2"), ("F1", "KID3"),
-                                 ("F1", "DAD1"), ("F1", "MUM1")])
-        pedigree = self.pedigree([("F1", "KID1", "DAD1", "MUM1"),
-                                  ("F1", "KID2", "DAD1", "MUM1"),
-                                  ("F1", "KID3", "DAD1", "MUM1")])
-
-        child_pos, parent_pos, imputed_rows = sut.map_samples_to_imputed_families(
-            pedigree=pedigree, families=np.array(["F1"]), full_fam_ids=full_fam_ids)
-
-        assert list(child_pos) == [0, 1, 2]
-        assert list(imputed_rows) == [0, 0, 0]
-        assert parent_pos.tolist() == [[3, 4]] * 3
-
-
-    def test__repeated_iid_the_pedigree_never_mentions__resolves_normally(self):
-        # Matching is on IID alone because that is what snipar records, so a repeated IID is
-        # ambiguous.  But two unrelated samples sharing one under different FIDs have nothing to
-        # do with the families snipar imputed for, and stopping the run over them would reject
-        # a file that is perfectly usable.
-        full_fam_ids = self.fam([("F1", "KID1"), ("F1", "DAD1"), ("F1", "MUM1"),
-                                 ("F8", "SHARED"), ("F9", "SHARED")])
-        pedigree = self.pedigree([("F1", "KID1", "DAD1", "MUM1")])
-
-        child_pos, parent_pos, _ = sut.map_samples_to_imputed_families(
-            pedigree=pedigree, families=np.array(["F1"]), full_fam_ids=full_fam_ids)
-
-        assert list(child_pos) == [0]
-        assert parent_pos.tolist() == [[1, 2]]
-
-
-    @pytest.mark.parametrize("records", [
-        pytest.param([("F1", "SHARED", "DAD1", "MUM1")], id="as_a_child"),
-        pytest.param([("F1", "KID1", "SHARED", "MUM1")], id="as_a_father"),
-        pytest.param([("F1", "KID1", "DAD1", "SHARED")], id="as_a_mother"),
-    ])
-    def test__repeated_iid_the_pedigree_refers_to__raises(self, records):
-        # Here it genuinely cannot be resolved: two samples answer to the name, and nothing
-        # distinguishes them.  Silently picking one would attach somebody else's genotypes.
-        full_fam_ids = self.fam([("F1", "KID1"), ("F1", "DAD1"), ("F1", "MUM1"),
-                                 ("F8", "SHARED"), ("F9", "SHARED")])
-
-        with pytest.raises(ValueError) as error:
-            sut.map_samples_to_imputed_families(
-                pedigree=self.pedigree(records), families=np.array(["F1"]),
-                full_fam_ids=full_fam_ids)
-
-        assert "SHARED" in str(error.value)
-        assert "IID alone" in str(error.value)
-
-
-    def test__returned_shapes__one_entry_per_pedigree_record(self):
-        # Sized by the PEDIGREE rather than by the fam file or the family list, all three of which
-        # differ here so that a confusion between them cannot pass
-        full_fam_ids = self.fam([("F1", "KID1"), ("F1", "DAD1"), ("F1", "MUM1"),
-                                 ("F2", "KID2"), ("F2", "DAD2")])
-        pedigree = self.pedigree([("F1", "KID1", "DAD1", "MUM1"),
-                                  ("F2", "KID2", "DAD2", "MUM2")])
-
-        child_pos, parent_pos, imputed_rows = sut.map_samples_to_imputed_families(
-            pedigree=pedigree, families=np.array(["F1", "F2", "F3"]), full_fam_ids=full_fam_ids)
-
-        assert child_pos.shape == (len(pedigree),)
-        assert parent_pos.shape == (len(pedigree), 2)
-        assert imputed_rows.shape == (len(pedigree),)
-
-
-
-class TestMapKingToFamPositions:
-    """KING pairs as positions in the WHOLE fam file, for parental processing (notes §13.1)"""
-
-    @staticmethod
-    def king(rows):
-        return pd.DataFrame(rows, columns=[sut.KING_FID1_COL, sut.KING_IID1_COL, sut.KING_FID2_COL,
-                                           sut.KING_IID2_COL, sut.KING_KINSHIP_COL, sut.KING_REL_COL])
-
-    def test__pairs__positions_in_the_whole_fam_file(self):
-        fam = pd.DataFrame({bbf.FAM_FID_COL : ["F", "F", "F", "F"],
-                            bbf.FAM_IID_COL : ["x", "dad", "mum", "kid"]})
-        king = self.king([["F", "dad", "F", "kid", 0.25, sut.INF_PARENT_OFFSPRING],
-                          ["F", "mum", "F", "kid", 0.25, sut.INF_PARENT_OFFSPRING]])
-
-        actual = sut.map_king_to_fam_positions(king_df=king, fam_ids=fam)
-
-        assert actual[[sut.FAM_INDEX_1, sut.FAM_INDEX_2]].values.tolist() == [[1, 3], [2, 3]]
-        assert actual[sut.KING_REL_COL].tolist() == [sut.DEG_PARENT_OFFSPRING] * 2
-
-    def test__pair_with_someone_not_in_the_fam_file__dropped(self):
-        fam = pd.DataFrame({bbf.FAM_FID_COL : ["F", "F"], bbf.FAM_IID_COL : ["dad", "kid"]})
-        king = self.king([["F", "dad", "F", "kid", 0.25, sut.INF_PARENT_OFFSPRING],
-                          ["F", "elsewhere", "F", "kid", 0.25, sut.INF_FULLSIB]])
-
-        actual = sut.map_king_to_fam_positions(king_df=king, fam_ids=fam)
-
-        assert actual[[sut.FAM_INDEX_1, sut.FAM_INDEX_2]].values.tolist() == [[0, 1]]
-
-    def test__pair_beyond_se_relatedness__dropped(self):
-        fam = pd.DataFrame({bbf.FAM_FID_COL : ["F", "F"], bbf.FAM_IID_COL : ["a", "b"]})
-        king = self.king([["F", "a", "F", "b", 0.0, sut.INF_4TH]])
-
-        assert len(sut.map_king_to_fam_positions(king_df=king, fam_ids=fam)) == 0
-
-    def test__numeric_ids_in_king_and_text_ids_in_the_fam_file__still_matched(self):
-        # The fam file is read as text, while pandas infers KING's ID columns as integers
-        fam = pd.DataFrame({bbf.FAM_FID_COL : ["1", "1"], bbf.FAM_IID_COL : ["10", "12"]})
-        king = self.king([[1, 10, 1, 12, 0.25, sut.INF_PARENT_OFFSPRING]])
-
-        actual = sut.map_king_to_fam_positions(king_df=king, fam_ids=fam)
-
-        assert actual[[sut.FAM_INDEX_1, sut.FAM_INDEX_2]].values.tolist() == [[0, 1]]
-
-
-class TestToAnalysisPositions:
-    """Whole-fam-file positions translated into the analysis sample's, for R (notes §13.1)"""
-
-    FULL = pd.DataFrame({bbf.FAM_FID_COL : ["F"] * 5, bbf.FAM_IID_COL : ["x", "a", "b", "c", "d"]})
-
-    def test__samples_filtered_out_before__positions_shift_down(self):
-        analysis = self.FULL.iloc[[1, 3, 4]].reset_index(drop=True)  # x and b filtered out
-
-        actual = sut.to_analysis_positions(fam_positions=np.array([3, 4, 1]),
-                                           full_fam_df=self.FULL, fam_df=analysis)
-
-        assert actual.tolist() == [1, 2, 0]
-
-    def test__no_filtering__unchanged(self):
-        actual = sut.to_analysis_positions(fam_positions=np.array([0, 2, 4]),
-                                           full_fam_df=self.FULL, fam_df=self.FULL)
-
-        assert actual.tolist() == [0, 2, 4]
-
-    def test__nothing_to_translate__empty(self):
-        actual = sut.to_analysis_positions(fam_positions=np.array([], dtype=int),
-                                           full_fam_df=self.FULL, fam_df=self.FULL)
-
-        assert actual.size == 0
-
-    def test__a_sample_not_in_the_analysis__raises(self):
-        analysis = self.FULL.iloc[[1, 2]].reset_index(drop=True)
-
-        with pytest.raises(ValueError, match="not in the analysis sample"):
-            sut.to_analysis_positions(fam_positions=np.array([1, 3]), full_fam_df=self.FULL,
-                                      fam_df=analysis)
-
-
-class TestDetermineFamFileTrios:
-
-    # Fam file trio mode.  The ORIGINAL fam file is read rather than the filtered frame, because
-    # the parental ID columns do not survive process_phenotypes() and because a parent dropped for
-    # a missing phenotype still has usable genotypes.  An individual must be in the analysis
-    # sample to be affected; their parents need not be.
-
-    @staticmethod
-    def fam(rows):
-        """Builds an unfiltered fam frame from (fid, iid, father, mother) tuples"""
-
-        return pd.DataFrame({bbf.FAM_FID_COL : [row[0] for row in rows],
-                             bbf.FAM_IID_COL : [row[1] for row in rows],
-                             bbf.FAM_IIDF_COL : [row[2] for row in rows],
-                             bbf.FAM_IIDM_COL : [row[3] for row in rows],
-                             bbf.FAM_SEX_COL : [sut.FAM_UNKNOWN_SEX] * len(rows),
-                             bbf.FAM_PHENO_COL : [1.0] * len(rows)})
-
-    @staticmethod
-    def analysis_sample(full_fam, positions=None):
-        """The filtered frame process_phenotypes() returns, holding the given rows"""
-
-        positions = positions if positions is not None else range(len(full_fam))
-
-        return full_fam.iloc[list(positions)][[bbf.FAM_FID_COL, bbf.FAM_IID_COL]]
-
-    @staticmethod
-    def king(pairs):
-        """KING data confirming each (child position, parent position) pair as parent-offspring"""
-
-        return pd.DataFrame({sut.FAM_INDEX_1 : [pair[0] for pair in pairs],
-                             sut.FAM_INDEX_2 : [pair[1] for pair in pairs],
-                             sut.KING_REL_COL : [sut.DEG_PARENT_OFFSPRING] * len(pairs)})
-
-
-    def test__a_full_trio__affected_with_both_parent_positions(self, caplog):
-        # Rows 0 and 1 are the parents, row 2 the child.  Nothing is imputed, so the three imputed
-        # fields come back as None -- which is what tells everything downstream it is in fam file
-        # trio mode rather than imputed parent mode.
-        full_fam = self.fam([("F1", "DAD", "0", "0"),
-                             ("F1", "MUM", "0", "0"),
-                             ("F1", "KID", "DAD", "MUM")])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.determine_fam_file_trios(
-                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam),
-                rel_df=self.king([(2, 0), (2, 1)]))
-
-        assert list(actual.affected_samples) == [2]
-        assert actual.observed_parent_cols.tolist() == [[0, 1]]
-        assert actual.imputed_rows is None
-        assert actual.imputed_file is None
-        assert actual.snipar_metadata is None
-
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "1 individual(s) list both parents" in logged
-        assert "0 not usable as trios" in logged
-        assert "1 full trio(s) validated against KING" in logged
-
-
-    def test__nobody_lists_both_parents__nothing_affected(self, caplog):
-        # The ordinary case for a cohort with no pedigree in its fam file.  The early return fires
-        # before any validation runs, so a file with no parental columns filled in costs nothing.
-        full_fam = self.fam([("F1", "A", "0", "0"), ("F1", "B", "0", "0")])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.determine_fam_file_trios(
-                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
-
-        assert len(actual.affected_samples) == 0
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "0 individual(s) list both parents" in logged
-
-
-    def test__only_one_parent_listed__never_a_candidate(self, caplog):
-        # Half a trio is not a trio.  Residualizing against one parent needs the transmitted
-        # allele of the other, which only an imputed parental genotype file supplies -- so in this
-        # mode the individual simply falls back to ordinary within-group residualization.
-        full_fam = self.fam([("F1", "DAD", "0", "0"),
-                             ("F1", "KID", "DAD", "0")])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.determine_fam_file_trios(
-                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam),
-                rel_df=self.king([(1, 0)]))
-
-        assert len(actual.affected_samples) == 0
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "0 individual(s) list both parents" in logged
-
-
-    def test__a_listed_parent_is_not_in_the_fam_file__not_a_trio(self, caplog):
-        # The father is named but was never genotyped, so there is nothing to difference against.
-        # This is reported separately from the candidates count, since the two mean different
-        # things to somebody wondering where their trios went.
-        full_fam = self.fam([("F1", "MUM", "0", "0"),
-                             ("F1", "KID", "ABSENT_DAD", "MUM")])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.determine_fam_file_trios(
-                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam),
-                rel_df=self.king([(1, 0)]))
-
-        assert len(actual.affected_samples) == 0
-
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "1 individual(s) list both parents" in logged
-        assert "1 not usable as trios" in logged
-        assert "0 full trio(s) validated against KING" in logged
-
-
-    def test__child_not_in_the_analysis_sample__not_affected(self, caplog):
-        # The child was dropped for a missing phenotype, so they contribute to no result and
-        # there is nothing to residualize.  Their parents being present changes nothing.
-        full_fam = self.fam([("F1", "DAD", "0", "0"),
-                             ("F1", "MUM", "0", "0"),
-                             ("F1", "KID", "DAD", "MUM")])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.determine_fam_file_trios(
-                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam, positions=[0, 1]),
-                rel_df=self.king([(2, 0), (2, 1)]))
-
-        assert len(actual.affected_samples) == 0
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "0 full trio(s) validated against KING" in logged
-
-
-    def test__a_parent_not_in_the_analysis_sample__still_used(self, caplog):
-        # The reason the unfiltered fam file is read at all.  The father was dropped for a missing
-        # phenotype, but his genotypes are in the bed file and are exactly what the child needs.
-        full_fam = self.fam([("F1", "DAD", "0", "0"),
-                             ("F1", "MUM", "0", "0"),
-                             ("F1", "KID", "DAD", "MUM")])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.determine_fam_file_trios(
-                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam, positions=[1, 2]),
-                rel_df=self.king([(2, 0), (2, 1)]))
-
-        assert list(actual.affected_samples) == [2]
-        assert actual.observed_parent_cols.tolist() == [[0, 1]]
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "1 full trio(s) validated against KING" in logged
-
-
-    def test__parental_ids_are_within_family__resolved_against_the_row_s_own_fid(self, caplog):
-        # PLINK's parental columns hold IIDs that are unique within a family rather than across
-        # the file, so the key is (this row's FID, the parental ID).  Two families reusing the
-        # same parental IDs is ordinary, and each child must resolve to its OWN parents.
-        full_fam = self.fam([("F1", "DAD", "0", "0"), ("F1", "MUM", "0", "0"),
-                             ("F2", "DAD", "0", "0"), ("F2", "MUM", "0", "0"),
-                             ("F1", "KID", "DAD", "MUM"), ("F2", "KID", "DAD", "MUM")])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.determine_fam_file_trios(
-                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam),
-                rel_df=self.king([(4, 0), (4, 1), (5, 2), (5, 3)]))
-
-        assert list(actual.affected_samples) == [4, 5]
-        assert actual.observed_parent_cols.tolist() == [[0, 1], [2, 3]]
-
-
-    def test__trios_mixed_with_non_trios__only_the_usable_ones_returned(self, caplog):
-        # Two candidates, of which one has an ungenotyped parent.  What comes back has to be the
-        # usable one, in its own position -- not the first candidate, and not both.
-        full_fam = self.fam([("F1", "DAD", "0", "0"), ("F1", "MUM", "0", "0"),
-                             ("F1", "KID_BAD", "GHOST", "MUM"),
-                             ("F1", "KID_OK", "DAD", "MUM")])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.determine_fam_file_trios(
-                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam),
-                rel_df=self.king([(3, 0), (3, 1), (2, 1)]))
-
-        assert list(actual.affected_samples) == [3]
-        assert actual.observed_parent_cols.tolist() == [[0, 1]]
-
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "2 individual(s) list both parents" in logged
-        assert "1 not usable as trios" in logged
-        assert "1 full trio(s) validated against KING" in logged
-
-
-    def test__king_contradicts_a_stated_parent__raises(self):
-        # The validator is wired in here and given the usable mask, so a contradiction about
-        # somebody who will actually be used stops the run
-        full_fam = self.fam([("F1", "DAD", "0", "0"),
-                             ("F1", "MUM", "0", "0"),
-                             ("F1", "KID", "DAD", "MUM")])
-
-        with pytest.raises(ValueError) as error:
-            sut.determine_fam_file_trios(full_fam_df=full_fam,
-                                         fam_df=self.analysis_sample(full_fam),
-                                         rel_df=self.king([(2, 0)]))
-
-        assert "KID (mother)" in str(error.value)
-
-
-    def test__numeric_ids__not_mistaken_for_numbers(self, caplog):
-        # A fam file whose IDs happen to be purely numeric is read as int64 unless something stops
-        # it, and then 0 == "0" is False, so every row looks as though it lists both parents.
-        # Passing a frame straight in skips the read entirely, which is why the conversion cannot
-        # live only in the read parameters.
-        full_fam = pd.DataFrame({bbf.FAM_FID_COL : [1, 1, 1],
-                                 bbf.FAM_IID_COL : [10, 11, 12],
-                                 bbf.FAM_IIDF_COL : [0, 0, 10],
-                                 bbf.FAM_IIDM_COL : [0, 0, 11],
-                                 bbf.FAM_SEX_COL : [0, 0, 0],
-                                 bbf.FAM_PHENO_COL : [1.0, 1.0, 1.0]})
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.determine_fam_file_trios(
-                full_fam_df=full_fam, fam_df=self.analysis_sample(full_fam),
-                rel_df=self.king([(2, 0), (2, 1)]))
-
-        assert list(actual.affected_samples) == [2]
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "1 individual(s) list both parents" in logged
-
-
-    def test__read_from_an_actual_fam_file__same_as_from_a_frame(self, tmp_path, caplog):
-        # process_relatedness() reads the fam file once, with every column as text, and hands the
-        # frame on.  Everything else here builds that frame directly; this one reads it from an
-        # actual file exactly as process_relatedness() does, so purely numeric IDs arrive as text
-        # and must still be matched.
-        path = str(tmp_path / "trio.fam")
-        bbf.write_fam_file(fam_filename=path,
-                           fid=np.array(["1", "1", "1"]),
-                           iid=np.array(["10", "11", "12"]),
-                           iidf=np.array(["0", "0", "10"]),
-                           iidm=np.array(["0", "0", "11"]),
-                           sex=np.array(["0", "0", "0"]),
-                           pheno=np.array([1.0, 1.0, 1.0]))
-
-        from_file, _ = sut.get_df(path, "fam_file", {"names" : bbf.FAM_COLS, "dtype" : str})
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.determine_fam_file_trios(
-                full_fam_df=from_file, fam_df=self.analysis_sample(from_file),
-                rel_df=self.king([(2, 0), (2, 1)]))
-
-        assert list(actual.affected_samples) == [2]
-        assert actual.observed_parent_cols.tolist() == [[0, 1]]
-
-
-class TestProcessImputedParents:
-
-    # Imputed parent mode.  The relationships come from snipar's own pedigree rather than from the
-    # fam file's parental columns, which are not consulted at all here.
-    #
-    # Three populations appear in the file, and the third is easy to miss: the obvious reading of
-    # "absent from families" is that both parents were genotyped and there was nothing to impute,
-    # which holds for some families but not all -- snipar also leaves out the families it could
-    # not impute for.
-
-    NUM_SNPS = 2
-
-    @classmethod
-    def imputed_file(cls, tmp_path, full_fam, pedigree_records, families):
-        """Writes an imputed parental genotype file holding the given pedigree and families
-
-        Only the pedigree and the family list matter here; the per-SNP arrays are filler, since
-        nothing this function does reads them.
-
-        A record of (FID, IID, father, mother) gets has_father / has_mother flags consistent with
-        full_fam -- "True" exactly where that parent is in it -- as snipar would have written them
-        had it run on the same fileset.  A record of six fields keeps the flags it gives, which is
-        how the tests below describe a file from a DIFFERENT fileset (notes §13.4).
-        """
-
-        genotyped = set(full_fam[bbf.FAM_IID_COL].astype(str))
-
-        def with_flags(record):
-            if len(record) == 6:
-                return list(record)
-            return [*record, str(record[2] in genotyped), str(record[3] in genotyped)]
-
-        path = str(tmp_path / "chr_1.hdf5")
-        num_families = len(families)
-
-        snipar_hdf5.write_snipar_file(
-            imputed_filename=path,
-            imputed_gts=np.zeros((num_families, cls.NUM_SNPS)),
-            num_obs_par_alleles=np.full((num_families, cls.NUM_SNPS), 4.0),
-            standard_f=np.full(cls.NUM_SNPS, 0.25),
-            parental_status=np.zeros((num_families, 3), dtype=bool),
-            pedigree=np.array([with_flags(record) for record in pedigree_records]),
-            families=np.array(families),
-            bim_values=np.array([["1", f"rs{snp}", "0", str(snp * 100), "A", "G"]
-                                 for snp in range(cls.NUM_SNPS)]))
-
-        return path
-
-    @staticmethod
-    def fam(rows):
-        """Builds an unfiltered fam frame from (fid, iid) pairs, with no parental IDs at all"""
-
-        return pd.DataFrame({bbf.FAM_FID_COL : [row[0] for row in rows],
-                             bbf.FAM_IID_COL : [row[1] for row in rows],
-                             bbf.FAM_IIDF_COL : [sut.FAM_MISSING_PARENT] * len(rows),
-                             bbf.FAM_IIDM_COL : [sut.FAM_MISSING_PARENT] * len(rows),
-                             bbf.FAM_SEX_COL : [sut.FAM_UNKNOWN_SEX] * len(rows),
-                             bbf.FAM_PHENO_COL : [1.0] * len(rows)})
-
-    @staticmethod
-    def analysis_sample(full_fam, positions=None):
-        positions = positions if positions is not None else range(len(full_fam))
-
-        return full_fam.iloc[list(positions)][[bbf.FAM_FID_COL, bbf.FAM_IID_COL]]
-
-    @staticmethod
-    def king(pairs):
-        return pd.DataFrame({sut.FAM_INDEX_1 : [pair[0] for pair in pairs],
-                             sut.FAM_INDEX_2 : [pair[1] for pair in pairs],
-                             sut.KING_REL_COL : [sut.DEG_PARENT_OFFSPRING] * len(pairs)})
-
-
-    def test__family_with_an_imputed_row__usable_with_any_genotyped_parent(self, tmp_path,
-                                                                           caplog):
-        # The first population.  The mother was genotyped and the father was not, so snipar
-        # imputed the father and GRMA will use both: the mother from the bed file, the father
-        # from the imputed row.
-        full_fam = self.fam([("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "GHOST_DAD", "MUM")], ["F1"])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam), rel_df=self.king([(1, 0)]))
-
-        assert list(actual.affected_samples) == [1]
-        assert actual.observed_parent_cols.tolist() == [[-1, 0]]
-        assert list(actual.imputed_rows) == [0]
-        assert actual.imputed_file == path
-
-
-    def test__no_imputed_row_but_both_parents_genotyped__usable_from_the_bed_file(self, tmp_path,
-                                                                                  caplog):
-        # The second population.  Nothing needed imputing, so snipar wrote no row for this family
-        # -- but both parents are in the bed file, which is all the differencing needs.
-        full_fam = self.fam([("F1", "DAD"), ("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "DAD", "MUM")], ["F_OTHER"])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam), rel_df=self.king([(2, 0), (2, 1)]))
-
-        assert list(actual.affected_samples) == [2]
-        assert actual.observed_parent_cols.tolist() == [[0, 1]]
-        assert list(actual.imputed_rows) == [-1]
-
-
-    def test__no_imputed_row_and_no_genotyped_parent__not_usable(self, tmp_path, caplog):
-        # The third population, and the one worth stating outright: a family can be missing from
-        # the families list because snipar could not impute for it, not because it had no need.
-        # There is then nothing to difference against, and ordinary within-group residualization
-        # applies instead.
-        full_fam = self.fam([("F1", "KID")])
-        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "GHOST_DAD", "GHOST_MUM")],
-                                 ["F_OTHER"])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
-
-        assert len(actual.affected_samples) == 0
-
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "1 pedigree record(s)" in logged
-        assert "1 not usable (no imputed row and no genotyped parent)" in logged
-        assert "0 individual(s) to residualize" in logged
-
-
-    def test__fam_file_parental_columns__not_consulted(self, tmp_path, caplog):
-        # The relationships come from snipar's pedigree.  Here the fam file names the WRONG
-        # parents, and the result is the same as if it named none -- which is what the fixtures
-        # elsewhere in this class rely on.
-        full_fam = self.fam([("F1", "DAD"), ("F1", "MUM"), ("F1", "KID"), ("F1", "STRANGER")])
-        full_fam.loc[2, bbf.FAM_IIDF_COL] = "STRANGER"
-        full_fam.loc[2, bbf.FAM_IIDM_COL] = "STRANGER"
-
-        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "DAD", "MUM")], ["F_OTHER"])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam), rel_df=self.king([(2, 0), (2, 1)]))
-
-        assert actual.observed_parent_cols.tolist() == [[0, 1]]
-
-
-    def test__child_not_in_the_fam_file__not_usable(self, tmp_path, caplog):
-        # snipar's pedigree covers everyone it saw, which can exceed the bfile being analysed now
-        full_fam = self.fam([("F1", "DAD"), ("F1", "MUM")])
-        path = self.imputed_file(tmp_path, full_fam, [("F1", "ABSENT_KID", "DAD", "MUM")], ["F1"])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
-
-        assert len(actual.affected_samples) == 0
-
-
-    def test__child_not_in_the_analysis_sample__not_usable(self, tmp_path, caplog):
-        # Dropped for a missing phenotype, so they contribute to no result
-        full_fam = self.fam([("F1", "DAD"), ("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "DAD", "MUM")], ["F1"])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam, positions=[0, 1]),
-                rel_df=self.king([(2, 0), (2, 1)]))
-
-        assert len(actual.affected_samples) == 0
-
-
-    def test__a_genotyped_parent_outside_the_analysis_sample__still_used(self, tmp_path, caplog):
-        # The father was dropped for a missing phenotype, but his genotypes are in the bed file
-        # and are what the child is differenced against
-        full_fam = self.fam([("F1", "DAD"), ("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "DAD", "MUM")], ["F_OTHER"])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam, positions=[1, 2]),
-                rel_df=self.king([(2, 0), (2, 1)]))
-
-        assert list(actual.affected_samples) == [2]
-        assert actual.observed_parent_cols.tolist() == [[0, 1]]
-
-
-    def test__siblings__share_an_imputed_row(self, tmp_path, caplog):
-        # snipar imputes the parents FROM the sibship, so one row serves all of them
-        full_fam = self.fam([("F1", "KID_A"), ("F1", "KID_B")])
-        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID_A", "GHOST_DAD", "GHOST_MUM"),
-                                            ("F1", "KID_B", "GHOST_DAD", "GHOST_MUM")], ["F1"])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
-
-        assert list(actual.affected_samples) == [0, 1]
-        assert list(actual.imputed_rows) == [0, 0]
-        assert actual.observed_parent_cols.tolist() == [[-1, -1], [-1, -1]]
-
-
-    def test__king_contradicts_the_pedigree__raises_naming_the_imputed_file(self, tmp_path):
-        # The same validator the fam file branch uses, but told where the claim came from.  A
-        # message blaming the fam file here would send the user to a file that says nothing about
-        # these relationships at all.
-        full_fam = self.fam([("F1", "DAD"), ("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "DAD", "MUM")], ["F_OTHER"])
-
-        with pytest.raises(ValueError) as error:
-            sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam), rel_df=self.king([(2, 0)]))
-
-        assert str(error.value).startswith("the imputed parental genotype file's pedigree")
-        assert "KID (mother)" in str(error.value)
-
-
-    # snipar's pedigree records which parents IT had genotypes for, and its imputed row depends on
-    # that.  When GRMA's fam file disagrees, snipar was run on a different fileset, and every such
-    # disagreement must stop the run rather than quietly mis-weight the parental mean (notes §13.4).
-    # Each case below is one way the two can disagree.  KING is left empty: the check comes first.
-
-    @pytest.mark.parametrize("fam_iids, record, families, what_goes_wrong", [
-        (["DAD", "KID"], ("F1", "KID", "DAD", "MUM", "False", "False"), ["F1"],
-         "row is both parents' average; adding the genotyped father counts him twice"),
-        (["DAD", "MUM", "KID"], ("F1", "KID", "DAD", "MUM", "False", "False"), ["F1"],
-         "row is both parents' average; adding both genotypes counts both twice"),
-        (["DAD", "MUM", "KID"], ("F1", "KID", "DAD", "MUM", "True", "False"), ["F1"],
-         "row is the mother; adding her genotype counts her twice"),
-        (["KID"], ("F1", "KID", "DAD", "MUM", "True", "False"), ["F1"],
-         "row is the mother only, but would be read as an average and doubled"),
-        (["DAD", "KID"], ("F1", "KID", "DAD", "MUM", "True", "True"), ["F_OTHER"],
-         "no row, so the missing mother would count as zero"),
-        (["KID"], ("F1", "KID", "DAD", "MUM", "True", "True"), ["F_OTHER"],
-         "no row and no parent found, so the child would quietly go unresidualized"),
-    ])
-    def test__snipar_and_the_fam_file_disagree_about_genotyped_parents__raises(
-            self, tmp_path, fam_iids, record, families, what_goes_wrong):
-        full_fam = self.fam([("F1", iid) for iid in fam_iids])
-        path = self.imputed_file(tmp_path, full_fam, [record], families)
-
-        with pytest.raises(ValueError, match="disagree about which parents are genotyped") as error:
-            sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
-
-        assert "KID" in str(error.value), what_goes_wrong
-        assert "Run snipar's impute.py on the same fileset" in str(error.value)
-
-
-    def test__disagreement_for_a_child_outside_the_analysis__not_raised(self, tmp_path, caplog):
-        # Only children who could be residualized are checked: one filtered out of the analysis
-        # is never used, so a disagreement about their parents changes nothing
-        full_fam = self.fam([("F1", "DAD"), ("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, full_fam,
-                                 [("F1", "KID", "DAD", "MUM", "False", "False")], ["F1"])
-
-        sources = sut.process_imputed_parents(
-            imputed_parental_file=path, full_fam_df=full_fam,
-            fam_df=self.analysis_sample(full_fam, positions=[0, 1]), rel_df=self.king([]))
-
-        assert len(sources.affected_samples) == 0
-
-
-    def test__nobody_usable__empty_sources(self, tmp_path, caplog):
-        # Every pedigree record describes somebody outside the analysis, so there is nothing to do
-        full_fam = self.fam([("F1", "SOMEONE_ELSE")])
-        path = self.imputed_file(tmp_path, full_fam, [("F1", "ABSENT_KID", "DAD", "MUM")], ["F1"])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam), rel_df=self.king([]))
-
-        assert len(actual.affected_samples) == 0
-        assert actual.observed_parent_cols.shape == (0, 2)
-
-
-    def test__metadata__returned_whole_for_the_steps_that_follow(self, tmp_path, caplog):
-        # The SNP alignment reads bim_values and bim_columns from this, and the chunk cache reads
-        # standard_f, so what comes back has to be the whole thing rather than the parts used here
-        full_fam = self.fam([("F1", "MUM"), ("F1", "KID")])
-        path = self.imputed_file(tmp_path, full_fam, [("F1", "KID", "GHOST_DAD", "MUM")], ["F1"])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam), rel_df=self.king([(1, 0)]))
-
-        for key in (snipar_hdf5.SNIPAR_PEDIGREE_KEY, snipar_hdf5.SNIPAR_FAMILIES_KEY,
-                    snipar_hdf5.SNIPAR_BIM_VALUES_KEY, snipar_hdf5.SNIPAR_BIM_COLUMNS_KEY,
-                    snipar_hdf5.SNIPAR_STANDARD_F_KEY, snipar_hdf5.SNIPAR_PARENTAL_STATUS_KEY):
-            assert key in actual.snipar_metadata
-
-        assert len(actual.snipar_metadata[snipar_hdf5.SNIPAR_STANDARD_F_KEY]) == self.NUM_SNPS
-
-    def test__usable_mixed_with_unusable__only_the_usable_ones_returned(self, tmp_path, caplog):
-        # Two pedigree records, of which only the second has anything to be residualized against.
-        # What comes back has to be the second one, in its own position -- not the first, and not
-        # both.  Without a case mixing them, a result that ignored the usable mask entirely would
-        # look right: every other case here has everybody usable or nobody, and nobody returns
-        # early before the mask is applied.
-        full_fam = self.fam([("F1", "LONE_KID"), ("F2", "DAD"), ("F2", "MUM"), ("F2", "KID")])
-        path = self.imputed_file(
-            tmp_path, full_fam,
-            [("F1", "LONE_KID", "GHOST_DAD", "GHOST_MUM"), ("F2", "KID", "DAD", "MUM")],
-            ["F_OTHER"])
-
-        with caplog.at_level(logging.INFO):
-            actual = sut.process_imputed_parents(
-                imputed_parental_file=path, full_fam_df=full_fam,
-                fam_df=self.analysis_sample(full_fam), rel_df=self.king([(3, 1), (3, 2)]))
-
-        assert list(actual.affected_samples) == [3]
-        assert actual.observed_parent_cols.tolist() == [[1, 2]]
-        assert list(actual.imputed_rows) == [-1]
-
-        logged = "\n".join(record.message for record in caplog.records)
-        assert "2 pedigree record(s)" in logged
-        assert "1 not usable (no imputed row and no genotyped parent)" in logged
-        assert "1 individual(s) to residualize" in logged
-
-
-class TestCalculateR:
-
-    # Each sample's row centers them within their CLOSEST relatedness group: the minimum degree
-    # they appear at, and every relative at that degree.  Multiplying by R subtracts that group's
-    # mean, which is what removes the family-level confounding GRMA exists to remove.
-    #
-    # Samples residualized against their parents instead get an identity row, since centering them
-    # a second time would subtract the family effect twice.
-
-    @staticmethod
-    def relatedness(pairs, degrees=None):
-        """Builds a relatedness frame from (index1, index2) pairs, full siblings by default"""
-
-        degrees = degrees if degrees is not None else [sut.DEG_FULLSIB] * len(pairs)
-
-        return pd.DataFrame({sut.FAM_INDEX_1 : [pair[0] for pair in pairs],
-                             sut.FAM_INDEX_2 : [pair[1] for pair in pairs],
-                             sut.KING_REL_COL : degrees})
-
-
-    def test__a_pair_of_siblings__each_centered_against_the_other(self):
-        actual = sut.calculate_R(self.relatedness([(0, 1)]), N=2).toarray()
-
-        assert np.allclose(actual, [[0.5, -0.5],
-                                    [-0.5, 0.5]])
-
-
-    def test__three_siblings__each_centered_against_the_other_two(self):
-        # The weight is 1/k for each of the k relatives at the minimum degree, so a larger sibship
-        # spreads the subtraction further rather than subtracting more
-        actual = sut.calculate_R(self.relatedness([(0, 1), (0, 2), (1, 2)]), N=3).toarray()
-
-        third = 1.0 / 3.0
-        assert np.allclose(actual, [[2 * third, -third, -third],
-                                    [-third, 2 * third, -third],
-                                    [-third, -third, 2 * third]])
-
-
-    def test__sample_with_no_relatives__contributes_nothing(self):
-        # A ZERO row, not an identity one.  Without a relative there is no within-family contrast
-        # to take, so the sample carries no information and is weighted out entirely.
-        actual = sut.calculate_R(self.relatedness([(0, 1)]), N=3).toarray()
-
-        assert np.allclose(actual[2], [0.0, 0.0, 0.0])
-
-
-    def test__no_related_pairs_at_all__everything_zero(self):
-        actual = sut.calculate_R(self.relatedness([]), N=3).toarray()
-
-        assert actual.shape == (3, 3)
-        assert np.allclose(actual, 0.0)
-
-
-    def test__closest_relatives_only__more_distant_ones_ignored(self):
-        # Sample 0 has a sibling and a third-degree relative.  Only the sibling counts: centering
-        # against a distant relative as well would mix in exactly the population structure the
-        # within-family contrast is meant to avoid.
-        actual = sut.calculate_R(
-            self.relatedness([(0, 1), (0, 2)], [sut.DEG_FULLSIB, sut.DEG_3RD]), N=3).toarray()
-
-        assert np.allclose(actual[0], [0.5, -0.5, 0.0])
-
-
-    def test__closest_relative_differs_between_two_samples__R_is_not_symmetric(self):
-        # A and B are third-degree relatives; B and C are second-degree; A and C are unrelated.
-        # So A's closest relative is B, while B's is C -- and B does not appear in its own
-        # closest group from A's point of view or the reverse.
-        #
-        # R is therefore NOT symmetric in general, which matters wherever it is multiplied: the
-        # covariance of the residualized phenotypes is R omega R', and R' omega R is a different
-        # matrix.
-        actual = sut.calculate_R(
-            self.relatedness([(0, 1), (1, 2)], [sut.DEG_3RD, sut.DEG_2ND]), N=3).toarray()
-
-        assert np.allclose(actual[0], [0.5, -0.5, 0.0])
-        assert np.allclose(actual[1], [0.0, 0.5, -0.5])
-        assert not np.allclose(actual, actual.T)
-
-
-    def test__two_relatives_tied_at_the_closest_degree__both_counted(self):
-        # Sample 0 has two second-degree relatives and one third-degree.  Both of the former
-        # count; the latter does not.
-        #
-        # The group being centered against INCLUDES the sample itself, so two relatives give
-        # thirds rather than halves -- the same arithmetic as a sibship of three.
-        actual = sut.calculate_R(
-            self.relatedness([(0, 1), (0, 2), (0, 3)],
-                             [sut.DEG_2ND, sut.DEG_2ND, sut.DEG_3RD]), N=4).toarray()
-
-        third = 1.0 / 3.0
-        assert np.allclose(actual[0], [2 * third, -third, -third, 0.0])
-
-
-    def test__rows_of_samples_with_relatives__sum_to_zero(self):
-        # What centering means: the row takes a difference, so a constant added to everybody's
-        # genotypes passes through it unchanged
-        actual = sut.calculate_R(self.relatedness([(0, 1), (0, 2), (1, 2), (3, 4)]),
-                                 N=5).toarray()
-
-        assert np.allclose(actual[:4].sum(axis=1), 0.0)
-
-
-    @pytest.mark.parametrize("pairs", [
-        pytest.param([(0, 1), (1, 2)], id="as_listed"),
-        pytest.param([(1, 0), (2, 1)], id="both_reversed"),
-        pytest.param([(1, 0), (1, 2)], id="one_reversed"),
-    ])
-    def test__pairs_listed_in_either_direction__same_result(self, pairs):
-        # KING writes each pair once, in whichever order it happened to consider them
-        expected = sut.calculate_R(self.relatedness([(0, 1), (1, 2)]), N=3).toarray()
-
-        assert np.allclose(sut.calculate_R(self.relatedness(pairs), N=3).toarray(), expected)
-
-
-    # A pair listed more than once is removed before calculate_R() is reached, by
-    # deduplicate_relatedness_pairs() in process_relatedness(), so calculate_R() can rely on each
-    # pair once.  The tests are in TestProcessRelatedness (notes §7.4f).
-
-
-    # ---- Samples residualized against their parents ---------------------------------------
-
-    def test__affected_sample__gets_an_identity_row(self):
-        # Their genotypes have already had their parents subtracted, so R passes them through
-        # unchanged rather than centering them a second time
-        actual = sut.calculate_R(self.relatedness([(0, 1)]), N=2,
-                                 affected_samples=np.array([0])).toarray()
-
-        assert np.allclose(actual[0], [1.0, 0.0])
-
-
-    def test__affected_sample_with_relatives__still_an_identity_row(self):
-        # Parental residualization REPLACES the within-group centering rather than supplementing
-        # it: doing both would subtract the family effect twice.  So having siblings changes
-        # nothing for the affected sample itself.
-        actual = sut.calculate_R(self.relatedness([(0, 1), (0, 2), (1, 2)]), N=3,
-                                 affected_samples=np.array([0])).toarray()
-
-        assert np.allclose(actual[0], [1.0, 0.0, 0.0])
-
-
-    def test__relatives_of_an_affected_sample__still_center_against_them(self):
-        # Only the affected sample's own ROW changes.  They remain a COLUMN in everybody else's,
-        # and still count towards those samples' group size -- sample 1 below centers against both
-        # 0 and 2, not only 2.
-        actual = sut.calculate_R(self.relatedness([(0, 1), (0, 2), (1, 2)]), N=3,
-                                 affected_samples=np.array([0])).toarray()
-
-        third = 1.0 / 3.0
-        assert np.allclose(actual[1], [-third, 2 * third, -third])
-        assert np.allclose(actual[2], [-third, -third, 2 * third])
-
-
-    def test__affected_sample_with_no_relatives__identity_rather_than_zero(self):
-        # The contrast that makes parental residualization worth having.  Unaffected, this sample
-        # would get a zero row and contribute nothing at all; affected, it contributes its own
-        # Mendelian residual.  That is how somebody whose parents are genotyped but who has no
-        # siblings in the sample becomes usable.
-        unaffected = sut.calculate_R(self.relatedness([]), N=2).toarray()
-        affected = sut.calculate_R(self.relatedness([]), N=2,
-                                   affected_samples=np.array([0])).toarray()
-
-        assert np.allclose(unaffected[0], [0.0, 0.0])
-        assert np.allclose(affected[0], [1.0, 0.0])
-
-
-    @pytest.mark.parametrize("affected_samples", [
-        pytest.param(None, id="none_given"),
-        pytest.param(np.array([], dtype=np.int64), id="empty_array"),
-    ])
-    def test__nobody_affected__ordinary_centering_throughout(self, affected_samples):
-        expected = sut.calculate_R(self.relatedness([(0, 1)]), N=2).toarray()
-
-        actual = sut.calculate_R(self.relatedness([(0, 1)]), N=2,
-                                 affected_samples=affected_samples).toarray()
-
-        assert np.allclose(actual, expected)
-        assert np.allclose(actual, [[0.5, -0.5], [-0.5, 0.5]])
-
-
-    def test__several_affected_samples__each_gets_its_own_identity_row(self):
-        actual = sut.calculate_R(self.relatedness([(0, 1), (0, 2), (1, 2)]), N=3,
-                                 affected_samples=np.array([0, 2])).toarray()
-
-        assert np.allclose(actual[0], [1.0, 0.0, 0.0])
-        assert np.allclose(actual[2], [0.0, 0.0, 1.0])
-
-        # Sample 1 is unaffected and still centers against both of them
-        third = 1.0 / 3.0
-        assert np.allclose(actual[1], [-third, 2 * third, -third])
-
-
-    def test__every_sample_affected__the_identity_matrix(self):
-        # Nothing is centered at all, since every genotype has already been differenced against
-        # its own parents
-        actual = sut.calculate_R(self.relatedness([(0, 1), (1, 2)]), N=3,
-                                 affected_samples=np.array([0, 1, 2])).toarray()
-
-        assert np.allclose(actual, np.identity(3))
-
-
-    def test__affected_rows__no_division_by_zero(self):
-        # An affected sample contributes no entries to its own row, so that row is empty when the
-        # normalisation runs and its row sum is zero.  Dividing by it unguarded would put
-        # infinities or NaNs into the matrix rather than the intended identity.
-        actual = sut.calculate_R(self.relatedness([(0, 1)]), N=3,
-                                 affected_samples=np.array([0, 2])).toarray()
-
-        assert np.isfinite(actual).all()
-
-
-    def test__returned_matrix__sparse_and_square_over_every_sample(self):
-        # N decides the size, not the relatedness data: samples appearing in no pair at all still
-        # need rows, so that everything indexed by sample lines up
-        actual = sut.calculate_R(self.relatedness([(0, 1)]), N=6)
-
-        assert sp.issparse(actual)
-        assert actual.shape == (6, 6)
-
-
-class TestProcessGenotypes:
-
-    def test__simple_inputs__expected_results(self):
-        pass
-
-    def test__sample_filter__expected_results(self):
-        pass
-
-    def test__snp_filter__expected_results(self):
-        pass
-
-    def test__process_multiple_blocks__expected_results(self):
-        pass
-
-    def test__filter_out_a_whole_block__expected_logging(self):
-        pass
-
-    def test__all_inputs__expected_results(self):
-        pass
-
-
-class TestCalculatePVals:
-
-    @pytest.mark.parametrize("betas, ses, expected_p", [
-        (np.array([1.96, 2.576]), np.array([1.0, 1.0]), np.array([0.05, 0.01])),
-        (np.array([1.0, 1.0]), np.array([1.0/1.96, 1.0/2.576]), np.array([0.05, 0.01])),
-        (np.array([1.96, 2.576]), np.array([-1.0, -1.0]), np.array([0.05, 0.01]))
-    ])
-    def test__precanned_tcs__expected_results(self, betas, ses, expected_p):
-        actual_p = sut.calculate_pvals(betas=betas, ses=ses)
-
-        assert np.allclose(actual_p.astype(float), expected_p, atol=0.00001)
-
-
-    @pytest.mark.parametrize("rng_seed", [54, 87])
-    def test__simple_inputs__expected_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-
-        N = 100
-
-        betas = 2.0 * rng.random(N) - 1.0
-        ses = 2.0 * rng.random(N) + 10.0
-
-        expected_p = 2.0 * (1.0 - stats.norm.cdf(np.abs(betas / ses)))
-
-        actual_p = sut.calculate_pvals(betas=betas, ses=ses)
-
-        assert np.allclose(actual_p.astype(float), expected_p)
-
-
-    @pytest.mark.parametrize("rng_seed", [316, 9999])
-    def test__negative_z__same_results(self, rng_seed):
-        rng = np.random.default_rng(seed=rng_seed)
-
-        N = 100
-
-        betas = 2.0 * rng.random(N) - 1.0
-        ses = 2.0 * rng.random(N) + 10.0
-        mask = rng.choice([True, False], size=N)
-
-        first_p = sut.calculate_pvals(betas=betas, ses=ses)
-
-        betas[mask] = -betas[mask]
-        second_p = sut.calculate_pvals(betas=betas, ses=ses)
-
-        assert np.all(first_p == second_p)
-
-
-    def test__include_very_small_p__expected_results(self):
-        betas = np.array([39.0, -39.0])
-        ses = np.array([1.0, 1.0])
-
-        actual_p = sut.calculate_pvals(betas=betas, ses=ses)
-
-        assert np.all(np.char.find(actual_p, "-332") >= 0)
-
-
-    def test__include_p_equals_1__expected_results(self):
-        betas = np.array([0.0, 0.0, 0.0])
-        ses = np.array([1.0, -1.0, 93478.0])
-
-        actual_p = sut.calculate_pvals(betas=betas, ses=ses)
-
-        assert np.all(actual_p == "1.0e0")
-
-
-class TestCreateOutput:
-
-    def test__simple_inputs__expected_results(self):
-        pass
-
-
-
-# -------------------------
-# Running a case with modified inputs, for the tests below that compare a case's results with those
-# of a modified copy.  The modifications themselves live in the tests.
-
-def _case_inputs(key):
-    """Copies of a case's inputs that a test can modify freely: grma()'s data plus the snipar data"""
-
-    case = tcs.REGISTRY[key]
-    return dict(fam=case["FAM_DF"].copy(), rel=case["REL_DF"].copy(),
-                bim=case["BIM_DF"].copy(), G=case["G"].copy(),
-                pheno=copy.deepcopy(case["PHENO_DF"]), covar=copy.deepcopy(case["COVAR_DF"]),
-                id_list=copy.deepcopy(case["ID_LIST"]), snp_list=copy.deepcopy(case["SNP_LIST"]),
-                snps_per_block=case["SNPS_PER_BLOCK"], imputed=copy.deepcopy(case["IMPUTED_FILE"]))
-
-
-def _run_inputs(inputs, degree, directory, name):
-    """Runs grma() on inputs from _case_inputs(), writing the snipar data to a file if there is any"""
-
-    imputed_file = None
-    if inputs["imputed"] is not None:
-        imputed_file = os.path.join(directory, name + snipar_hdf5.SNIPAR_FILE_SUFFIX)
-        snipar_hdf5.write_snipar_file(imputed_file, **inputs["imputed"])
-
-    kwargs = dict(rel_file=inputs["rel"], bed_file=inputs["G"], bim_file=inputs["bim"],
-                  fam_file=inputs["fam"], rel_degree=degree, pheno_file=inputs["pheno"],
-                  covar_file=inputs["covar"], id_list=inputs["id_list"],
-                  snp_list=inputs["snp_list"], imputed_parental_file=imputed_file)
-    if inputs["snps_per_block"] is not None:
-        kwargs["snps_per_block"] = inputs["snps_per_block"]
-    return sut.grma(**kwargs)
-
-
-def _assert_same_results(original, modified, rsid_map=None, negated_rsids=()):
-    """The two runs agree SNP for SNP, to rounding
-
-    Args:
-        rsid_map: original rsid -> the name it has in the modified run, if SNPs were renamed
-        negated_rsids: SNPs whose beta should have changed sign (reported for the other allele)
-    """
-
-    original_rsids = original[bbf.BIM_RSID_COL].astype(str).tolist()
-    expected_rsids = [rsid_map[r] for r in original_rsids] if rsid_map else original_rsids
-    assert modified[bbf.BIM_RSID_COL].astype(str).tolist() == expected_rsids
-
-    sign = np.array([-1.0 if r in negated_rsids else 1.0 for r in original_rsids])
-    assert np.allclose(modified[sut.OUTPUT_BETA_COL].to_numpy(),
-                       sign * original[sut.OUTPUT_BETA_COL].to_numpy(), atol=1e-10, rtol=0.0)
-    assert np.allclose(modified[sut.OUTPUT_SE_COL].to_numpy(),
-                       original[sut.OUTPUT_SE_COL].to_numpy(), atol=1e-10, rtol=0.0)
-
-
-def _permuted_names(values, prefix, rng):
-    """New names for values, assigned by a random permutation of their sorted order
-
-    The permutation is redrawn until it is not the identity, so the new names never sort in the same
-    order as the old -- anything that depends on IDs being sorted then shows up.
-    """
-
-    values = sorted(set(values))
-    perm = rng.permutation(len(values))
-    while len(values) > 1 and np.array_equal(perm, np.arange(len(values))):
-        perm = rng.permutation(len(values))
-    width = len(str(len(values)))
-    return {v: f"{prefix}{p:0{width}d}" for v, p in zip(values, perm)}
-
-
-def _new_ids(existing, count, prefix):
-    """IDs for added samples, of the same kind as the existing ones so the column keeps its type"""
-
-    if pd.api.types.is_integer_dtype(existing):
-        start = int(existing.max()) + 1
-        return list(range(start, start + count))
-    return [f"{prefix}{n}" for n in range(count)]
-
-
-class TestGRMA:
-
-    @pytest.mark.parametrize("key, degree", tcs.params("add_singletons", default_xfail=tcs.XFAIL_13_6))
-    def test__add_singletons__same_results(self, key, degree, tmp_path):
-        """Unrelated samples are not in the regression, so adding them changes nothing (notes
-        §13.6).  xfailed until §13.6 is fixed: today omega's variance includes them, and with
-        anyone affected so does the phenotype centering mean."""
-
-        original = _run_inputs(_case_inputs(key), degree, tmp_path, "original")
-
-        inputs = _case_inputs(key)
-        fam, num_new = inputs["fam"], 3
-        new_fids = _new_ids(fam[bbf.FAM_FID_COL], num_new, "singleton_fam")
-        new_iids = _new_ids(fam[bbf.FAM_IID_COL], num_new, "singleton")
-        no_parent = 0 if pd.api.types.is_integer_dtype(fam[bbf.FAM_IIDF_COL]) else "0"
-        new_phenos = [1.7, -2.3, 0.4]
-        added = pd.DataFrame({bbf.FAM_FID_COL : new_fids, bbf.FAM_IID_COL : new_iids,
-                              bbf.FAM_IIDF_COL : no_parent, bbf.FAM_IIDM_COL : no_parent,
-                              bbf.FAM_SEX_COL : fam[bbf.FAM_SEX_COL].iloc[0],
-                              bbf.FAM_PHENO_COL : new_phenos}, columns=bbf.FAM_COLS)
-        inputs["fam"] = pd.concat([fam, added], ignore_index=True)
-
-        num_snps = inputs["G"].shape[0]
-        new_genotypes = np.array([[(snp + n) % 3 for n in range(num_new)]
-                                  for snp in range(num_snps)], dtype=float)
-        inputs["G"] = np.hstack([inputs["G"], new_genotypes])
-
-        # Wherever the case filters samples, the singletons must pass the filter to reach the
-        # analysis at all
-        ids = added[[bbf.FAM_FID_COL, bbf.FAM_IID_COL]]
-        if inputs["id_list"] is not None:
-            inputs["id_list"] = pd.concat([inputs["id_list"], ids.set_axis(
-                inputs["id_list"].columns, axis=1)], ignore_index=True)
-        if inputs["pheno"] is not None:
-            rows = ids.copy(); rows[2] = new_phenos
-            inputs["pheno"] = pd.concat([inputs["pheno"], rows.set_axis(
-                inputs["pheno"].columns, axis=1)], ignore_index=True)
-        if inputs["covar"] is not None:
-            rows = ids.copy()
-            for n, col in enumerate(inputs["covar"].columns[2:]):
-                rows[col] = inputs["covar"][col].mean() + np.arange(num_new) - 1.0 + n
-            inputs["covar"] = pd.concat([inputs["covar"], rows.set_axis(
-                inputs["covar"].columns, axis=1)], ignore_index=True)
-
-        _assert_same_results(original, _run_inputs(inputs, degree, tmp_path, "modified"))
-
-
-    @pytest.mark.parametrize("key, degree", tcs.params("rename_samples"))
-    def test__rename_samples__same_results(self, key, degree, tmp_path):
-        """Sample IDs are labels: renaming every one consistently, in an order unrelated to the
-        original, changes nothing"""
-
-        original = _run_inputs(_case_inputs(key), degree, tmp_path, "original")
-        rng = np.random.default_rng(seed=1206)
-        inputs = _case_inputs(key)
-        fam, rel, imputed = inputs["fam"], inputs["rel"], inputs["imputed"]
-        id_files = [df for df in (inputs["id_list"], inputs["pheno"], inputs["covar"]) if df is not None]
-
-        # Every IID, including parents named only in parent columns or in snipar's pedigree, but not
-        # the missing-parent code
-        iids = [*fam[bbf.FAM_IID_COL], *fam[bbf.FAM_IIDF_COL], *fam[bbf.FAM_IIDM_COL],
-                *rel[sut.KING_IID1_COL], *rel[sut.KING_IID2_COL], *[v for df in id_files for v in df.iloc[:, 1]]]
-        if imputed is not None:
-            iids += list(imputed["pedigree"][:, 1:4].ravel())
-        iid_map = _permuted_names([str(i) for i in iids if str(i) != "0"], "iid", rng)
-        iid_map["0"] = "0"
-
-        fids = [*fam[bbf.FAM_FID_COL], *rel[sut.KING_FID1_COL], *rel[sut.KING_FID2_COL],
-                *[v for df in id_files for v in df.iloc[:, 0]]]
-        fid_map = _permuted_names([str(f) for f in fids], "fid", rng)
-
-        for col in (bbf.FAM_IID_COL, bbf.FAM_IIDF_COL, bbf.FAM_IIDM_COL):
-            fam[col] = [iid_map[str(v)] for v in fam[col]]
-        fam[bbf.FAM_FID_COL] = [fid_map[str(v)] for v in fam[bbf.FAM_FID_COL]]
-        for col in (sut.KING_IID1_COL, sut.KING_IID2_COL):
-            rel[col] = [iid_map[str(v)] for v in rel[col]]
-        for col in (sut.KING_FID1_COL, sut.KING_FID2_COL):
-            rel[col] = [fid_map[str(v)] for v in rel[col]]
-        for df in id_files:
-            df[df.columns[0]] = [fid_map[str(v)] for v in df.iloc[:, 0]]
-            df[df.columns[1]] = [iid_map[str(v)] for v in df.iloc[:, 1]]
-
-        # snipar's own family IDs link its pedigree to its imputed rows, so they are renamed too
-        if imputed is not None:
-            family_map = _permuted_names(list(imputed["families"]), "family", rng)
-            pedigree = imputed["pedigree"].astype(object)
-            pedigree[:, 0] = [family_map.get(str(f), str(f)) for f in pedigree[:, 0]]
-            pedigree[:, 1:4] = np.vectorize(lambda v: iid_map[str(v)])(pedigree[:, 1:4])
-            imputed["pedigree"] = pedigree.astype(str)
-            imputed["families"] = np.array([family_map[str(f)] for f in imputed["families"]])
-
-        _assert_same_results(original, _run_inputs(inputs, degree, tmp_path, "modified"))
-
-
-    @pytest.mark.parametrize("key, degree", tcs.params("rename_snps"))
-    def test__rename_snps__same_results(self, key, degree, tmp_path):
-        """rsids are labels: renaming every one consistently changes nothing but the rsid column,
-        and the output keeps the bim file's order whatever the names"""
-
-        original = _run_inputs(_case_inputs(key), degree, tmp_path, "original")
-        rng = np.random.default_rng(seed=1207)
-        inputs = _case_inputs(key)
-        bim, imputed = inputs["bim"], inputs["imputed"]
-
-        rsids = [*bim[bbf.BIM_RSID_COL]]
-        if imputed is not None:
-            rsids += list(imputed["bim_values"][:, 1])
-        rsid_map = _permuted_names([str(r) for r in rsids], "snp", rng)
-
-        bim[bbf.BIM_RSID_COL] = [rsid_map[str(r)] for r in bim[bbf.BIM_RSID_COL]]
-        if inputs["snp_list"] is not None:
-            snp_list = inputs["snp_list"]
-            snp_list[snp_list.columns[0]] = [rsid_map[str(r)] for r in snp_list.iloc[:, 0]]
-        if imputed is not None:
-            bim_values = imputed["bim_values"].astype(object)
-            bim_values[:, 1] = [rsid_map[str(r)] for r in bim_values[:, 1]]
-            imputed["bim_values"] = bim_values.astype(str)
-
-        _assert_same_results(original, _run_inputs(inputs, degree, tmp_path, "modified"),
-                             rsid_map=rsid_map)
-
-
-    # TODO(jonbjala) Definitely need error cases
-
-
-
-# Case harness ====================================================================================
+# --------------------------------------------------------------------------------------------------
+# The PO regression
 #
-# Generic tests over every case in tcs.REGISTRY.  A case states what it is built to have and,
-# optionally, any intermediate values; anything it does not state is derived by the mocks in
-# helper.py.  See tcs.py for the format.
+# Family 1: dad1 and mum1 both genotyped, children k1a and k1b.  mum1's sister aunt1 puts mum1 in
+# the FS regression too, so that mum1 is in Omega however her motherhood is recorded.
+# Family 2: dad2 genotyped but WITHOUT a phenotype -- read for his children's residuals, but not in
+# Omega -- and children k2a, k2b; snipar family S2 holds the other parent's data.
+# Family 3: dad3 genotyped, child k3; snipar family S3.
+# s1 and s2: sibs without parents.  k3 and s1 are cousins, linking families.
 
-def _assert_close(key, name, actual, expected):
-    """Compares a value against a case's expectation, naming the case and quantity on failure"""
-
-    actual = actual.toarray() if sp.issparse(actual) else np.asarray(actual, dtype=float)
-    expected = expected.toarray() if sp.issparse(expected) else np.asarray(expected, dtype=float)
-    assert actual.shape == expected.shape, \
-        f"{key}: {name} has shape {actual.shape}, expected {expected.shape}"
-    worst = float(np.max(np.abs(actual - expected))) if actual.size else 0.0
-    assert np.allclose(actual, expected, atol=tcs.tolerance(key), rtol=0.0), \
-        f"{key}: {name} differs by up to {worst:.3g} ({tcs.provenance(key, name)} expectation)"
-
-
-class TestCaseFormat:
-
-    @pytest.mark.parametrize("key", tcs.KEYS)
-    def test__case__follows_the_format(self, key):
-        assert tcs.format_problems(key) == []
+PO_PHENOS = {"dad1" : 0.3, "mum1" : -0.8, "k1a" : 1.4, "k1b" : 0.2, "aunt1" : -1.1,
+             "dad2" : -9.0, "k2a" : 0.9, "k2b" : -0.6, "dad3" : 1.7, "k3" : 2.1,
+             "s1" : -1.9, "s2" : -0.4}
+PO_KING = [("dad1", "k1a", "PO"), ("dad1", "k1b", "PO"), ("mum1", "k1a", "PO"),
+           ("mum1", "k1b", "PO"), ("dad2", "k2a", "PO"), ("dad2", "k2b", "PO"),
+           ("dad3", "k3", "PO"), ("k1a", "k1b", "FS"), ("k2a", "k2b", "FS"),
+           ("mum1", "aunt1", "FS"), ("s1", "s2", "FS"), ("k3", "s1", "3rd")]
+PO_RECORDS = [("S1", "k1a", "dad1", "mum1", True, True),
+              ("S1", "k1b", "dad1", "mum1", True, True),
+              ("S2", "k2a", "dad2", "mum2", True, False),
+              ("S2", "k2b", "dad2", "mum2", True, False),
+              ("S3", "k3", "dad3", "mum3", True, False)]
 
 
-class TestCaseSelfConsistency:
-    """Every value a case states that the mocks can also derive, checked against the mocks
+def po_plan(records=PO_RECORDS, families=("S2", "S3")):
+    samples, graph, parents = planned(PO_PHENOS, PO_KING, records, list(families))
+    phenotypes = sut.prepare_phenotypes(samples)
+    omega = sut.build_omega(samples, graph, phenotypes)
+    bed_cols, column_of_row = sut.plan_genotype_samples(samples, parents)
+    po = sut.build_po_regression(samples, parents, phenotypes, omega, column_of_row)
+    regressions = [po] + sut.build_relative_regressions(samples, graph, phenotypes, omega)
+    cross = sut.build_cross_covariances(regressions, omega)
+    return dict(samples=samples, graph=graph, parents=parents, phenotypes=phenotypes, omega=omega,
+                bed_cols=bed_cols, column_of_row=column_of_row, regressions=regressions,
+                cross=cross)
 
-    No production code runs here.  A failure means the case and the mocks disagree, so one of them
-    is wrong -- a hand-derived matrix with a slip in it, a reference value computed under an older
-    estimator (notes §15.1), or a mock that has drifted.  Either way it must be resolved before the
-    production tests that use the case mean anything.
+
+def po_data(num_loaded, families, num_snps=12, seed=5):
+    """Genotypes for the loaded samples, and snipar data for the families: at each SNP, k is 3 or 4
+    (with a few 2s and gaps), and the imputed value is what that k implies -- an allele plus f, or
+    a genotype"""
+    rng = np.random.default_rng(seed)
+    genotypes = rng.integers(0, 3, size=(num_snps, num_loaded)).astype(float)
+    k = rng.choice([3.0, 4.0], size=(num_snps, families))
+    f = rng.uniform(0.1, 0.9, size=num_snps)
+    imputed = np.where(k == 3, rng.integers(0, 2, size=k.shape) + f[:, None],
+                       rng.integers(0, 3, size=k.shape).astype(float))
+    k[0, 0] = 2.0
+    k[1, 1] = np.nan
+    imputed[1, 1] = np.nan
+    return genotypes, (imputed, k, f)
+
+
+class TestPlanGenotypeSamples:
+
+    def test__omega_first_then_parents_outside_it(self):
+        plan = po_plan()
+        samples = plan["samples"]
+        iid = samples[sut.SAMPLE_IID_COL].to_numpy()
+        row = dict(zip(iid, range(len(iid))))
+
+        bed_cols, column_of_row = plan["bed_cols"], plan["column_of_row"]
+
+        num_omega = len(plan["phenotypes"])
+        omega_rows = np.flatnonzero(samples[sut.SAMPLE_OMEGA_IDX_COL].to_numpy() != -1)
+        assert bed_cols[:num_omega].tolist() == samples[sut.SAMPLE_BED_COL][omega_rows].tolist()
+        # dad2 has no phenotype, so is not in Omega, but is read, after Omega's samples
+        assert bed_cols.tolist()[num_omega:] == [samples[sut.SAMPLE_BED_COL][row["dad2"]]]
+        assert column_of_row[row["dad2"]] == num_omega
+        assert column_of_row[row["k1a"]] == samples[sut.SAMPLE_OMEGA_IDX_COL][row["k1a"]]
+
+
+class TestBuildPoRegression:
+
+    def test__children_their_phenotypes_and_their_block_of_omega(self):
+        plan = po_plan()
+        po, samples = plan["regressions"][0], plan["samples"]
+        idx = dict(zip(samples[sut.SAMPLE_IID_COL], samples[sut.SAMPLE_OMEGA_IDX_COL]))
+        children = [idx[c] for c in ("k1a", "k1b", "k2a", "k2b", "k3")]
+
+        assert po.name == sut.GROUP_PO and po.focal.tolist() == children
+        assert np.allclose(po.phenotypes, plan["phenotypes"][children])
+        block = plan["omega"].toarray()[np.ix_(children, children)]
+        assert np.allclose(po.gls_weights.toarray(), np.linalg.pinv(block, hermitian=True))
+
+    def test__parents_located(self):
+        plan = po_plan()
+        po, col = plan["regressions"][0], plan["column_of_row"]
+        row = dict(zip(plan["samples"][sut.SAMPLE_IID_COL], range(len(plan["samples"]))))
+
+        assert po.parents.father.tolist() == [col[row["dad1"]]] * 2 + [col[row["dad2"]]] * 2 + [
+            col[row["dad3"]]]
+        assert po.parents.mother.tolist() == [col[row["mum1"]]] * 2 + [-1] * 3
+        assert po.parents.family.tolist() == [-1, -1, 0, 0, 1]
+
+    def test__no_parents__no_regression(self):
+        samples, graph, parents = planned(RELATIVE_PHENOS, RELATIVE_ROWS)
+        phenotypes = sut.prepare_phenotypes(samples)
+        _, column_of_row = sut.plan_genotype_samples(samples, parents)
+
+        assert sut.build_po_regression(samples, parents, phenotypes,
+                                       sut.build_omega(samples, graph, phenotypes),
+                                       column_of_row) is None
+
+
+def po_residuals_by_hand(genotypes, snipar_block, po):
+    """Each child at each SNP, case by case"""
+    imputed, k, f = snipar_block
+    out = np.zeros((genotypes.shape[0], len(po.focal)))
+    for s in range(genotypes.shape[0]):
+        for c, child in enumerate(po.focal):
+            dad, mum, fam = po.parents.father[c], po.parents.mother[c], po.parents.family[c]
+            g_c = genotypes[s, child]
+            if dad != -1 and mum != -1:
+                out[s, c] = g_c - (genotypes[s, dad] + genotypes[s, mum]) / 2
+                continue
+            g_obs = genotypes[s, dad if dad != -1 else mum]
+            if fam == -1 or np.isnan(k[s, fam]):
+                continue
+            if k[s, fam] == 3:
+                out[s, c] = g_c - g_obs / 2 - round(imputed[s, fam] - f[s])
+            elif k[s, fam] == 4:
+                out[s, c] = g_c - (g_obs + round(imputed[s, fam])) / 2
+    return out
+
+
+class TestPoGenotypeResiduals:
+
+    def test__every_case__as_worked_case_by_case(self):
+        plan = po_plan()
+        po = plan["regressions"][0]
+        genotypes, block = po_data(len(plan["bed_cols"]), 2)
+
+        actual = sut.po_genotype_residuals(genotypes, block, po)
+
+        assert np.allclose(actual, po_residuals_by_hand(genotypes, block, po))
+        # k = 2 (SNP 0, family S2) and a gap (SNP 1, family S3): missing, so zero
+        assert np.all(actual[0, 2:4] == 0.0) and actual[1, 4] == 0.0
+
+    def test__stored_as_float16__still_whole_numbers(self):
+        plan = po_plan()
+        po = plan["regressions"][0]
+        genotypes, (imputed, k, f) = po_data(len(plan["bed_cols"]), 2)
+        stored = (imputed.astype(np.float16).astype(float), k, f.astype(np.float16).astype(float))
+
+        actual = sut.po_genotype_residuals(genotypes, stored, po)
+
+        assert np.allclose(actual, po_residuals_by_hand(genotypes, (imputed, k, f), po))
+
+    def test__missing_genotype__that_residual_missing(self):
+        plan = po_plan()
+        po = plan["regressions"][0]
+        genotypes, block = po_data(len(plan["bed_cols"]), 2)
+        genotypes[3, po.parents.mother[0]] = np.nan     # mum1, at SNP 3
+        genotypes[4, po.focal[4]] = np.nan              # k3 itself, at SNP 4
+
+        actual = sut.po_genotype_residuals(genotypes, block, po)
+
+        assert np.all(actual[3, :2] == 0.0) and actual[4, 4] == 0.0
+        assert not np.isnan(actual).any()
+
+    def test__imputed_value_not_a_whole_number_of_alleles__missing_with_a_warning(self, caplog):
+        plan = po_plan()
+        po = plan["regressions"][0]
+        genotypes, (imputed, k, f) = po_data(len(plan["bed_cols"]), 2)
+        imputed = imputed.copy()
+        imputed[5, 1] += 0.4
+
+        with caplog.at_level(logging.WARNING):
+            actual = sut.po_genotype_residuals(genotypes, (imputed, k, f), po)
+
+        assert actual[5, 4] == 0.0
+        assert "not a whole number of alleles" in caplog.text
+
+    def test__no_snipar_data__only_two_parent_children_have_residuals(self):
+        plan = po_plan()
+        po = plan["regressions"][0]
+        genotypes, _ = po_data(len(plan["bed_cols"]), 2)
+
+        actual = sut.po_genotype_residuals(genotypes, None, po)
+
+        assert np.all(actual[:, 2:] == 0.0) and np.any(actual[:, :2] != 0.0)
+
+
+class TestPoGenotypeResidualsOneChild:
+    """One child, built directly, for the cases the shared fixture has no example of"""
+
+    @staticmethod
+    def child_with(father, mother, family):
+        return sut.Regression(name=sut.GROUP_PO, focal=np.array([0]),
+                              phenotype_map=sp.csr_array(np.ones((1, 1))),
+                              phenotypes=np.zeros(1), gls_weights=sp.csr_array(np.ones((1, 1))),
+                              parents=sut.ParentColumns(father=np.array([father]),
+                                                        mother=np.array([mother]),
+                                                        family=np.array([family])))
+
+    # Columns: the child, then the genotyped parent.  SNP 0 has k = 3 (transmitted allele 1, so
+    # imputed = 1 + f); SNP 1 has k = 4 (the other parent's genotype is 2).
+    GENOTYPES = np.array([[2.0, 1.0], [1.0, 0.0]])
+    BLOCK = (np.array([[1.3], [2.0]]), np.array([[3.0], [4.0]]), np.array([0.3, 0.5]))
+
+    def test__only_the_mother_genotyped__her_genotype_used(self):
+        actual = sut.po_genotype_residuals(self.GENOTYPES, self.BLOCK,
+                                           self.child_with(father=-1, mother=1, family=0))
+
+        assert np.allclose(actual[:, 0], [2.0 - 1.0 / 2 - 1.0, 1.0 - (0.0 + 2.0) / 2])
+
+    def test__one_parent_but_no_imputed_row__missing(self):
+        actual = sut.po_genotype_residuals(self.GENOTYPES, self.BLOCK,
+                                           self.child_with(father=1, mother=-1, family=-1))
+
+        assert np.all(actual == 0.0)
+
+
+class TestEstimateBlockWithPo:
+
+    def test__po_estimates__match_a_dense_textbook_regression(self):
+        plan = po_plan()
+        po = plan["regressions"][0]
+        genotypes, block = po_data(len(plan["bed_cols"]), 2)
+
+        betas, ses = sut.estimate_block(genotypes, plan["regressions"], plan["cross"],
+                                        sut.reported_estimates(has_po=True), snipar_block=block)
+
+        Z = po_residuals_by_hand(genotypes, block, po)
+        A = po.phenotype_map.toarray()
+        Q = np.linalg.pinv(A @ plan["omega"].toarray() @ A.T, hermitian=True)
+        d = np.einsum("sf,fg,sg->s", Z, Q, Z)
+        assert np.allclose(betas[:, 0], (Z @ Q @ (A @ plan["phenotypes"])) / d)
+        assert np.allclose(ses[:, 0], 1 / np.sqrt(d))
+
+    def test__alleles_recoded_with_snipar__every_estimate_negated(self):
+        # g -> 2 - g, imputed -> 2 - imputed, f -> 1 - f, as a flipped SNP is read: the PO
+        # regression too must simply change sign.  The original implementation did not (notes
+        # §13.7's second cause).
+        plan = po_plan()
+        genotypes, (imputed, k, f) = po_data(len(plan["bed_cols"]), 2)
+        estimates = sut.reported_estimates(has_po=True)
+
+        betas, ses = sut.estimate_block(genotypes, plan["regressions"], plan["cross"], estimates,
+                                        snipar_block=(imputed, k, f))
+        recoded_betas, recoded_ses = sut.estimate_block(
+            2.0 - genotypes, plan["regressions"], plan["cross"], estimates,
+            snipar_block=(2.0 - imputed, k, 1.0 - f))
+
+        assert np.allclose(recoded_betas, -betas) and np.allclose(recoded_ses, ses)
+
+    def test__mother_imputed_from_her_own_genotypes__same_as_genotyped(self):
+        # Patrick's check: hide mum1 from the pedigree and give snipar her true genotypes as an
+        # imputed parent with every allele observed (k = 4).  Family 1's children must get exactly
+        # the results they get with mum1 genotyped.  mum1 stays in Omega either way, as aunt1's
+        # sister, so nothing else changes.
+        genotyped = po_plan()
+        records = [(f, i, d, "hidden_mum1" if m == "mum1" else m, hd,
+                    False if m == "mum1" else hm) for f, i, d, m, hd, hm in PO_RECORDS]
+        imputed_mum = po_plan(records, families=("S1", "S2", "S3"))
+
+        genotypes, (imputed, k, f) = po_data(len(genotyped["bed_cols"]), 2)
+        mum1 = genotyped["regressions"][0].parents.mother[0]
+        imputed3 = np.column_stack([genotypes[:, mum1], imputed])
+        k3 = np.column_stack([np.full(len(k), 4.0), k])
+
+        estimates = sut.reported_estimates(has_po=True)
+        expected = sut.estimate_block(genotypes, genotyped["regressions"], genotyped["cross"],
+                                      estimates, snipar_block=(imputed, k, f))
+        actual = sut.estimate_block(genotypes, imputed_mum["regressions"], imputed_mum["cross"],
+                                    estimates, snipar_block=(imputed3, k3, f))
+
+        assert np.array_equal(imputed_mum["bed_cols"], genotyped["bed_cols"])
+        assert np.allclose(actual[0], expected[0]) and np.allclose(actual[1], expected[1])
+
+
+# --------------------------------------------------------------------------------------------------
+# grma(): planning and running, end to end
+#
+# The PO fixture's families, nine SNPs, and a snipar file on disk.  rs4 has G/T alleles; rs6's are
+# swapped in snipar's file; rs7 is not in it at all.
+
+NUM_SNPS = 9
+
+
+def grma_inputs(tmp_path, seed=8, chunk_snps=3):
+    rng = np.random.default_rng(seed)
+    iids = list(PO_PHENOS)
+    fam_df = pd.DataFrame({bbf.FAM_FID_COL : "F", bbf.FAM_IID_COL : iids,
+                           bbf.FAM_IIDF_COL : "0", bbf.FAM_IIDM_COL : "0", bbf.FAM_SEX_COL : "0",
+                           bbf.FAM_PHENO_COL : list(PO_PHENOS.values())})
+    king_df = pd.DataFrame([("F", a, "F", b, t) for a, b, t in PO_KING],
+                           columns=list(grma_io.KING_COLS))
+    alleles = [("A", "C")] * NUM_SNPS
+    alleles[4] = ("G", "T")
+    bim_df = pd.DataFrame([("1", f"rs{s}", 0.0, 100 * (s + 1), *alleles[s])
+                           for s in range(NUM_SNPS)], columns=list(bbf.BIM_COLS))
+    genotypes = rng.integers(0, 3, size=(NUM_SNPS, len(iids))).astype(float)
+    genotypes[2, 3] = np.nan
+
+    # snipar: every SNP but rs7, with rs6's alleles swapped.  Values exactly representable in
+    # float16, so that what is written is what is read.
+    snipar_snps = [s for s in range(NUM_SNPS) if s != 7]
+    f = np.round(rng.uniform(0.1, 0.9, len(snipar_snps)) * 64) / 64
+    k = rng.choice([3.0, 4.0], size=(2, len(snipar_snps)))
+    imputed = np.where(k == 3, rng.integers(0, 2, size=k.shape) + f,
+                       rng.integers(0, 3, size=k.shape).astype(float))
+    snipar_alleles = [alleles[s][::-1] if s == 6 else alleles[s] for s in snipar_snps]
+    path = os.path.join(tmp_path, "imp" + snipar_hdf5.SNIPAR_FILE_SUFFIX)
+    snipar_hdf5.write_snipar_file(
+        path, imputed_gts=imputed, num_obs_par_alleles=k, standard_f=f,
+        parental_status=np.zeros((2, 3), dtype=bool),
+        pedigree=np.array([[f_, i, d, m, str(hd), str(hm)] for f_, i, d, m, hd, hm in PO_RECORDS]),
+        families=np.array(["S2", "S3"]),
+        bim_values=np.array([["1", f"rs{s}", "0", str(100 * (s + 1)), *a]
+                             for s, a in zip(snipar_snps, snipar_alleles)]),
+        chunk_snps=chunk_snps)
+    return dict(fam_file=fam_df, rel_file=king_df, bim_file=bim_df, bed_file=genotypes,
+                imputed_parental_file=path, rel_degree=3)
+
+
+def without(inputs, *names):
+    return {k : v for k, v in inputs.items() if k not in names}
+
+
+def assert_same_results(actual, expected):
+    """The same results, up to floating-point rounding
+
+    Different block sizes give numpy's batched linear algebra different shapes, which can change
+    the last bit of a result; p-values, written as text, would show it.  So the bim columns are
+    compared exactly, and every estimate, SE and p-value numerically.
     """
-
-    @pytest.mark.parametrize("key, name, degree", tcs.stated_derivable_params())
-    def test__stated_value__agrees_with_mocks(self, key, name, degree):
-        stated, derived = tcs.stated(key, name, degree), tcs.derived(key, name, degree)
-
-        if name in ("AFFECTED", "ANALYSIS_IIDS", "RETAINED_RSIDS"):
-            assert sorted(stated) == sorted(derived) if name == "AFFECTED" else stated == derived
-        elif name == "PARENTAL_MEANS":
-            assert sorted(stated) == sorted(derived)
-            for iid in stated:
-                assert np.allclose(stated[iid], derived[iid], atol=tcs.tolerance(key),
-                                   equal_nan=True), f"{key}: PARENTAL_MEANS[{iid}]"
-        else:
-            _assert_close(key, name, stated, derived)
+    assert actual.columns.tolist() == expected.columns.tolist()
+    bim_cols = list(bbf.BIM_COLS)
+    pd.testing.assert_frame_equal(actual[bim_cols], expected[bim_cols])
+    for column in actual.columns[len(bim_cols):]:
+        a = pd.to_numeric(actual[column].astype(object).where(actual[column].notna(), np.nan))
+        e = pd.to_numeric(expected[column].astype(object).where(expected[column].notna(), np.nan))
+        assert np.allclose(a, e, rtol=1e-12, atol=0, equal_nan=True), column
 
 
-class TestCaseEndToEnd:
+class TestGrma:
 
-    @pytest.mark.parametrize("key, degree", tcs.params("end_to_end"))
-    def test__grma__matches_expected(self, key, degree, tmp_path, caplog):
-        with caplog.at_level(logging.DEBUG):
-            actual = sut.grma(**tcs.grma_kwargs(key, degree, tmp_path))
+    def test__plan__the_steps_done_one_by_one(self, tmp_path):
+        inputs = grma_inputs(tmp_path)
 
-        assert actual[bbf.BIM_RSID_COL].astype(str).tolist() == tcs.get(key, "RETAINED_RSIDS")
-        _assert_close(key, "BETAS", actual[sut.OUTPUT_BETA_COL], tcs.get(key, "BETAS", degree))
-        _assert_close(key, "SES", actual[sut.OUTPUT_SE_COL], tcs.get(key, "SES", degree))
+        plan = sut.plan_analysis(**without(inputs, "bed_file"))
 
-        for message, count in (tcs.REGISTRY[key]["EXPECTED_LOG_COUNTS"] or {}).items():
-            assert caplog.text.count(message) == count, \
-                f"{key}: expected {count} occurrence(s) of {message!r}"
+        expected = po_plan()
+        assert [r.name for r in plan.regressions] == [r.name for r in expected["regressions"]]
+        for actual_r, expected_r in zip(plan.regressions, expected["regressions"]):
+            assert np.array_equal(actual_r.focal, expected_r.focal)
+            assert np.allclose(actual_r.phenotypes, expected_r.phenotypes)
+            assert np.allclose(actual_r.gls_weights.toarray(), expected_r.gls_weights.toarray())
+        assert np.array_equal(plan.bed_cols, expected["bed_cols"])
+        assert plan.estimates == sut.reported_estimates(has_po=True)
+        assert plan.snps.snipar_positions.tolist() == [0, 1, 2, 3, 4, 5, 6, -1, 7]
+        assert plan.snps.flip.tolist() == [False] * 6 + [True, False, False]
 
+    def test__results__the_same_as_every_snp_estimated_at_once(self, tmp_path):
+        inputs = grma_inputs(tmp_path)
+        plan = sut.plan_analysis(**without(inputs, "bed_file"))
 
-class TestCaseInvariance:
-    """Properties every case must have, checked against production alone
+        actual = sut.grma(**inputs, snps_per_block=4)
 
-    These need no reimplementation of the method, so they can catch a gap the mocks share with
-    production -- as notes §13.5 was: the mocks did not center phenotypes either, so they agreed.
-    """
+        with grma_io.SniparReader(inputs["imputed_parental_file"], plan.standard_f) as reader:
+            block = reader.read(plan.snps.snipar_positions, plan.snps.flip)
+        betas, ses = sut.estimate_block(inputs["bed_file"][:, plan.bed_cols], plan.regressions,
+                                        plan.cross, plan.estimates, snipar_block=block)
+        for e, combined in enumerate(plan.estimates):
+            label = grma_io.estimate_label(combined)
+            assert np.allclose(actual["BETA_" + label], betas[:, e], equal_nan=True)
+            assert np.allclose(actual["SE_" + label], ses[:, e], equal_nan=True)
 
-    @pytest.mark.parametrize("key, degree", tcs.params("phenotype_shift"))
-    def test__phenotypes_shifted_by_a_constant__results_unchanged(self, key, degree, tmp_path):
-        kwargs = tcs.grma_kwargs(key, degree, tmp_path)
-        baseline = sut.grma(**kwargs)
+    @pytest.mark.parametrize("snps_per_block", [1, 2, 5, 100])
+    def test__block_size__makes_no_difference(self, tmp_path, snps_per_block):
+        inputs = grma_inputs(tmp_path)
 
-        shifted_fam = kwargs["fam_file"].copy()
-        shifted_fam[bbf.FAM_PHENO_COL] = shifted_fam[bbf.FAM_PHENO_COL].astype(float) + 10.0
-        shifted_kwargs = dict(kwargs, fam_file=shifted_fam)
-        if kwargs["pheno_file"] is not None:
-            shifted_pheno = kwargs["pheno_file"].copy()
-            shifted_pheno.iloc[:, 2] = shifted_pheno.iloc[:, 2].astype(float) + 10.0
-            shifted_kwargs["pheno_file"] = shifted_pheno
-        shifted = sut.grma(**shifted_kwargs)
+        expected = sut.grma(**inputs, snps_per_block=3)
+        actual = sut.grma(**inputs, snps_per_block=snps_per_block)
 
-        for col in (sut.OUTPUT_BETA_COL, sut.OUTPUT_SE_COL):
-            assert np.allclose(shifted[col], baseline[col], atol=1e-9, rtol=0.0), \
-                f"{key}: {col} depends on the phenotype's origin"
+        assert_same_results(actual, expected)
 
+    def test__from_files__the_same_as_from_frames(self, tmp_path):
+        inputs = grma_inputs(tmp_path)
+        prefix = os.path.join(tmp_path, "data")
+        fam, bim = inputs["fam_file"], inputs["bim_file"]
+        bbf.write_fam_file(prefix + ".fam", fam[bbf.FAM_FID_COL].to_numpy(),
+                           fam[bbf.FAM_IID_COL].to_numpy(), pheno=fam[bbf.FAM_PHENO_COL].to_numpy())
+        bbf.write_bim_file(prefix + ".bim", bim[bbf.BIM_CHR_COL].to_numpy(),
+                           bim[bbf.BIM_RSID_COL].to_numpy(), bim[bbf.BIM_BP_COL].to_numpy(),
+                           bim[bbf.BIM_A1_COL].to_numpy(), bim[bbf.BIM_A2_COL].to_numpy())
+        bbf.write_bed_file(prefix + ".bed", inputs["bed_file"])
+        inputs["rel_file"].to_csv(prefix + ".kin0", sep="\t", index=False)
 
-    @pytest.mark.parametrize("key, degree", tcs.params("allele_swap",
-                                                       default_xfail=tcs.coding_dependence_xfail))
-    def test__alleles_swapped__betas_negated(self, key, degree, tmp_path):
-        """Swapping A1 and A2 in the bim, and recoding the genotypes to match, describes the same
-        data with the other allele counted.  Betas are reported for A2, so a swapped SNP's beta
-        changes sign and nothing else changes.
+        from_files = sut.grma(rel_file=prefix + ".kin0", bed_file=prefix + ".bed",
+                               bim_file=prefix + ".bim", fam_file=prefix + ".fam", rel_degree=3,
+                               imputed_parental_file=inputs["imputed_parental_file"])
+        from_frames = sut.grma(**inputs)
 
-        For an imputed case the snipar file is left alone, so on the swapped SNPs it now disagrees
-        with the bim and must be flipped -- the flip path, checked against exact truth.  Only
-        non-palindromic SNPs are swapped: for A/T or C/G a swap looks like a strand difference,
-        which is the unimplemented palindromic rescue (notes §12.1), not something to test here.
-        """
+        assert_same_results(from_files, from_frames)
 
-        original = _run_inputs(_case_inputs(key), degree, tmp_path, "original")
-        inputs = _case_inputs(key)
-        bim = inputs["bim"]
+    def test__phenotype_file__the_same_as_those_phenotypes_in_the_fam_file(self, tmp_path):
+        inputs = grma_inputs(tmp_path)
+        fam = inputs["fam_file"]
+        new_phenos = fam[bbf.FAM_PHENO_COL].to_numpy() * 2.0 + 1.0
+        new_phenos[fam[bbf.FAM_PHENO_COL].to_numpy() == -9.0] = -9.0
+        pheno = pd.DataFrame({0 : fam[bbf.FAM_FID_COL], 1 : fam[bbf.FAM_IID_COL], 2 : new_phenos})
 
-        retained = set(tcs.get(key, "RETAINED_RSIDS"))
-        palindromic = [{a1, a2} in sut.PALINDROMIC_ALLELE_PAIRS
-                       for a1, a2 in zip(bim[bbf.BIM_A1_COL], bim[bbf.BIM_A2_COL])]
-        candidates = [n for n, r in enumerate(bim[bbf.BIM_RSID_COL].astype(str))
-                      if r in retained and not palindromic[n]]
-        swap = candidates[::2]
-        assert swap, f"{key} has no retained non-palindromic SNP to swap"
+        actual = sut.grma(**inputs, pheno_file=pheno)
+        expected = sut.grma(**{**inputs, "fam_file" : fam.assign(**{bbf.FAM_PHENO_COL :
+                                                                       new_phenos})})
 
-        bim.loc[swap, [bbf.BIM_A1_COL, bbf.BIM_A2_COL]] = \
-            bim.loc[swap, [bbf.BIM_A2_COL, bbf.BIM_A1_COL]].to_numpy()
-        inputs["G"][swap] = 2.0 - inputs["G"][swap]
+        assert_same_results(actual, expected)
+        assert not np.allclose(actual["BETA_PO_FS"], sut.grma(**inputs)["BETA_PO_FS"])
 
-        _assert_same_results(original, _run_inputs(inputs, degree, tmp_path, "modified"),
-                             negated_rsids=set(bim[bbf.BIM_RSID_COL].astype(str).iloc[swap]))
+    def test__id_list__the_same_as_the_samples_left_out_lacking_phenotypes(self, tmp_path):
+        inputs = grma_inputs(tmp_path)
+        fam = inputs["fam_file"]
+        leave_out = fam[bbf.FAM_IID_COL].isin(["s2", "aunt1"]).to_numpy()
+        ids = fam.loc[~leave_out, [bbf.FAM_FID_COL, bbf.FAM_IID_COL]]
 
+        actual = sut.grma(**inputs, id_list=ids)
+        expected = sut.grma(**{**inputs, "fam_file" : fam.assign(**{bbf.FAM_PHENO_COL : np.where(
+            leave_out, -9.0, fam[bbf.FAM_PHENO_COL])})})
 
-class TestCaseEquivalence:
-    """Cases that must give exactly the results of another case (EQUIVALENT_TO): the same data run
-    a different way that should make no difference -- imputed rather than observed parents
-    (notes §15.3), a different block size, parents named but absent"""
+        assert_same_results(actual, expected)
 
-    @pytest.mark.parametrize("key, degree", tcs.params("equivalence", keys=tcs.equivalent_keys()))
-    def test__results__identical_to_the_equivalent_case(self, key, degree, tmp_path):
-        other = tcs.REGISTRY[key]["EQUIVALENT_TO"]
-        actual = sut.grma(**tcs.grma_kwargs(key, degree, tmp_path))
-        expected = sut.grma(**tcs.grma_kwargs(other, degree, tmp_path))
-        _assert_same_results(expected, actual)
+    def test__covariates__the_same_as_the_phenotypes_residualized_on_them_first(self, tmp_path):
+        # Residualizing on an intercept and covariates within Omega is a projection, so applying
+        # it to phenotypes already residualized on the same covariates changes nothing: the run
+        # with covariates must equal the run without them, given the pre-residualized phenotypes
+        inputs = grma_inputs(tmp_path)
+        fam = inputs["fam_file"]
+        age = np.linspace(20, 75, len(fam))
+        covar = pd.DataFrame({0 : fam[bbf.FAM_FID_COL], 1 : fam[bbf.FAM_IID_COL], 2 : age})
+        samples, _, _ = planned(PO_PHENOS, PO_KING, PO_RECORDS, ["S2", "S3"])
+        in_omega = samples[sut.SAMPLE_OMEGA_IDX_COL].to_numpy() != -1
+        y = fam[bbf.FAM_PHENO_COL].to_numpy()[in_omega]
+        X = np.column_stack([age[in_omega], np.ones(in_omega.sum())])
+        pre = fam[bbf.FAM_PHENO_COL].to_numpy().copy()
+        pre[in_omega] = y - X @ np.linalg.lstsq(X, y, rcond=None)[0]
+
+        actual = sut.grma(**inputs, covar_file=covar)
+        expected = sut.grma(**{**inputs, "fam_file" : fam.assign(**{bbf.FAM_PHENO_COL : pre})})
+
+        assert_same_results(actual, expected)
+        assert not np.allclose(actual["BETA_PO_FS"], sut.grma(**inputs)["BETA_PO_FS"])
+
+    def test__snp_list__only_those_snps_with_the_same_results(self, tmp_path):
+        inputs = grma_inputs(tmp_path)
+        snp_list = pd.DataFrame({0 : ["rs1", "rs6", "rs7", "rs8"]})
+
+        actual = sut.grma(**inputs, snp_list=snp_list)
+        everything = sut.grma(**inputs)
+
+        assert actual["RSID"].tolist() == ["rs1", "rs6", "rs7", "rs8"]
+        assert_same_results(actual, everything.iloc[[1, 6, 7, 8]].reset_index(drop=True))
+
+    def test__snipar_reader__closed_after_the_run(self, tmp_path, monkeypatch):
+        inputs = grma_inputs(tmp_path)
+        closed = []
+        real_close = grma_io.SniparReader.close
+        monkeypatch.setattr(grma_io.SniparReader, "close",
+                            lambda self: closed.append(True) or real_close(self))
+
+        sut.grma(**inputs)
+
+        assert closed == [True]
+
+    @pytest.mark.parametrize("snipar, rel_degree, labels", [
+        (True, 3, ["PO", "PO_FS", "PO_FS_2ND", "PO_FS_2ND_3RD"]),
+        (True, 1, ["PO", "PO_FS"]),
+        (False, 2, ["FS", "FS_2ND"])])
+    def test__output_columns__from_the_options(self, tmp_path, caplog, snipar, rel_degree,
+                                               labels):
+        inputs = {**grma_inputs(tmp_path), "rel_degree" : rel_degree}
+        if not snipar:
+            inputs = without(inputs, "imputed_parental_file")
+
+        with caplog.at_level(logging.WARNING):
+            actual = sut.grma(**inputs)
+
+        # This fixture's 2ND and 3RD groups are genuinely empty, which is warned about -- but only
+        # where the options include them: a regression the options exclude is not an empty one
+        for group, degree in ((sut.GROUP_2ND, 2), (sut.GROUP_3RD, 3)):
+            warned = f"No sample qualifies for the {group} regression" in caplog.text
+            assert warned == (rel_degree >= degree), group
+
+        expected = list(bbf.BIM_COLS) + [f"{c}_{label}" for label in labels
+                                         for c in ("BETA", "SE", "P")]
+        assert actual.columns.tolist() == expected
+        assert len(actual) == NUM_SNPS
+
+    def test__snipar_file_without_po_children__warned_and_po_estimates_missing(self, tmp_path,
+                                                                               caplog):
+        inputs = grma_inputs(tmp_path)
+        # snipar's pedigree names no parent the fam file has, and records none as genotyped, so
+        # no child has a parent and the PO regression has nobody
+        path = inputs["imputed_parental_file"]
+        metadata = snipar_hdf5.read_snipar_metadata(path)
+        pedigree = metadata[snipar_hdf5.SNIPAR_PEDIGREE_KEY].copy()
+        for column in (snipar_hdf5.SNIPAR_PED_FATHER_COL, snipar_hdf5.SNIPAR_PED_MOTHER_COL):
+            pedigree[:, column] = "nobody"
+        for column in (snipar_hdf5.SNIPAR_PED_HAS_FATHER_COL,
+                       snipar_hdf5.SNIPAR_PED_HAS_MOTHER_COL):
+            pedigree[:, column] = "False"
+        os.remove(path)
+        snipar_hdf5.write_snipar_file(
+            path, imputed_gts=np.zeros((2, NUM_SNPS - 1)),
+            num_obs_par_alleles=np.full((2, NUM_SNPS - 1), 3.0),
+            standard_f=metadata[snipar_hdf5.SNIPAR_STANDARD_F_KEY],
+            parental_status=np.zeros((2, 3), dtype=bool), pedigree=pedigree,
+            families=metadata[snipar_hdf5.SNIPAR_FAMILIES_KEY],
+            bim_values=metadata[snipar_hdf5.SNIPAR_BIM_VALUES_KEY])
+
+        with caplog.at_level(logging.WARNING):
+            actual = sut.grma(**inputs)
+
+        assert "No sample qualifies for the PO regression" in caplog.text
+        assert actual["BETA_PO"].isna().all()
+        # With no PO regression, PO+FS is the FS regression alone, which has estimates
+        assert actual["BETA_PO_FS"].notna().all()
+
+    def test__bad_input__raised_before_any_genotype_is_read(self, tmp_path):
+        inputs = grma_inputs(tmp_path)
+        inputs["fam_file"] = pd.concat([inputs["fam_file"], inputs["fam_file"].iloc[[0]]],
+                                       ignore_index=True)
+        inputs["bed_file"] = os.path.join(tmp_path, "does_not_exist.bed")
+
+        # A missing bed file would raise FileNotFoundError; the fam file's repeated sample is
+        # reported first, because every check runs before the genotypes are read
+        with pytest.raises(ValueError, match="more than once"):
+            sut.grma(**inputs)
+
+    def test__rel_degree_given_as_text__accepted(self, tmp_path):
+        inputs = grma_inputs(tmp_path)
+
+        expected = sut.grma(**inputs)
+        actual = sut.grma(**{**inputs, "rel_degree" : "3"})
+
+        assert_same_results(actual, expected)
+

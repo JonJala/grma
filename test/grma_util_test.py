@@ -1,5 +1,5 @@
 """
-Tests of grma2_util: helpers shared by GRMA's modules.
+Tests of grma_util: helpers shared by GRMA's modules.
 
 TestDescribeOffenders is copied unchanged from the original implementation's tests, along with the
 function itself.
@@ -13,7 +13,7 @@ import numpy as np
 main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(main_directory)
 
-import grma2_util as sut
+import grma_util as sut
 
 
 class TestDescribeOffenders:

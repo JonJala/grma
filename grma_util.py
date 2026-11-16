@@ -1,7 +1,7 @@
 """
 Small helpers shared by GRMA's modules.
 
-Kept apart from grma2_io and grma2_lib so that both can use them without importing each other.
+Kept apart from grma_io and grma_lib so that both can use them without importing each other.
 """
 
 

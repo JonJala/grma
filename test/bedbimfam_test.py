@@ -20,8 +20,6 @@ pd.options.mode.copy_on_write = True #https://pandas.pydata.org/pandas-docs/stab
 
 import bedbimfam as sut
 
-import helper
-import tcs
 
 
 ##############

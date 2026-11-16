@@ -1,5 +1,5 @@
 """
-Tests of grma2_io: GRMA's readers.
+Tests of grma_io: GRMA's readers.
 
 Every reader is checked for the same three things: IDs come back as text (leading zeros intact),
 a file and the equivalent DataFrame give identical results, and bad values are errors that name
@@ -18,7 +18,7 @@ main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(main_directory)
 
 import bedbimfam as bbf
-import grma2_io as sut
+import grma_io as sut
 import snipar_hdf5
 
 
@@ -425,8 +425,9 @@ class TestWriteResults:
 
         sut.write_results(results, path)
 
-        lines = open(path).read().splitlines()
-        assert lines[0].split("\t") == list(bbf.BIM_COLS) + ["BETA_FS", "SE_FS", "P_FS"]
-        assert lines[2].split("\t")[-3:] == ["NA", "NA", "NA"]
-        assert "nan" not in open(path).read().lower().replace("na\t", "").replace("\tna", "")
+        with open(path) as f:
+            rows = [line.split("\t") for line in f.read().splitlines()]
+        assert rows[0] == list(bbf.BIM_COLS) + ["BETA_FS", "SE_FS", "P_FS"]
+        assert rows[2][-3:] == ["NA", "NA", "NA"]
+        assert not any(value.lower() == "nan" for row in rows for value in row)
 

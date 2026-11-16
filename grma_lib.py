@@ -1,153 +1,129 @@
-#!/usr/bin/env python3
-
 """
-Library / core code for GRMA method
+GRMA: planning and statistics.
+
+Work happens in two stages:
+
+    1. Planning, from everything except genotypes: the sample table, the relatedness graph, the
+       groups, Omega and the four regressions.  Every input is validated here, so a problem is
+       reported before any genotype is read rather than partway through a long run.
+    2. Running: genotype blocks streamed through the finished plan.
+
+So far: the sample table and each input's own checks; the relatedness graph and KING's checks;
+duplicate samples; parents, from snipar's pedigree; the groups; and Omega, with the phenotypes
+prepared for it; the SNPs to analyse, aligned to snipar's file; the four regressions; the covariance
+of their estimates; their meta-analysis; and grma(), which runs it all: plan_analysis() then
+run_analysis().  Reading the files is
+grma_io's job.
 """
 
-import contextlib
+import dataclasses
 import logging
-import operator
-import textwrap
-import time
-from typing import NamedTuple, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-from scipy.sparse.csgraph import connected_components
+import scipy.sparse.csgraph as csgraph
 import scipy.sparse.linalg as spla
-from scipy.stats import norm
 
-from bedbimfam import (
-    BIM_A1_COL,
-    BIM_A2_COL,
-    BIM_BP_COL,
-    BIM_CHR_COL,
-    BIM_COLS,
-    BIM_RSID_COL,
-    FAM_COLS,
-    FAM_FID_COL,
-    FAM_IID_COL,
-    FAM_IIDF_COL,
-    FAM_IIDM_COL,
-    FAM_PHENO_COL,
-    FAM_SEX_COL,
-    read_bed_file
-)
-import snipar_hdf5 as snipar
-
-# Copy-on-Write will become the default behaviour in Pandas 3.0 and is turned on to increase clarity
-# about whether objects are views or copies
-# (https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html#)
-pd.options.mode.copy_on_write = True
-
-# Calculate constants used in determination of P values
-ln = np.log  # pylint: disable=invalid-name
-LN_2 = ln(2.0)
-RECIP_LN_10 = np.reciprocal(ln(10.0))
+import bedbimfam as bbf
+import grma_io
+import grma_util
+import snipar_hdf5
 
 
+# Sample table columns =============================================================================
+#
+# One row per sample in the fam file, in fam order.  Each sort of position a sample can have (its
+# column in the bed file, and later its place in Omega) gets its own name, so that one can never be
+# used where another was meant.
 
-# Columns used from the King output (this will need to be adjusted if King output is changed)
-KING_FID1_COL = "FID1"
-KING_IID1_COL = "ID1"
-KING_FID2_COL = "FID2"
-KING_IID2_COL = "ID2"
-KING_KINSHIP_COL = "Kinship"
-KING_REL_COL = "InfType"
+SAMPLE_FID_COL = bbf.FAM_FID_COL
+SAMPLE_IID_COL = bbf.FAM_IID_COL
+SAMPLE_BED_COL = "BED_COL"              # Column of the bed file holding this sample's genotypes
+SAMPLE_SEX_COL = bbf.FAM_SEX_COL        # As the fam file records it, as text
+SAMPLE_PHENO_COL = bbf.FAM_PHENO_COL    # The phenotype file's value where one is given
+SAMPLE_HAS_PHENO_COL = "HAS_PHENOTYPE"
+# Has a phenotype, complete covariates, and (where an ID list is given) is in it
+SAMPLE_IN_ANALYSIS_COL = "IN_ANALYSIS"
 
-
-NEEDED_KING_COLS = [
-    KING_FID1_COL,
-    KING_IID1_COL,
-    KING_FID2_COL,
-    KING_IID2_COL,
-    KING_KINSHIP_COL,
-    KING_REL_COL,
-]
+SAMPLE_KEY = [SAMPLE_FID_COL, SAMPLE_IID_COL]
 
 
-# Two parents, two alleles each: the total snipar's allele counts are measured against
-SNIPAR_TOTAL_PARENTAL_ALLELES = 4
+# Relatedness =====================================================================================
+#
+# The relationships GRMA distinguishes between a pair of samples, and how each of KING's InfType
+# values maps to one.  PO and FS are separate relationships, though both are first-degree, because
+# they lead to different regressions.  4th-degree and unrelated pairs play no part, and are left
+# out of the relatedness graph.
 
-# A parent has two alleles, so flipping which allele a genotype counts gives 2 - g
-SNIPAR_ALLELES_PER_PARENT = 2
+# A duplicate sample, or an MZ twin: genotypes identical
+RELATIONSHIP_DUPLICATE = "DUPLICATE"
+RELATIONSHIP_PO = "PO"
+RELATIONSHIP_FS = "FS"
+RELATIONSHIP_2ND = "2ND"
+RELATIONSHIP_3RD = "3RD"
 
-# Complementary bases, for detecting two files recorded on opposite strands
-ALLELE_COMPLEMENTS = {"A" : "T", "T" : "A", "C" : "G", "G" : "C"}
+INFTYPE_TO_RELATIONSHIP = {
+    grma_io.INF_DUP_MZTWIN : RELATIONSHIP_DUPLICATE,
+    grma_io.INF_PARENT_OFFSPRING : RELATIONSHIP_PO,
+    grma_io.INF_FULLSIB : RELATIONSHIP_FS,
+    grma_io.INF_2ND : RELATIONSHIP_2ND,
+    grma_io.INF_3RD : RELATIONSHIP_3RD,
+}
+INFTYPES_IGNORED = (grma_io.INF_4TH, grma_io.INF_UNRELATED)
 
-# Allele pairs that are their own complement, and so cannot have their strand determined from the
-# letters alone
-PALINDROMIC_ALLELE_PAIRS = ({"A", "T"}, {"C", "G"})
+# The relatedness graph: one row per pair, each pair once, ROW_1 < ROW_2.  Rows are sample table
+# rows.
+GRAPH_ROW1_COL = "ROW_1"
+GRAPH_ROW2_COL = "ROW_2"
+GRAPH_RELATIONSHIP_COL = "RELATIONSHIP"
 
-# Column positions within snipar's pedigree records, re-exported for readability here
-SNIPAR_PED_IID_COL = snipar.SNIPAR_PED_IID_COL
-SNIPAR_PED_FID_COL = snipar.SNIPAR_PED_FID_COL
-SNIPAR_PED_FATHER_COL = snipar.SNIPAR_PED_FATHER_COL
-SNIPAR_PED_MOTHER_COL = snipar.SNIPAR_PED_MOTHER_COL
-SNIPAR_PED_HAS_FATHER_COL = snipar.SNIPAR_PED_HAS_FATHER_COL
-SNIPAR_PED_HAS_MOTHER_COL = snipar.SNIPAR_PED_HAS_MOTHER_COL
-
-FAM_INDEX = "FAM_INDEX"
-
-FAM_KEY = [FAM_FID_COL, FAM_IID_COL]
-KING_KEY_1 = [KING_FID1_COL, KING_IID1_COL]
-KING_KEY_2 = [KING_FID2_COL, KING_IID2_COL]
-
-# PLINK uses "0" in a parental ID column to mean that parent is not in the dataset
-FAM_MISSING_PARENT = "0"
-
-# PLINK sex codes.  Anything else (0, -9) means unknown.
-FAM_MALE_SEX = "1"
-FAM_FEMALE_SEX = "2"
-FAM_UNKNOWN_SEX = "0"
-FAM_KNOWN_SEXES = (FAM_MALE_SEX, FAM_FEMALE_SEX)
-
-FAM_INDEX_1 = "FAM_INDEX_1"
-FAM_INDEX_2 = "FAM_INDEX_2"
-
-# For error messages
-MAX_REPORTED_OFFENDERS = 10
+# Added to the sample table by resolve_duplicates(): for a dropped duplicate, the row of the sample
+# kept in its place; -1 for every other sample
+SAMPLE_DUPLICATE_OF_COL = "DUPLICATE_OF"
 
 
-# Values seen in KING file as InfTypes
-INF_DUP_MZTWIN = "Dup/MZTwin"
-INF_FULLSIB = "FS"
-INF_PARENT_OFFSPRING = "PO"
-INF_2ND = "2nd"
-INF_3RD = "3rd"
-INF_4TH = "4th"
-INF_UNRELATED = "UN"
+# Parents and groups ==============================================================================
 
-# Values to map InfTypes to
-DEG_DUP_MZTWIN = 0
-DEG_FULLSIB = 0
-DEG_PARENT_OFFSPRING = 1
-DEG_2ND = 2
-DEG_3RD = 3
-DEG_4TH = 4
-DEG_UNRELATED = 5
+# One row per child who will be residualized against their parents: in the analysis, with at
+# least one parent genotyped.  Parent rows are sample table rows, -1 where that parent is not
+# genotyped; the snipar family row indexes snipar's imputed data, -1 where it has none.
+PARENTS_CHILD_COL = "CHILD_ROW"
+PARENTS_FATHER_COL = "FATHER_ROW"
+PARENTS_MOTHER_COL = "MOTHER_ROW"
+PARENTS_SNIPAR_FAMILY_COL = "SNIPAR_FAMILY_ROW"
+PARENTS_COLS = (PARENTS_CHILD_COL, PARENTS_FATHER_COL, PARENTS_MOTHER_COL,
+                PARENTS_SNIPAR_FAMILY_COL)
 
-# Map of possible InfTypes in a King output file to degree values 
-INFTYPE_TO_DEG_MAP = {
-    INF_DUP_MZTWIN: DEG_DUP_MZTWIN,
-    INF_FULLSIB: DEG_FULLSIB,
-    INF_PARENT_OFFSPRING: DEG_PARENT_OFFSPRING,
-    INF_2ND: DEG_2ND,
-    INF_3RD: DEG_3RD,
-    INF_4TH: DEG_4TH,
-    INF_UNRELATED: DEG_UNRELATED
-    }
+# Each sample in the analysis is in exactly one group: the first it qualifies for, in this order
+GROUP_PO = "PO"                 # At least one parent genotyped
+GROUP_FS = "FS"                 # At least one full sib in the analysis
+GROUP_2ND = "2ND"               # At least one 2nd-degree relative in the analysis
+GROUP_3RD = "3RD"               # At least one 3rd-degree relative in the analysis
+# In the analysis, but not the focal sample of any regression.  Such a sample may still be USED:
+# as the genotyped parent of a child in the PO regression, for instance.
+GROUP_NOT_FOCAL = "NOT_FOCAL"
+SAMPLE_GROUP_COL = "GROUP"      # None for samples outside the analysis
+
+# The relationship degree a regression needs.  --rel-degree runs every regression up to it, so 0
+# and 1 both run PO and FS: the PO regression needs a snipar file, but no particular degree.
+MAX_REL_DEGREE = 3
+GROUP_MIN_REL_DEGREE = {GROUP_FS : 0, GROUP_2ND : 2, GROUP_3RD : 3}
 
 
-MAX_GRMA_RELATEDNESS = 3  # Maximum degree of relatedness GRMA currently handles
-SE_RELATEDNESS = 3  # Relatedness to include in SE calculations
+# Omega ===========================================================================================
 
+# Added to the sample table by select_omega_sample(): the sample's row and column in Omega, or -1
+# for a sample not in it
+SAMPLE_OMEGA_IDX_COL = "OMEGA_IDX"
 
-# Default number of SNPs to process at a time
-DEFAULT_SNPS_PER_BLOCK = 100
+# The relationships whose covariances fill Omega's off-diagonal.  Duplicates have been resolved by
+# the time Omega is built, so none remain.
+OMEGA_RELATIONSHIPS = (RELATIONSHIP_PO, RELATIONSHIP_FS, RELATIONSHIP_2ND, RELATIONSHIP_3RD)
 
-# Default values in omega shrinking procedure
+# The floor Omega's smallest eigenvalue is shrunk to, so that it stays strictly positive definite.
+# Absolute, as in the original implementation; whether it should instead scale with the phenotypic
+# variance, so that a phenotype's units cannot affect it, is still to be decided.
 DEFAULT_OMEGA_EPSILON = 1e-10
 DEFAULT_EIGSH_TOL = 1e-8
 
@@ -158,244 +134,652 @@ DENSE_LAMBDA_MIN_MAX_SIZE = 500
 # Fixed seed for the ARPACK start vector, so repeated runs give identical results
 EIGSH_START_VECTOR_SEED = 8675309
 
-# Output columns
-OUTPUT_BETA_COL = 'BETA'
-OUTPUT_SE_COL = 'SE'
-OUTPUT_P_COL = 'P'
-OUTPUT_SUMSQX_COL = 'SUM_SQ_X'
+
+# Regressions =====================================================================================
+
+# The regressions, in the order their estimates are combined.  Each is named after the group whose
+# samples are its focal samples.
+REGRESSION_ORDER = (GROUP_PO, GROUP_FS, GROUP_2ND, GROUP_3RD)
+
+# Genotype residuals smaller than this are rounding noise, and are set to exactly zero.  A SNP with
+# no variation among a focal sample and its relatives gives a residual of 0 in exact arithmetic,
+# but about 1e-17 in floating point, since R's row (1 - 1/3, -1/3, -1/3, say) does not sum to
+# exactly zero; left as it is, d would be tiny but positive and the "estimate" enormous.  Genotypes
+# are always on the 0-2 scale, so a fixed tolerance is safe: a real residual is never this small.
+GENOTYPE_RESIDUAL_TOLERANCE = 1e-9
+
+# The relationship each relative regression residualizes against
+RELATIVE_REGRESSION_RELATIONSHIP = {GROUP_FS : RELATIONSHIP_FS, GROUP_2ND : RELATIONSHIP_2ND,
+                                    GROUP_3RD : RELATIONSHIP_3RD}
 
 
-# -------------------------
+# SNPs ============================================================================================
 
-class ParentalSources(NamedTuple):
-    """Describes whose genotypes are residualized against their parents
+ALLELE_COMPLEMENTS = {"A" : "T", "T" : "A", "C" : "G", "G" : "C"}
 
-    Produced by either branch of parental processing -- fam file trio determination or imputed
-    parent processing -- and consumed downstream without regard to which branch ran.
+# Allele pairs that are their own complement, and so cannot have their strand determined from the
+# letters alone
+PALINDROMIC_ALLELE_PAIRS = ({"A", "T"}, {"C", "G"})
 
-    Sentinels operate at two levels.  imputed_rows is None entirely when no imputed parental
-    genotype file was supplied; a -1 within an array means that particular parent, or that
-    particular family's imputed row, does not exist.
-
-    Attributes:
-        affected_samples: (n,) indices into the original, unfiltered sample space
-        observed_parent_cols: (n, 2) sample indices of each individual's genotyped parents, with
-            -1 where that parent is not genotyped
-        imputed_rows: (n,) row index into the imputed parental genotype arrays, -1 where the
-            family has no imputed row because both parents are genotyped.  None entirely in fam
-            file trio mode
-        imputed_file: Path to the imputed parental genotype file, reopened around the block loop
-            rather than held open here.  None in fam file trio mode
-        snipar_metadata: Output of read_snipar_metadata(), or None in fam file trio mode
-    """
-
-    affected_samples: np.ndarray
-    observed_parent_cols: np.ndarray
-    imputed_rows: np.ndarray
-    imputed_file: str
-    snipar_metadata: dict
+# snipar's imputed value, less the frequency where an allele was unobserved, is a whole number of
+# alleles: one allele (0 or 1) where snipar observed one of the parent's two, the genotype (0, 1 or
+# 2) where it observed both.  Each is rounded to that whole number, so that storage rounding cannot
+# leave tiny nonzero residuals where the true residual is zero.  snipar stores these values as
+# float16 -- about three significant figures -- so imputed - f can be off by up to about 0.0006;
+# the tolerance leaves a wide margin over that.  A value further than this from any whole number
+# does not fit that description at all, and is treated as missing.
+SNIPAR_ALLELE_TOLERANCE = 0.01
 
 
-# -------------------------
+# Running =========================================================================================
 
-def get_df(filename: Union[str, pd.DataFrame], df_name: str, read_csv_params: dict = None,
-           mi_key: list = None) -> Tuple[pd.DataFrame, pd.MultiIndex]:
-
-    """Gets DataFrame from file (along with optional MultiIndex)
-
-    Helper function to retrieve data from a file and return it in Pandas Dataframe format.  Uses
-    default settings but allows for overrides and the possibility of creating a returning a 
-    MultiIndex.  Also allows for the possibilty of the Dataframe already being passed in,
-    essentially as a no-op, which is useful for testing or library purposes.
-
-    Args:
-        filename: String path to the file, or the Dataframe itself (already read in)
-        df_name: Name of the Dataframe, only for error / logging purposes
-        read_csv_params: Dictionary for specification / override of read_csv() function parameters
-        mi_key: Optional column names to allow for a MultiIndex to be returned along with the frame
-
-    Returns:
-        A tuple (df, mi) where df is the DataFrame in question and mi is a MultiIndex on the 
-        columns specified by mi_key (or None if no columns were specified)
-
-    """
-
-    read_csv_defaults = {
-        "sep" : r"\s+",
-        "index_col" : False,
-        "header" : None
-    }
-    if read_csv_params:
-        read_csv_defaults.update(read_csv_params) 
-
-    if isinstance(filename, str):
-        if not filename:
-            return None, None
-        df = pd.read_csv(filename, **read_csv_defaults)
-    elif isinstance(filename, pd.DataFrame):
-        df = filename
-    elif filename is None:
-        return None, None
-    else:
-        raise TypeError(f"Expected str or Pandas DataFrame for parameter {df_name}, but "
-                        f"received {type(filename)}")
-
-    mi = pd.MultiIndex.from_frame(df[mi_key]) if mi_key else None
-
-    return df, mi
+# Default number of SNPs to process at a time.  Memory in the genotype loop scales with it.
+DEFAULT_SNPS_PER_BLOCK = 100
 
 
-# TODO(jonbjala) Check various files for duplicates?
-def process_phenotypes(fam_file: Union[str, pd.DataFrame], *,
-                       pheno_file: Union[str, pd.DataFrame]=None,
-                       sample_id_file: Union[str, pd.DataFrame]=None,
-                       covar_file: Union[str, pd.DataFrame]=None
-    ) -> Tuple[int, int, np.ndarray, pd.DataFrame, np.ndarray]:
-    """Performs processing related to raw phenotypes and sample IDs
+# Checks ===========================================================================================
 
-    Function to read in a fam file along with various optional files that are relevant to this
-    portion of the GRMA processing, including filtering by sample ID, overriding the fam phenotypes,
-    and residualizing the phenotype values on covariates.  There is also checking for missing/NaN
-    values.  No input file should contain any column name headers.
+def check_unique_ids(table: pd.DataFrame, name: str):
+    """Raises if any FID/IID pair appears more than once
+
+    Each sample must be identifiable by its IDs alone: a repeated pair would make every lookup by
+    ID ambiguous, and silently picking one of the rows could pair a phenotype with the wrong
+    genotypes.
 
     Args:
-        fam_file: String path to the fam file, or the Dataframe itself (already read in).  This
-            needs to contain the columns specified by Plink.
-            (see https://www.cog-genomics.org/plink/1.9/formats#fam)
-        pheno_file: String path to the pheno file, or the Dataframe itself (already read in).  This
-            needs to contain the columns for a simple, phenotype file as specified by Plink.
-            (see https://www.cog-genomics.org/plink/1.9/input#pheno)
-        sample_id_file: String path to the sample ID file, or the Dataframe itself (already read in)
-            This needs to contain two columns, FID and IID.
-        covar_file: String path to the sample ID file, or the Dataframe itself (already read in).  
-            This needs to contain two columns, FID and IID, along with N other columns (where N > 0)
-            that contain the covariate values to use for residualizing the phenotypes.
+        table: Any input with FID and IID columns
+        name: What the input is, for the error message
 
-    Returns:
-        A tuple (N_orig, N, sample_filter, fam_id_cols, phenotypes) where:
-
-            N_orig is the initial number of samples in the fam file
-            N is the final number of samples after intersecting with any of the
-                optional inputs (pheno file, sample ID file, covariates file) and dropping samples with 
-                NaN/missing values.
-            sample_filter is the list of numerical (values from 0 to N_orig-1) indices to use when
-                filtering, say, the values in the bed file by sample
-            fam_id_cols is what is left of the fam DataFrame after all the sample filtering is 
-                complete and the columns are restricted down to FID and IID
-            phenotypes is array of phenotypes not yet residualized on relatedness
+    Raises:
+        ValueError: Naming every repeated pair (capped as describe_offenders caps it)
     """
 
-    # Read in fam file and take note of starting number of samples (before any filtering)
-    fam_name = fam_file if isinstance(fam_file, str) else "fam file"
-    fam_df, fam_mi = get_df(fam_file, "fam_file", {"names" : FAM_COLS}, FAM_KEY)
-    fam_df = fam_df.reset_index(names=FAM_INDEX).set_index(FAM_KEY, drop=False)
-    N_orig = len(fam_df)
-    total_intersection = fam_mi.copy()
-    logging.info(f"\tThere are {N_orig} samples in {fam_name}")
-    logging.debug(f"\tThere are {len(total_intersection)} samples left in intersection\n")
+    repeated = table.duplicated(subset=SAMPLE_KEY, keep=False)
+    if repeated.any():
+        pairs = (table.loc[repeated, SAMPLE_FID_COL] + " " +
+                 table.loc[repeated, SAMPLE_IID_COL]).drop_duplicates()
+        raise ValueError(f"The {name} lists some samples more than once: "
+                         f"{grma_util.describe_offenders(pairs.tolist(), noun='sample(s)')}")
 
 
-    # Read in id_list file (if specified) and find intersection of sample IDs
-    _, sample_mi = get_df(sample_id_file, "sample_id_file",
-                          {"usecols" : (0,1), "names" : FAM_KEY}, FAM_KEY)
-    if sample_id_file is not None:
-        sample_name = sample_id_file if isinstance(sample_id_file, str) else "sample id file"
-        total_intersection = total_intersection.intersection(sample_mi)
-        logging.info(f"\tThere are {len(sample_mi)} samples in {sample_name}")
-        logging.debug(f"\tThere are {len(total_intersection)} samples left in intersection\n")
+# The sample table =================================================================================
 
+def build_sample_table(fam: pd.DataFrame, pheno: pd.DataFrame = None, covar: pd.DataFrame = None,
+                       id_list: pd.DataFrame = None) -> pd.DataFrame:
+    """One row per fam sample, saying where its genotypes are and whether it is in the analysis
 
-    # Read in phenotype file (if specified) and find intersection of sample IDs
-    pheno_df, pheno_mi = get_df(pheno_file, "pheno_file",
-                                {"names":[FAM_FID_COL, FAM_IID_COL, FAM_PHENO_COL]}, FAM_KEY)
-    if pheno_file is not None:
-        pheno_name = pheno_file if isinstance(pheno_file, str) else "phenotype file"
-        total_intersection = total_intersection.intersection(pheno_mi)
-        logging.info(f"\tThere are {len(pheno_mi)} samples in {pheno_name}")
-        logging.debug(f"\tThere are {len(total_intersection)} samples left in intersection\n")
+    The inputs are as grma_io's readers return them, so their IDs are already text.  Checks run in
+    order, and the first that fails raises, naming all of its own offenders: repeated IDs in each
+    input, then an empty analysis.
 
+    Args:
+        fam: grma_io.read_fam()'s result
+        pheno: grma_io.read_pheno()'s result, or None to use the fam file's phenotypes.  Where
+            given, it is the only source: a sample it does not list has no phenotype.
+        covar: grma_io.read_covar()'s result, or None.  A sample it does not list, or for which
+            any covariate is missing, is not in the analysis.
+        id_list: grma_io.read_id_list()'s result, or None.  Where given, only samples it lists can
+            be in the analysis.
 
-    # Read in covariates file (if specified) and find intersection of sample IDs
-    covar_df, _ = get_df(covar_file, "covar_file")
-    if covar_file is not None:
-        covar_name = covar_file if isinstance(covar_file, str) else "covariates file"
-        n_covars = covar_df.shape[1] - 2 # Since there should be two initial columns, FID and IID
-        if n_covars < 1:
-            raise ValueError(f"Covariates file should contain at least 3 columns")
-        if covar_df.iloc[:, 2:].isna().values.any():
-            num_orig_covar_rows = len(covar_df)
-            logging.info(f"\tThere are {num_orig_covar_rows} samples in {covar_name}")
-            covar_df = covar_df[covar_df.iloc[:, 2:].notna().all(axis=1)]
-            num_nan_rows = num_orig_covar_rows - len(covar_df)
-            logging.warning(f"Covariates file contains NaN values.  Dropped {num_nan_rows} samples.\n")
-        covar_df.columns = FAM_KEY + [f"COVAR_{i+1}" for i in range(n_covars)]
-        covar_mi = pd.MultiIndex.from_frame(covar_df[FAM_KEY])
+    Raises:
+        ValueError: If any input repeats a sample, or no sample is left in the analysis
 
-        total_intersection = total_intersection.intersection(covar_mi)
-        logging.info(f"\tThere are {len(covar_mi)} (non-NaN-containing) samples in {covar_name}")
-        logging.debug(f"\tThere are {len(total_intersection)} samples left in intersection\n")
+    Returns:
+        One row per fam sample, in fam order: SAMPLE_FID_COL, SAMPLE_IID_COL, SAMPLE_BED_COL,
+        SAMPLE_SEX_COL, SAMPLE_PHENO_COL, the covariates (COVAR_1 ... where covar is given),
+        SAMPLE_HAS_PHENO_COL and SAMPLE_IN_ANALYSIS_COL
+    """
 
+    for table, name in ((fam, "fam file"), (pheno, "phenotype file"), (covar, "covariate file"),
+                        (id_list, "ID list")):
+        if table is not None:
+            check_unique_ids(table, name)
 
-    # Restrict down to the intersection of available samples
-    if any(f is not None for f in (sample_id_file, pheno_file, covar_file)):
-        logging.info(f"\tThere are {len(total_intersection)} samples in the intermediate intersection")
-        if len(total_intersection) < N_orig:
-            logging.info(f"\tRestricting to these samples\n")
-            fam_df = fam_df.reindex(total_intersection)
-            fam_mi = total_intersection
+    samples = fam[SAMPLE_KEY].copy()
+    samples[SAMPLE_BED_COL] = np.arange(len(fam))
+    samples[SAMPLE_SEX_COL] = fam[bbf.FAM_SEX_COL].to_numpy()
+    keys = pd.MultiIndex.from_frame(samples[SAMPLE_KEY])
 
-    # Reassign the phenotype values to the ones from the phenotype file (override fam values)
-    if pheno_file is not None:
-        logging.info(f"\tExtracting phenotype values from the provided phenotype file")
-        pheno_s = pheno_df.set_index(FAM_KEY)[FAM_PHENO_COL]
-        fam_df[FAM_PHENO_COL] = pheno_s.reindex(fam_df.index).to_numpy()
-
-
-    # Drop any NaN / missing values
-    fam_df = fam_df.dropna(subset=[FAM_PHENO_COL])
-    num_nan = len(total_intersection) - len(fam_df)
-    if num_nan > 0:
-        logging.info(f"\tDropped {num_nan} samples with missing/NaN phenotype values.")
-    fam_mi = fam_df.index
-
-    # Residualize phenotypes on an intercept plus any covariates.  With no covariates this is
-    # centering on the mean, which matters: an affected sample's row of R is an identity row, so its
-    # phenotype passes through unchanged, and an uncentered one would make the betas depend on the
-    # phenotype's origin (notes §13.5)
-    design = np.ones((len(fam_df), 1))
-    if covar_file is not None:
-        logging.info(f"\tRunning regression to residualize phenotypes on covariates")
-        covar_df = covar_df.set_index(FAM_KEY, drop=False).reindex(fam_mi)
-        design = np.column_stack([covar_df.iloc[:, 2:].to_numpy(dtype=float), design])
+    if pheno is None:
+        samples[SAMPLE_PHENO_COL] = fam[bbf.FAM_PHENO_COL].to_numpy()
     else:
-        logging.info(f"\tCentering phenotypes on their mean")
+        by_id = pheno.set_index(SAMPLE_KEY)[bbf.FAM_PHENO_COL]
+        samples[SAMPLE_PHENO_COL] = by_id.reindex(keys).to_numpy()
+    samples[SAMPLE_HAS_PHENO_COL] = samples[SAMPLE_PHENO_COL].notna()
+    in_analysis = samples[SAMPLE_HAS_PHENO_COL].to_numpy().copy()
 
-    orig_phenotypes = fam_df[FAM_PHENO_COL].to_numpy(dtype=float)
-    x, _, _, _ = np.linalg.lstsq(a = design, b = orig_phenotypes, rcond = None)
-    fam_df[FAM_PHENO_COL] = orig_phenotypes - design @ x
+    if covar is not None:
+        covar_cols = [c for c in covar.columns if c not in SAMPLE_KEY]
+        aligned = covar.set_index(SAMPLE_KEY)[covar_cols].reindex(keys)
+        for column in covar_cols:
+            samples[column] = aligned[column].to_numpy()
+        in_analysis &= aligned.notna().all(axis=1).to_numpy()
+
+    if id_list is not None:
+        listed = pd.MultiIndex.from_frame(id_list[SAMPLE_KEY])
+        in_analysis &= keys.isin(listed)
+
+    samples[SAMPLE_IN_ANALYSIS_COL] = in_analysis
+
+    logging.info(f"\t{len(samples)} samples in the fam file; "
+                 f"{int(samples[SAMPLE_HAS_PHENO_COL].sum())} with a phenotype; "
+                 f"{int(in_analysis.sum())} in the analysis")
+
+    if not in_analysis.any():
+        raise ValueError("No sample is left in the analysis: none has a phenotype, complete "
+                         "covariates and (where an ID list is given) a place in the ID list")
+
+    return samples
 
 
-    # Make sure fam_df is in sorted order based on original index
-    fam_df = fam_df.sort_values(FAM_INDEX)
+# The relatedness graph ===========================================================================
 
-    # Grab the phenotype values and the final value for N
-    N = len(fam_df)
-    phenotypes = fam_df[FAM_PHENO_COL].to_numpy()
+def build_relatedness_graph(samples: pd.DataFrame, king: pd.DataFrame) -> pd.DataFrame:
+    """KING's pairs between samples, as sample table rows, each pair once
 
-    # Debug logging
-    sample_ids = fam_df[FAM_KEY].reset_index(drop=True)
-    logging.debug(f"\t{N_orig=} {N=} {len(sample_ids)=}")
+    Only pairs that can matter are kept: both samples must be in the fam file, the relationship
+    must be one GRMA uses, and at least one of the two must be in the analysis.  A pair between two
+    samples outside the analysis can never be used -- even a parent outside it matters only
+    through a child inside it -- so it is neither kept nor checked, and a contradiction between
+    two unused samples never stops a run.
 
-    return (N_orig, N, fam_df[FAM_INDEX].to_numpy(), sample_ids, phenotypes)
+    Checks, in order, the first failure raising with all of its offenders:
+        - an InfType KING does not define
+        - a sample paired with itself
+        - a pair given two different relationships, which cannot be resolved
+    A pair listed more than once with the SAME relationship -- in either order -- is kept once, with
+    a warning: the sparse matrices built from the graph would otherwise count it more than once.
+
+    Args:
+        samples: The sample table
+        king: grma_io.read_king()'s result
+
+    Raises:
+        ValueError: As above
+
+    Returns:
+        GRAPH_ROW1_COL, GRAPH_ROW2_COL (ROW_1 < ROW_2) and GRAPH_RELATIONSHIP_COL
+    """
+
+    rel = king[grma_io.KING_REL_COL].to_numpy()
+    unknown = sorted(set(rel) - set(INFTYPE_TO_RELATIONSHIP) - set(INFTYPES_IGNORED))
+    if unknown:
+        raise ValueError(f"The KING file has InfType values KING does not define: {unknown}")
+
+    keys = pd.MultiIndex.from_frame(samples[SAMPLE_KEY])
+    row1 = keys.get_indexer(pd.MultiIndex.from_arrays(
+        [king[grma_io.KING_FID1_COL], king[grma_io.KING_IID1_COL]]))
+    row2 = keys.get_indexer(pd.MultiIndex.from_arrays(
+        [king[grma_io.KING_FID2_COL], king[grma_io.KING_IID2_COL]]))
+
+    in_fam = (row1 != -1) & (row2 != -1)
+    if not in_fam.all():
+        logging.info(f"\t{int((~in_fam).sum())} KING pair(s) name a sample not in the fam file, "
+                     f"and are ignored")
+    used = np.isin(rel, list(INFTYPE_TO_RELATIONSHIP))
+    in_analysis = samples[SAMPLE_IN_ANALYSIS_COL].to_numpy()
+    keep = in_fam & used
+    keep[keep] = in_analysis[row1[keep]] | in_analysis[row2[keep]]
+
+    row1, row2, rel = row1[keep], row2[keep], rel[keep]
+    iids = samples[SAMPLE_IID_COL].to_numpy()
+
+    paired_with_self = row1 == row2
+    if paired_with_self.any():
+        raise ValueError(f"The KING file pairs some samples with themselves: "
+                         f"{grma_util.describe_offenders(iids[row1[paired_with_self]])}")
+
+    pairs = pd.DataFrame({GRAPH_ROW1_COL : np.minimum(row1, row2),
+                          GRAPH_ROW2_COL : np.maximum(row1, row2),
+                          GRAPH_RELATIONSHIP_COL : [INFTYPE_TO_RELATIONSHIP[r] for r in rel],
+                          grma_io.KING_REL_COL : rel})
+
+    by_pair = pairs.groupby([GRAPH_ROW1_COL, GRAPH_ROW2_COL])
+    labels_per_pair = by_pair[grma_io.KING_REL_COL].unique()
+    conflicting = labels_per_pair[labels_per_pair.map(len) > 1]
+    if len(conflicting) > 0:
+        details = [f"{iids[r1]}-{iids[r2]} ({', '.join(sorted(labels))})"
+                   for (r1, r2), labels in conflicting.items()]
+        raise ValueError(f"The KING file gives some pairs more than one relationship, which "
+                         f"cannot be resolved: "
+                         f"{grma_util.describe_offenders(details, noun='pair(s)')}.  KING writes "
+                         f"one row per pair, so this usually comes from combining files.")
+
+    repeated = pairs.duplicated(subset=[GRAPH_ROW1_COL, GRAPH_ROW2_COL]).to_numpy()
+    if repeated.any():
+        names = [f"{iids[r1]}-{iids[r2]}" for r1, r2 in
+                 zip(pairs[GRAPH_ROW1_COL][repeated], pairs[GRAPH_ROW2_COL][repeated])]
+        logging.warning(f"The KING file lists some pairs more than once, with the same "
+                        f"relationship; each is counted once: "
+                        f"{grma_util.describe_offenders(names, noun='pair(s)')}")
+
+    graph = pairs.loc[~repeated, [GRAPH_ROW1_COL, GRAPH_ROW2_COL, GRAPH_RELATIONSHIP_COL]]
+    logging.info(f"\tRelatedness graph: {len(graph)} pair(s); "
+                 f"{graph[GRAPH_RELATIONSHIP_COL].value_counts().to_dict()}")
+    return graph.reset_index(drop=True)
 
 
-# -------------------------
-def get_rel_report(rel_df: pd.DataFrame) -> str:
-    rel_counts = rel_df[KING_REL_COL].value_counts(sort=False).sort_index().to_dict()
-    return "{" + ", ".join(f"{deg}->{count}" for deg, count in rel_counts.items()) + "}"
+# Duplicate samples ===============================================================================
+
+def resolve_duplicates(samples: pd.DataFrame, graph: pd.DataFrame):
+    """Keeps one sample of each set of duplicates or MZ twins, and drops the rest
+
+    Duplicate pairs can chain (A-B and B-C), so this works on clusters: the connected components of
+    the duplicate pairs.  In each, the sample kept is the earliest in the fam file that is in the
+    analysis, or the earliest overall if none is.  The others are dropped: taken out of the
+    analysis, and every pair involving them is removed, so they are never used as a relative.
+    Each dropped sample records which was kept in its place, so that a parent named as a dropped
+    duplicate can be replaced by the one kept, whose genotypes are identical.
+
+    Args:
+        samples: The sample table
+        graph: build_relatedness_graph()'s result
+
+    Returns:
+        A tuple (samples, graph): the sample table with SAMPLE_DUPLICATE_OF_COL added and the
+        dropped samples out of the analysis; and the graph without duplicate pairs, without any
+        pair involving a dropped sample, and without any pair left with neither sample in the
+        analysis
+    """
+
+    samples = samples.copy()
+    num_samples = len(samples)
+    duplicate_of = np.full(num_samples, -1)
+
+    is_duplicate = (graph[GRAPH_RELATIONSHIP_COL] == RELATIONSHIP_DUPLICATE).to_numpy()
+    if is_duplicate.any():
+        r1 = graph[GRAPH_ROW1_COL].to_numpy()[is_duplicate]
+        r2 = graph[GRAPH_ROW2_COL].to_numpy()[is_duplicate]
+        links = sp.coo_array((np.ones(len(r1)), (r1, r2)), shape=(num_samples, num_samples))
+        _, labels = csgraph.connected_components(links, directed=False)
+
+        in_analysis = samples[SAMPLE_IN_ANALYSIS_COL].to_numpy()
+        for cluster in np.unique(labels[np.concatenate([r1, r2])]):
+            members = np.flatnonzero(labels == cluster)     # Ascending: fam order
+            eligible = members[in_analysis[members]]
+            kept = eligible[0] if eligible.size else members[0]
+            duplicate_of[members[members != kept]] = kept
+
+    dropped = duplicate_of != -1
+    samples[SAMPLE_DUPLICATE_OF_COL] = duplicate_of
+    samples.loc[dropped, SAMPLE_IN_ANALYSIS_COL] = False
+    if dropped.any():
+        logging.info(f"\t{int(dropped.sum())} duplicate sample(s) or MZ twin(s) dropped, one of "
+                     f"each set kept")
+        dropped_iids = samples.loc[dropped, SAMPLE_IID_COL].tolist()
+        logging.debug(f"\tDropped: {grma_util.describe_offenders(dropped_iids)}")
+
+    # Removing every pair that involves a dropped sample also removes every duplicate pair, since
+    # all but one sample of each cluster is dropped and a pair has two
+    r1 = graph[GRAPH_ROW1_COL].to_numpy()
+    r2 = graph[GRAPH_ROW2_COL].to_numpy()
+    in_analysis = samples[SAMPLE_IN_ANALYSIS_COL].to_numpy()
+    keep = ~dropped[r1] & ~dropped[r2] & (in_analysis[r1] | in_analysis[r2])
+    return samples, graph.loc[keep].reset_index(drop=True)
 
 
-def get_lambda_min(B: Union[np.ndarray, sp.csr_array], tol=DEFAULT_EIGSH_TOL) -> float:
+# Parents =========================================================================================
+
+def identify_parents(samples: pd.DataFrame, graph: pd.DataFrame,
+                     snipar_metadata: dict = None) -> pd.DataFrame:
+    """The children to be residualized against their parents, and who their parents are
+
+    Parents come from snipar's pedigree, since fam files rarely carry them.  The pedigree names
+    people by IID alone (its family IDs are snipar's own), so they are matched to the fam file by
+    IID.  A parent named as a dropped duplicate is replaced by the sample kept in its place.
+
+    Only children in the analysis are considered.  For each, checks run in order, the first failure
+    raising with all of its offenders:
+        - every IID the pedigree names must be unique in the fam file, or the match is ambiguous
+        - snipar's record of which parents it had genotypes for must agree with which parents are
+          in the fam file.  If they disagree, snipar was run on a different fileset, and its
+          imputed data would be misread: a parent counted twice, or treated as absent.
+        - every parent found must be a parent-offspring pair with the child in KING
+    Two genotyped parents of the same recorded sex are only warned about: which parent is which
+    does not affect the result, but a pedigree wrong in this way may be wrong in others.
+
+    Args:
+        samples: The sample table, after resolve_duplicates()
+        graph: The relatedness graph, after resolve_duplicates()
+        snipar_metadata: snipar_hdf5.read_snipar_metadata()'s result, or None without a snipar
+            file, in which case nobody has parents and a warning is logged
+
+    Raises:
+        ValueError: As above
+
+    Returns:
+        PARENTS_COLS, one row per child in the analysis with at least one parent genotyped, in
+        sample table order
+    """
+
+    empty = pd.DataFrame({column : np.array([], dtype=int) for column in PARENTS_COLS})
+    if snipar_metadata is None:
+        logging.warning("No imputed parental genotype file was given, so no parents are known "
+                        "and the parent-offspring regression is omitted")
+        return empty
+
+    pedigree = snipar_metadata[snipar_hdf5.SNIPAR_PEDIGREE_KEY]
+    ped_iids = pedigree[:, snipar_hdf5.SNIPAR_PED_IID_COL]
+    ped_fathers = pedigree[:, snipar_hdf5.SNIPAR_PED_FATHER_COL]
+    ped_mothers = pedigree[:, snipar_hdf5.SNIPAR_PED_MOTHER_COL]
+
+    iids = samples[SAMPLE_IID_COL].to_numpy()
+    in_analysis = samples[SAMPLE_IN_ANALYSIS_COL].to_numpy()
+    duplicate_of = samples[SAMPLE_DUPLICATE_OF_COL].to_numpy()
+
+    # Matching by IID is only safe where the IID names one sample.  Two unrelated samples may share
+    # an IID in different families, which matters only if the pedigree names that IID.
+    by_iid = pd.Series(np.arange(len(iids)), index=iids)
+    shared = set(by_iid.index[by_iid.index.duplicated(keep=False)])
+    named = set(ped_iids) | set(ped_fathers) | set(ped_mothers)
+    ambiguous = sorted(shared & named)
+    if ambiguous:
+        raise ValueError(f"The imputed parental genotype file names people by IID alone, but "
+                         f"some of the IIDs it names belong to more than one sample in the fam "
+                         f"file: {grma_util.describe_offenders(ambiguous)}")
+    by_iid = by_iid[~by_iid.index.duplicated(keep=False)]
+
+    def rows_of(ped_ids):
+        rows = by_iid.reindex(ped_ids).to_numpy()
+        return np.where(np.isnan(rows), -1, rows).astype(int)
+
+    def parent_rows_of(ped_ids):
+        # "0" means no parent, as in a fam file, even if some sample happens to have the IID "0".
+        # A parent dropped as a duplicate is replaced by the sample kept in its place.
+        rows = rows_of(ped_ids)
+        rows[ped_ids == bbf.FAM_MISSING_PARENT] = -1
+        replaced = (rows != -1) & (duplicate_of[np.maximum(rows, 0)] != -1)
+        rows[replaced] = duplicate_of[rows[replaced]]
+        return rows
+
+    # Children are NOT replaced: a child dropped as a duplicate is out of the analysis, and its
+    # kept twin has its own record
+    child = rows_of(ped_iids)
+    father = parent_rows_of(ped_fathers)
+    mother = parent_rows_of(ped_mothers)
+
+    considered = (child != -1)
+    considered[considered] = in_analysis[child[considered]]
+
+    def flag(column):
+        return np.char.lower(pedigree[:, column].astype(str)) == "true"
+    disagree = considered & ((flag(snipar_hdf5.SNIPAR_PED_HAS_FATHER_COL) != (father != -1)) |
+                             (flag(snipar_hdf5.SNIPAR_PED_HAS_MOTHER_COL) != (mother != -1)))
+    if disagree.any():
+        raise ValueError(f"The imputed parental genotype file and the fam file disagree about "
+                         f"which parents are genotyped, for "
+                         f"{grma_util.describe_offenders(ped_iids[disagree])}: snipar records "
+                         f"whether it had each parent's genotypes, and a different set of those "
+                         f"parents is in the fam file.  This happens when snipar was run on a "
+                         f"different fileset.  Run snipar's impute.py on the same fileset given "
+                         f"to GRMA.")
+
+    usable = considered & ((father != -1) | (mother != -1))
+    child, father, mother = child[usable], father[usable], mother[usable]
+    ped_iids_used = ped_iids[usable]
+
+    repeated = pd.Series(child).duplicated(keep=False).to_numpy()
+    if repeated.any():
+        raise ValueError(f"The imputed parental genotype file lists some children more than once: "
+                         f"{grma_util.describe_offenders(sorted(set(ped_iids_used[repeated])))}")
+
+    is_po = graph[GRAPH_RELATIONSHIP_COL] == RELATIONSHIP_PO
+    po_pairs = graph.loc[is_po, [GRAPH_ROW1_COL, GRAPH_ROW2_COL]]
+    po_pairs = set(zip(po_pairs[GRAPH_ROW1_COL], po_pairs[GRAPH_ROW2_COL]))
+    unconfirmed = []
+    for role, parent in (("father", father), ("mother", mother)):
+        for c, p in zip(child, parent):
+            if p != -1 and (min(c, p), max(c, p)) not in po_pairs:
+                unconfirmed.append(f"{iids[c]} ({role} {iids[p]})")
+    if unconfirmed:
+        raise ValueError(f"The imputed parental genotype file names parents that KING does not "
+                         f"classify as parent-offspring with the child: "
+                         f"{grma_util.describe_offenders(unconfirmed, noun='child(ren)')}")
+
+    sexes = samples[SAMPLE_SEX_COL].to_numpy()
+    both = (father != -1) & (mother != -1)
+    same_sex = both & np.isin(sexes[np.maximum(father, 0)], bbf.FAM_KNOWN_SEXES)
+    same_sex &= sexes[np.maximum(father, 0)] == sexes[np.maximum(mother, 0)]
+    if same_sex.any():
+        logging.warning(f"Two genotyped parents of the same recorded sex are named for "
+                        f"{grma_util.describe_offenders(iids[child[same_sex]])}.  Results are "
+                        f"unaffected, since which parent is which does not matter, but a pedigree "
+                        f"or a sex column wrong in this way may be wrong in others.")
+
+    families = snipar_metadata[snipar_hdf5.SNIPAR_FAMILIES_KEY]
+    family = pd.Index(families).get_indexer(
+        pedigree[usable, snipar_hdf5.SNIPAR_PED_FID_COL])
+
+    parents = pd.DataFrame({PARENTS_CHILD_COL : child, PARENTS_FATHER_COL : father,
+                            PARENTS_MOTHER_COL : mother, PARENTS_SNIPAR_FAMILY_COL : family})
+    parents = parents.sort_values(PARENTS_CHILD_COL).reset_index(drop=True)
+    logging.info(f"\t{len(parents)} child(ren) with at least one parent genotyped; "
+                 f"{int(both.sum())} with both")
+    return parents
+
+
+# Groups ==========================================================================================
+
+def assign_groups(samples: pd.DataFrame, graph: pd.DataFrame, parents: pd.DataFrame,
+                  rel_degree: int = MAX_REL_DEGREE) -> pd.DataFrame:
+    """Places each sample in the analysis in exactly one group, the first it qualifies for
+
+    In order: PO (a parent genotyped), FS, 2ND, 3RD (at least one such relative IN the analysis,
+    since residualizing against a relative needs their phenotype), else NOT_FOCAL.  rel_degree
+    cuts off the groups beyond it: those samples fall through to NOT_FOCAL.
+
+    Args:
+        samples: The sample table, after resolve_duplicates()
+        graph: The relatedness graph, after resolve_duplicates()
+        parents: identify_parents()'s result
+        rel_degree: The highest relationship degree to run a regression for, 0 to MAX_REL_DEGREE
+
+    Raises:
+        ValueError: If rel_degree is out of range
+
+    Returns:
+        The sample table with SAMPLE_GROUP_COL added: a group for every sample in the analysis,
+        None for every other
+    """
+
+    if not 0 <= rel_degree <= MAX_REL_DEGREE:
+        raise ValueError(f"The relatedness degree must be between 0 and {MAX_REL_DEGREE}, "
+                         f"but is {rel_degree}")
+
+    samples = samples.copy()
+    in_analysis = samples[SAMPLE_IN_ANALYSIS_COL].to_numpy()
+    r1 = graph[GRAPH_ROW1_COL].to_numpy()
+    r2 = graph[GRAPH_ROW2_COL].to_numpy()
+    relationship = graph[GRAPH_RELATIONSHIP_COL].to_numpy()
+
+    def has_relative_in_analysis(wanted):
+        result = np.zeros(len(samples), dtype=bool)
+        related = relationship == wanted
+        result[r1[related & in_analysis[r2]]] = True
+        result[r2[related & in_analysis[r1]]] = True
+        return result
+
+    group = np.full(len(samples), None, dtype=object)
+    unassigned = in_analysis.copy()
+
+    has_parent = np.zeros(len(samples), dtype=bool)
+    has_parent[parents[PARENTS_CHILD_COL].to_numpy()] = True
+    for name, qualifies in ((GROUP_PO, has_parent),
+                            (GROUP_FS, has_relative_in_analysis(RELATIONSHIP_FS)),
+                            (GROUP_2ND, has_relative_in_analysis(RELATIONSHIP_2ND)),
+                            (GROUP_3RD, has_relative_in_analysis(RELATIONSHIP_3RD))):
+        if rel_degree < GROUP_MIN_REL_DEGREE.get(name, 0):
+            continue
+        joining = unassigned & qualifies
+        group[joining] = name
+        unassigned &= ~joining
+    group[unassigned] = GROUP_NOT_FOCAL
+
+    # Kept as plain objects: pandas would otherwise turn this text column into its own string type,
+    # which stores None as NaN and breaks the "None outside the analysis" sentinel
+    samples[SAMPLE_GROUP_COL] = pd.Series(group, index=samples.index, dtype=object)
+    logging.info(f"\tGroups: {pd.Series(group[in_analysis]).value_counts().to_dict()}")
+    return samples
+
+
+# Omega ===========================================================================================
+
+def select_omega_sample(samples: pd.DataFrame, parents: pd.DataFrame) -> pd.DataFrame:
+    """Chooses the samples Omega covers, and gives each its position in it
+
+    Omega covers every sample in the analysis that some regression uses: each focal sample (any
+    group but NOT_FOCAL), and each genotyped parent of a child in the PO regression.  Parents count
+    because their genotypes enter their children's residuals, and because the PO covariance is
+    estimated from parent-child pairs.  A relative used in a sibling, 2nd- or 3rd-degree
+    residualization needs no separate rule: having a relative of that degree in the analysis makes
+    them focal in some group themselves.  Everyone else in the analysis -- a sample related to
+    nobody, for instance -- is left out, so that they affect neither Omega's variance nor the
+    phenotypes' centering.
+
+    Args:
+        samples: The sample table, after assign_groups()
+        parents: identify_parents()'s result
+
+    Raises:
+        ValueError: If no sample is used by any regression
+
+    Returns:
+        The sample table with SAMPLE_OMEGA_IDX_COL added: 0, 1, 2 ... in sample table order for the
+        samples in Omega, -1 for every other
+    """
+
+    samples = samples.copy()
+    in_analysis = samples[SAMPLE_IN_ANALYSIS_COL].to_numpy()
+    group = samples[SAMPLE_GROUP_COL].to_numpy()
+    focal = np.array([g is not None and g != GROUP_NOT_FOCAL for g in group])
+
+    is_parent = np.zeros(len(samples), dtype=bool)
+    for column in (PARENTS_FATHER_COL, PARENTS_MOTHER_COL):
+        rows = parents[column].to_numpy()
+        is_parent[rows[rows != -1]] = True
+
+    member = in_analysis & (focal | is_parent)
+    if not member.any():
+        raise ValueError("No sample is used by any regression: no sample in the analysis has a "
+                         "genotyped parent or a relative in the analysis")
+
+    omega_idx = np.full(len(samples), -1)
+    omega_idx[member] = np.arange(int(member.sum()))
+    samples[SAMPLE_OMEGA_IDX_COL] = omega_idx
+
+    logging.info(f"\tOmega covers {int(member.sum())} sample(s): "
+                 f"{int((member & focal).sum())} focal, {int((member & ~focal).sum())} used only "
+                 f"as parents; {int((in_analysis & ~member).sum())} sample(s) in the analysis are "
+                 f"used by no regression")
+    return samples
+
+
+def prepare_phenotypes(samples: pd.DataFrame) -> np.ndarray:
+    """The phenotypes of the samples in Omega, residualized on an intercept and any covariates
+
+    Done within Omega's samples only, so that samples no regression uses cannot shift the centering.
+    With no covariates this is centering on the mean.
+
+    Args:
+        samples: The sample table, after select_omega_sample()
+
+    Raises:
+        ValueError: If nothing is left to explain: every residualized phenotype is the same
+
+    Returns:
+        The residualized phenotypes, (omega samples,), in Omega order
+    """
+
+    in_omega = samples[SAMPLE_OMEGA_IDX_COL].to_numpy() != -1
+    phenotypes = samples.loc[in_omega, SAMPLE_PHENO_COL].to_numpy(dtype=float)
+    covar_cols = [c for c in samples.columns if str(c).startswith(grma_io.COVAR_PREFIX)]
+
+    design = np.column_stack([samples.loc[in_omega, covar_cols].to_numpy(dtype=float),
+                              np.ones(len(phenotypes))])
+    coefficients, _, _, _ = np.linalg.lstsq(design, phenotypes, rcond=None)
+    residualized = phenotypes - design @ coefficients
+
+    scale = max(float(np.abs(phenotypes).max()), 1.0)
+    if np.all(np.abs(residualized) <= 1e-12 * scale):
+        raise ValueError("Every phenotype in Omega is the same once the intercept and any "
+                         "covariates are accounted for, so there is nothing to estimate")
+    logging.info(f"\tPhenotypes residualized on an intercept"
+                 f"{f' and {len(covar_cols)} covariate(s)' if covar_cols else ''}, "
+                 f"within the {len(phenotypes)} samples in Omega")
+    return residualized
+
+
+def get_omega_pairs(samples: pd.DataFrame, graph: pd.DataFrame):
+    """The relatedness graph's pairs within Omega, as Omega positions
+
+    Every relationship in OMEGA_RELATIONSHIPS is kept, whatever rel_degree is: a relative beyond the
+    regressions' cut-off is still phenotypically correlated with samples in them.
+
+    Args:
+        samples: The sample table, after select_omega_sample()
+        graph: The relatedness graph, after resolve_duplicates()
+
+    Returns:
+        A tuple (first, second, relationship), each (pairs,): the two samples' Omega positions and
+        the pair's relationship
+    """
+
+    omega_idx = samples[SAMPLE_OMEGA_IDX_COL].to_numpy()
+    first = omega_idx[graph[GRAPH_ROW1_COL].to_numpy()]
+    second = omega_idx[graph[GRAPH_ROW2_COL].to_numpy()]
+    relationship = graph[GRAPH_RELATIONSHIP_COL].to_numpy()
+    keep = (first != -1) & (second != -1) & np.isin(relationship, OMEGA_RELATIONSHIPS)
+    return first[keep], second[keep], relationship[keep]
+
+
+def get_relationship_covariances(first: np.ndarray, second: np.ndarray, relationship: np.ndarray,
+                                 phenotypes: np.ndarray) -> dict:
+    """The phenotypic covariance for each relationship, from its pairs
+
+    For each relationship, the mean is taken over the DISTINCT samples in its pairs, each counted
+    once however many pairs they are in; the covariance is the average, over the pairs, of the
+    product of the two samples' deviations from that mean.  Dividing by the number of pairs rather
+    than one fewer: scaling Omega by a constant changes none of the estimates.
+
+    Args:
+        first, second: The pairs' Omega positions, each (pairs,)
+        relationship: Each pair's relationship, (pairs,)
+        phenotypes: The residualized phenotypes, (omega samples,)
+
+    Returns:
+        Relationship -> covariance, for each relationship that has at least one pair
+    """
+
+    covariances = {}
+    for r in OMEGA_RELATIONSHIPS:
+        of_r = relationship == r
+        if not of_r.any():
+            continue
+        members = np.unique(np.concatenate([first[of_r], second[of_r]]))
+        mean = phenotypes[members].mean()
+        covariances[r] = float(np.mean((phenotypes[first[of_r]] - mean) *
+                                       (phenotypes[second[of_r]] - mean)))
+    logging.debug(f"\tPhenotypic covariance by relationship: {covariances}")
+    return covariances
+
+
+def get_omega_components(first: np.ndarray, second: np.ndarray, num_samples: int) -> np.ndarray:
+    """Which connected component of Omega's off-diagonal each sample is in
+
+    Args:
+        first, second: The pairs' Omega positions, each (pairs,)
+        num_samples: The number of samples in Omega
+
+    Returns:
+        Each sample's component label, (omega samples,)
+    """
+
+    links = sp.coo_array((np.ones(len(first)), (first, second)), shape=(num_samples, num_samples))
+    _, labels = csgraph.connected_components(links, directed=False)
+    return labels
+
+
+def get_lambda_min(B: np.ndarray | sp.csr_array, tol=DEFAULT_EIGSH_TOL) -> float:
 
     N = B.shape[0]
 
@@ -499,1929 +883,883 @@ def get_block_alphas(off_diag: sp.csr_array, pheno_variance: float, labels: np.n
     return alphas
 
 
-def get_rel_covariances(rel_df: pd.DataFrame,
-                        unresidualized_phenotypes: np.ndarray) -> dict[int, float]:
-    rel_to_cov = {rel_deg : 
-        np.cov(unresidualized_phenotypes[np.concatenate([df_view[FAM_INDEX_1].to_numpy(np.int64),
-                                                         df_view[FAM_INDEX_2].to_numpy(np.int64)])],
-               unresidualized_phenotypes[np.concatenate([df_view[FAM_INDEX_2].to_numpy(np.int64),
-                                                         df_view[FAM_INDEX_1].to_numpy(np.int64)])],
-               ddof=0)[0, 1] if len(df_view) > 0 else np.nan
-                  for rel_deg in range(SE_RELATEDNESS+1)
-                  for df_view in [rel_df[rel_df[KING_REL_COL] == rel_deg]]}
+def build_omega(samples: pd.DataFrame, graph: pd.DataFrame, phenotypes: np.ndarray,
+                epsilon: float = DEFAULT_OMEGA_EPSILON) -> sp.csr_array:
+    """Omega: the phenotypic covariance among the samples in it, regularized once
 
-    logging.debug(f"\t{rel_to_cov=}\n")
-
-    return rel_to_cov
-
-
-# -------------------------
-def get_relatedness_components(rel_df: pd.DataFrame, N: int) -> np.ndarray:
-    """Assigns each sample to a connected component of the relatedness graph
-
-    Both the per-block shrinkage in calculate_omega() and the block-wise inversion in
-    calculate_gls_weights() need the same partition, and both must use omega's components rather
-    than R's.  Computing it once here makes that a single decision instead of a constraint two
-    functions have to independently honour.
-
-    The partition depends only on WHICH pairs exist, not on their covariances, so it is available
-    before any phenotype data is involved.
+    The diagonal is the residualized phenotypes' variance.  Each related pair's off-diagonal entry
+    is its relationship's covariance (get_relationship_covariances()); every other entry is zero.
+    Each connected component of the off-diagonal is then shrunk only as far as needed to keep it
+    positive definite (get_block_alphas()).  The one regularized Omega is used by every regression.
 
     Args:
-        rel_df: Relatedness pairs, mapped to sample indices and integer degrees
-        N: Number of samples
+        samples: The sample table, after select_omega_sample()
+        graph: The relatedness graph, after resolve_duplicates()
+        phenotypes: prepare_phenotypes()'s result, (omega samples,)
+        epsilon: The floor for Omega's smallest eigenvalue
 
     Returns:
-        Component index of each sample
+        Omega, (omega samples, omega samples)
     """
 
-    i1 = rel_df[FAM_INDEX_1].to_numpy(np.int64)
-    i2 = rel_df[FAM_INDEX_2].to_numpy(np.int64)
+    num_samples = len(phenotypes)
+    first, second, relationship = get_omega_pairs(samples, graph)
+    covariances = get_relationship_covariances(first, second, relationship, phenotypes)
 
-    adjacency = sp.coo_array((np.ones(2 * len(i1)),
-                              (np.concatenate([i1, i2]), np.concatenate([i2, i1]))),
-                             shape=(N, N)).tocsr()
+    values = np.array([covariances[r] for r in relationship], dtype=float)
+    off_diag = sp.coo_array((np.concatenate([values, values]),
+                             (np.concatenate([first, second]), np.concatenate([second, first]))),
+                            shape=(num_samples, num_samples)).tocsr()
 
-    n_components, labels = connected_components(adjacency, directed=False)
-    logging.debug(f"\t{n_components} connected components in the relatedness graph")
+    variance = float(np.var(phenotypes))
+    logging.info(f"\tOmega: {num_samples} samples, phenotypic variance {variance:.6g}, "
+                 f"{len(first)} related pair(s)")
 
-    return labels
+    labels = get_omega_components(first, second, num_samples)
+    alphas = get_block_alphas(off_diag, variance, labels, epsilon)
 
-
-# -------------------------
-def calculate_gls_weights(R: sp.csr_array, omega: sp.csr_array, labels: np.ndarray,
-                          epsilon=DEFAULT_OMEGA_EPSILON) -> sp.csr_array:
-    """Builds the GLS weight matrix
-
-    The regression weights observations by the inverse of their covariance, so that correlated
-    relatives -- whose observations overlap and therefore carry less independent information than
-    the same number of unrelated people -- are discounted accordingly.  The covariance of the
-    residualized phenotypes is R @ omega @ R.T, and the weight is its pseudo-inverse.
-
-    A pseudo-inverse rather than an inverse because R is rank-deficient, so that product is
-    singular by construction.  It is the correct object rather than a workaround: since omega is
-    positive definite, the product's range equals R's, and the regressor is itself R-residualized
-    and therefore lies within it -- which is the condition under which pseudo-inverse GLS is the
-    best linear unbiased estimator rather than an approximation.
-
-    The inversion is done block by block.  R and omega are both block diagonal over the
-    relatedness components, so their product is too, and the pseudo-inverse of a block diagonal
-    matrix is the block diagonal matrix of pseudo-inverses -- exactly, not approximately.  That
-    keeps the result as sparse as the input, where a dense inverse would be unusable at scale.
-
-    Note that where every pair within a component shares one relatedness degree, R @ omega @ R.T
-    reduces to a scalar multiple of R, its pseudo-inverse weights every direction equally, and
-    the estimates coincide exactly with ordinary least squares.  The weighting only does work
-    where a component contains pairs at differing degrees.
-
-    Args:
-        R: The residualization matrix
-        omega: The phenotypic covariance matrix, already shrunk
-        labels: Component index of each sample, from get_relatedness_components()
-        epsilon: Smallest eigenvalue omega was shrunk to retain
-
-    Returns:
-        The GLS weight matrix, block diagonal over the relatedness components
-    """
-
-    resid_pheno_cov = R @ omega @ R.T
-
-    N = R.shape[0]
-    n_components = labels.max() + 1 if len(labels) > 0 else 0
-
-    # No components means no samples, and the assembly below cannot concatenate an empty list of
-    # blocks.  Returning here keeps that from being a crash.
-    if n_components == 0:
-        return sp.csr_array((N, N))
-
-    order = np.argsort(labels, kind="stable")
-    starts = np.searchsorted(labels[order], np.arange(n_components))
-    ends = np.searchsorted(labels[order], np.arange(n_components), side="right")
-
-    rows, cols, data = [], [], []
-    for component in range(n_components):
-        idx = order[starts[component]:ends[component]]
-        block = resid_pheno_cov[idx][:, idx].toarray()
-
-        # The cutoff below which a direction is treated as null space.  R makes every block
-        # singular by construction (each group's mean direction is removed), and in floating
-        # point those zero eigenvalues come out as rounding noise of order (block size) x eps x
-        # the largest singular value.  numpy's default cutoff is a FIXED 1e-15 of the largest, so
-        # from a few hundred samples per block the noise exceeds it and is inverted rather than
-        # discarded, giving weights around 1e14, silently (notes §8.10).  This cutoff scales with
-        # the block, as the noise does -- it is what numpy 2's rtol=None computes, written out so
-        # that numpy 1 works too.
-        #
-        # Not to be confused with the explicit cutoff tried and removed earlier, which was relative
-        # to epsilon, an absolute value: that drove rcond to 1.0 for any block whose largest entry
-        # fell below epsilon, discarding every direction.  This one is relative to the block's own
-        # largest singular value and stays far below 1 for any block that could exist.
-        block_pinv = np.linalg.pinv(block, rcond=max(block.shape) * np.finfo(float).eps)
-
-        nonzero = np.nonzero(block_pinv)
-        rows.append(idx[nonzero[0]])
-        cols.append(idx[nonzero[1]])
-        data.append(block_pinv[nonzero])
-
-
-    gls_weights = sp.coo_array((np.concatenate(data),
-                                (np.concatenate(rows), np.concatenate(cols))),
-                               shape=(N, N)).tocsr()
-
-    logging.debug(f"\tGLS weight matrix has {gls_weights.nnz} nonzeros over "
-                  f"{n_components} components")
-
-    return gls_weights
-
-
-# -------------------------
-def calculate_gls_estimates(genotypes: np.ndarray, gls_weights: sp.csr_array,
-                            weighted_phenotypes: np.ndarray
-                            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Calculates the GLS effect estimates and their standard errors
-
-    Betas and standard errors share their expensive term, so they are produced together rather
-    than by separate functions that would each have to compute it.
-
-    A SNP carrying no information -- monomorphic, entirely missing, or residualized away to
-    nothing -- yields XtWX = 0, hence a NaN beta and an infinite standard error.  Both are left
-    as they are rather than substituted: an infinite standard error means zero weight in any
-    downstream inverse-variance weighting, which is the safe direction to fail in.
-
-    Args:
-        genotypes: Residualized genotypes for this block, (snps, samples)
-        gls_weights: The GLS weight matrix
-        weighted_phenotypes: gls_weights @ resid_phenotypes, computed once outside the block loop
-
-    Returns:
-        A tuple (betas, ses, XtWX)
-    """
-
-    weighted_genotypes = gls_weights @ genotypes.T
-    XtWX = np.einsum('ij,ij->j', weighted_genotypes, genotypes.T)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        betas = np.einsum('ij,j->i', genotypes, weighted_phenotypes) / XtWX
-        ses = np.reciprocal(np.sqrt(XtWX))
-
-    return betas, ses, XtWX
-
-def calculate_omega(rel_df: pd.DataFrame, N: int, unresidualized_phenotypes: np.ndarray,
-                    labels: np.ndarray, epsilon=DEFAULT_OMEGA_EPSILON) -> sp.csr_array:
-
-    rel_to_cov = get_rel_covariances(rel_df=rel_df,
-                                     unresidualized_phenotypes=unresidualized_phenotypes)
-
-
-    i1 = rel_df[FAM_INDEX_1].to_numpy(np.int64)
-    i2 = rel_df[FAM_INDEX_2].to_numpy(np.int64)
-    rel = rel_df[KING_REL_COL]
-
-    rows = np.concatenate([i1, i2])
-    cols = np.concatenate([i2, i1])
-    data = np.tile(rel.map(rel_to_cov).to_numpy(), 2)
-
-    # get_rel_covariances() returns NaN for any degree with no pairs, so a degree present in
-    # rel_df but absent from rel_to_cov maps to NaN here.  That should be unreachable (rel_df is
-    # filtered to <= SE_RELATEDNESS before this point, and rel_to_cov is keyed over that same
-    # range), but it must not pass silently: the Gershgorin screen in get_block_alphas() compares
-    # against a row sum, and every comparison against NaN is False, so a NaN block would fail the
-    # candidate test, keep alpha=1 without an eigendecomposition, and propagate NaN into omega.
-    if not np.all(np.isfinite(data)):
-        bad_degrees = sorted(rel[~np.isfinite(rel.map(rel_to_cov))].unique())
-        raise ValueError(f"No covariance could be computed for relatedness degree(s) "
-                         f"{bad_degrees}, which are present in the relatedness data.  This "
-                         f"would silently produce a NaN omega.")
-
-    off_diag = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
-
-    pheno_variance = np.var(unresidualized_phenotypes)
-    logging.debug(f"\t{pheno_variance=}")
-
-    alphas = get_block_alphas(off_diag, pheno_variance, labels, epsilon)
-
-    # Scale each entry by the alpha of the component it belongs to.  Both members of a pair are in
-    # the same component by construction, so a nonzero's column index identifies its component
-    # just as well as its row index does.
+    # Both members of a pair are in the same component, so an entry's column identifies its
+    # component as well as its row does
     off_diag.data *= alphas[labels[off_diag.indices]]
+    return sp.csr_array(variance * sp.eye_array(num_samples) + off_diag)
 
-    omega = pheno_variance * sp.eye(N) + off_diag
 
-    return omega
+# Regressions: the plan ===========================================================================
 
-
-# -------------------------
-def empty_parental_sources() -> ParentalSources:
-    """
-    Returns a ParentalSources describing no affected individuals, so that callers need not
-    distinguish "no parental residualization was requested" from "parental residualization was
-    requested but applied to nobody".
-    """
-
-    return ParentalSources(affected_samples=np.array([], dtype=np.int64),
-                           observed_parent_cols=np.empty((0, 2), dtype=np.int64),
-                           imputed_rows=None,
-                           imputed_file=None,
-                           snipar_metadata=None)
-
-
-# -------------------------
-def as_id_strings(df: pd.DataFrame, columns: list) -> pd.DataFrame:
-    """
-    Returns a copy of the given columns with every value as a string.
-
-    Pandas infers the dtype of each column when reading, so a fam file whose IDs happen to be
-    purely numeric yields int64 where one with alphanumeric IDs yields str.  Comparisons then
-    behave differently between the two: 0 == "0" is False, so a missing-parent test written
-    against the string marker would treat every row of a numeric file as listing both parents.
-    The same inference applies to FID and IID, so sample matching is exposed as well.
-
-    Forcing the dtype at read time is not sufficient, because a DataFrame passed directly into
-    GRMA (as the tests do) never goes through read_csv at all.
-
-    Args:
-        df: Frame containing the columns
-        columns: Names of the columns to convert
-
-    Returns:
-        The requested columns, as strings
-    """
-
-    return df[columns].astype(str)
-
-
-# -------------------------
-def describe_offenders(ids, noun: str = "individual(s)",
-                       limit: int = MAX_REPORTED_OFFENDERS) -> str:
-    """Summarises a list of offending identifiers for an error message
-
-    The count comes first because it is what distinguishes a handful of data entry errors from
-    something systematic, and the list is capped because a systematic problem can name every
-    individual in the cohort -- which is unreadable in a terminal and unhelpful in a log.
-
-    Args:
-        ids: The offending identifiers, as any sequence.  They are rendered as plain strings, so
-            that a numpy array of them does not print its element type alongside each one
-        noun: What they are, so that the result reads as a phrase
-        limit: How many to name before summarising the rest
-
-    Returns:
-        A string naming how many there are and up to limit of them.  Where there are more
-        than limit, which ones are named is arbitrary
-    """
-
-    count = len(ids)
-    if count <= limit:
-        return f"{count} {noun}: {sorted(str(identifier) for identifier in ids)}"
-
-    # Take the sample before sorting rather than after.  Sorting the whole list to show ten of
-    # them would be the expensive part of handling an error, and the cohort-sized case is exactly
-    # the one worth not making slow.  The ten are therefore arbitrary rather than the first ten
-    # in order, which is fine for examples.
-    sample = sorted(str(identifier) for identifier in ids[:limit])
-
-    # Built by hand rather than from the list's own repr, so that it can be left visibly open:
-    # a list printed whole reads as the full set whatever the wording in front of it says.
-    named = ", ".join(repr(identifier) for identifier in sample)
-
-    return f"{count} {noun}, including: [{named}, ...]"
-
-# -------------------------
-def validate_pedigree_sanity(candidates: pd.DataFrame):
-    """Checks the fam file's parental ID columns for a malformed pedigree
-
-    All conditions are fatal: each means the input is wrong rather than merely incomplete, and
-    detecting bad input cheaply is preferable to producing results that are quietly wrong.  All
-    offending IDs are reported, since the user will want to fix them in one pass.
-
-    Args:
-        candidates: Rows of the fam file that list both parents, with ID columns as strings
-
-    Raises:
-        ValueError: If any malformed condition is found
-    """
-
-    self_referential = candidates[(candidates[FAM_IID_COL] == candidates[FAM_IIDF_COL]) |
-                                  (candidates[FAM_IID_COL] == candidates[FAM_IIDM_COL])]
-    if len(self_referential) > 0:
-         raise ValueError(f"The fam file lists "
-                         f"{describe_offenders(self_referential[FAM_IID_COL])} as their own "
-                         f"parent")
-
-    # Rows where both parents are absent are not a pedigree error, and callers are not relied on
-    # to have filtered them out.  Note this catches only PLINK's marker: a file using something
-    # else for "no parent here" will arrive with those rows looking like real IDs, which is what
-    # the error below mentions.
-    both_parents_absent = ((candidates[FAM_IIDF_COL] == FAM_MISSING_PARENT) &
-                           (candidates[FAM_IIDM_COL] == FAM_MISSING_PARENT))
-
-    identical_parents = candidates[~both_parents_absent &
-                                   (candidates[FAM_IIDF_COL] == candidates[FAM_IIDM_COL])]
-    if len(identical_parents) > 0:
-        raise ValueError(f"The fam file lists the same individual as both parents of "
-                         f"{describe_offenders(identical_parents[FAM_IID_COL])}.  Note that GRMA "
-                         f"treats \"{FAM_MISSING_PARENT}\" as meaning a parent is absent; a file "
-                         f"using something else for that would reach this check with those rows "
-                         f"looking like real IDs.")
-
-
-# -------------------------
-def validate_parent_sexes(full_fam_df: pd.DataFrame, candidates: pd.DataFrame,
-                          father_pos: np.ndarray, mother_pos: np.ndarray):
-    """Confirms that no individual has two genetic parents of the same recorded sex
-
-    This is a data-quality signal rather than a correctness issue, and so warns rather than
-    stopping the run.  The parental mean is symmetric in the two parents, so mislabelling which is
-    which changes no result -- but two same-sex genetic parents mean the pedigree or the sex
-    coding is wrong, which probably affects other things too.  The other pedigree checks are fatal
-    because what they catch has no sensible reading at all; this one has.
-
-    A trio where either parent's sex is unknown cannot be checked at all, which is common: GRMA
-    does not otherwise use the sex column, and many fam files leave it unpopulated.  Those are
-    reported as a count rather than silently passed over, since silence would otherwise mean both
-    "checked and fine" and "could not be checked".
-
-    Args:
-        full_fam_df: The unfiltered fam file
-        candidates: Rows of the fam file that list both parents
-        father_pos: Positions of their fathers in full_fam_df, -1 where not genotyped
-        mother_pos: Positions of their mothers in full_fam_df, -1 where not genotyped
-
-    """
-
-    sexes = full_fam_df[FAM_SEX_COL].astype(str).to_numpy()
-    both_genotyped = (father_pos != -1) & (mother_pos != -1)
-
-    father_sex = np.where(both_genotyped, sexes[father_pos], FAM_UNKNOWN_SEX)
-    mother_sex = np.where(both_genotyped, sexes[mother_pos], FAM_UNKNOWN_SEX)
-
-    known = np.isin(father_sex, FAM_KNOWN_SEXES) & np.isin(mother_sex, FAM_KNOWN_SEXES)
-
-    # Saying nothing would mean two different things at once -- that the check passed, and that
-    # it could not run -- and the user has no way to tell which they got.  One line covers it
-    # however many there are.
-    unchecked = both_genotyped & ~known
-    if np.any(unchecked):
-        logging.info(f"\t\tSex is not recorded for one or both parents of "
-                     f"{describe_offenders(candidates[FAM_IID_COL].to_numpy()[unchecked])}, so "
-                     f"they could not be checked for same-sex parents")
-
-    same_sex = known & (father_sex == mother_sex)
-    if np.any(same_sex):
-        logging.warning(f"The fam file lists two parents of the same recorded sex as the genetic "
-                        f"parents of "
-                        f"{describe_offenders(candidates[FAM_IID_COL].to_numpy()[same_sex])}.  "
-                        f"Results are unaffected -- the parental mean is symmetric in the two "
-                        f"parents -- but a pedigree or a sex column wrong in this way may well "
-                        f"be wrong in others.")
-
-
-# -------------------------
-def validate_parents_against_king(iids: np.ndarray, child_pos: np.ndarray,
-                                  father_pos: np.ndarray, mother_pos: np.ndarray,
-                                  usable: np.ndarray, rel_df: pd.DataFrame,
-                                  source: str = "the fam file"):
-    """Confirms that every stated parent-child relationship is classified as PO by KING
-
-    Used by both parental processing branches, since a contradicted pedigree is the same class of
-    error whichever file asserted it.  The fam file and snipar's pedigree are potentially
-    independent artifacts -- a user may have received one from a collaborator and produced the
-    other themselves -- so agreement between either and KING is real evidence rather than a
-    restatement.
-
-    A pair KING classifies as something else is a contradiction.  So is a pair KING does not
-    mention at all: KING reports the relationships it detects, so the absence of a
-    parent-offspring pair means it did not detect one.  Both kill the run, and every offending
-    pair is collected before raising so the user can fix them in one pass.
-
-    Only relationships that will actually be used are checked.  Both sources describe individuals
-    beyond those contributing to this analysis, and failing over a pedigree error involving
-    someone who affects no result would be unhelpful.
-
-    Args:
-        iids: Individual IDs, for the error message
-        child_pos: Positions in the whole fam file of those individuals, -1 where not a sample
-        father_pos: Positions in the whole fam file of their fathers, -1 where not genotyped
-        mother_pos: Positions in the whole fam file of their mothers, -1 where not genotyped
-        usable: Which entries will actually be used
-        rel_df: Relatedness pairs, as positions in the SAME whole fam file -- comparing them with
-            the analysis sample's positions instead was notes §13.1
-        source: Where the relationships came from, for the error message
-
-    Raises:
-        ValueError: If any stated relationship is contradicted by KING
-    """
-
-    # Keyed both ways round, since the stated direction (child to parent) need not match the
-    # order in which KING recorded the pair
-    po_df = rel_df[rel_df[KING_REL_COL] == DEG_PARENT_OFFSPRING]
-    king_po_pairs = set(zip(po_df[FAM_INDEX_1], po_df[FAM_INDEX_2]))
-    king_po_pairs |= set(zip(po_df[FAM_INDEX_2], po_df[FAM_INDEX_1]))
-
-    contradicted = []
-    for row in np.flatnonzero(usable):
-        for parent_pos, label in ((father_pos[row], "father"), (mother_pos[row], "mother")):
-            # A parent that was not genotyped states no relationship KING could confirm
-            if parent_pos == -1:
-                continue
-            if (child_pos[row], parent_pos) not in king_po_pairs:
-                contradicted.append(f"{iids[row]} ({label})")
-
-    if contradicted:
-        raise ValueError(f"{source} states parent-offspring relationships that the KING data does "
-                         f"not confirm.  KING either classifies these pairs as something other "
-                         f"than parent-offspring, or does not report them at all, which means it "
-                         f"did not detect the relationship.  Affected: "
-                         f"{describe_offenders(contradicted, noun='relationship(s)')}")
-
-
-# -------------------------
-def determine_fam_file_trios(full_fam_df: pd.DataFrame, fam_df: pd.DataFrame,
-                             rel_df: pd.DataFrame) -> ParentalSources:
-    """Identifies full trios from the fam file's parental ID columns
-
-    The ORIGINAL fam file is read rather than the already-filtered frame, for two reasons: the
-    parental ID columns do not survive process_phenotypes(), and a parent dropped for a missing
-    phenotype still has genotypes that are usable here.  An individual must be in the analysis
-    sample to be affected, but their parents need not be.
-
-    A listed parent who is not a sample in the fam file simply means that individual is not a full
-    trio, and ordinary within-group residualization continues to apply to them.  A listed parent
-    who IS a sample but whom KING does not classify as parent-offspring is a contradiction between
-    the two inputs, and kills the run.
-
-    Args:
-        full_fam_df: The whole fam file, UNFILTERED, as read by process_relatedness() with every
-            column as text
-        fam_df: The already-filtered sample IDs, as returned by process_phenotypes()
-        rel_df: Relatedness pairs, as positions in the WHOLE fam file (full_fam_df), with
-            integer degrees -- see map_king_to_fam_positions().  Not the analysis sample's
-            positions: a parent filtered out of the analysis must keep their pairs (notes §13.1)
-
-    Returns:
-        A ParentalSources describing the full trios found
-
-    Raises:
-        ValueError: On a malformed pedigree, or a stated parent contradicted by KING
-    """
-
-    logging.info("\tDetermining trios from the fam file's parental ID columns")
-
-    id_cols = [FAM_FID_COL, FAM_IID_COL, FAM_IIDF_COL, FAM_IIDM_COL]
-    full_fam_ids = as_id_strings(full_fam_df, id_cols)
-
-    has_father = full_fam_ids[FAM_IIDF_COL] != FAM_MISSING_PARENT
-    has_mother = full_fam_ids[FAM_IIDM_COL] != FAM_MISSING_PARENT
-    candidates = full_fam_ids[has_father & has_mother]
-
-    logging.info(f"\t\t{len(candidates)} individual(s) list both parents in the fam file")
-    if len(candidates) == 0:
-        return empty_parental_sources()
-
-    validate_pedigree_sanity(candidates)
-
-    # Parental IDs are within-family, so a parent's key is (this row's FID, the parental ID)
-    full_fam_mi = pd.MultiIndex.from_frame(full_fam_ids[FAM_KEY])
-    child_pos = full_fam_mi.get_indexer(pd.MultiIndex.from_frame(candidates[FAM_KEY]))
-    father_pos = full_fam_mi.get_indexer(
-        pd.MultiIndex.from_arrays([candidates[FAM_FID_COL], candidates[FAM_IIDF_COL]]))
-    mother_pos = full_fam_mi.get_indexer(
-        pd.MultiIndex.from_arrays([candidates[FAM_FID_COL], candidates[FAM_IIDM_COL]]))
-
-    validate_parent_sexes(full_fam_df, candidates, father_pos, mother_pos)
-
-    # Only individuals in the analysis sample can be affected, though their parents need not be
-    analysis_mi = pd.MultiIndex.from_frame(as_id_strings(fam_df, FAM_KEY))
-    in_analysis = analysis_mi.get_indexer(pd.MultiIndex.from_frame(candidates[FAM_KEY])) != -1
-
-    genotyped_parents = (father_pos != -1) & (mother_pos != -1)
-    usable = in_analysis & genotyped_parents
-
-    logging.info(f"\t\t{int((in_analysis & ~genotyped_parents).sum())} not usable as trios "
-                 f"(a listed parent is not genotyped)")
-
-    validate_parents_against_king(iids=candidates[FAM_IID_COL].to_numpy(), child_pos=child_pos,
-                                  father_pos=father_pos, mother_pos=mother_pos, usable=usable,
-                                  rel_df=rel_df, source="The fam file")
-
-    logging.info(f"\t\t{int(usable.sum())} full trio(s) validated against KING")
-
-    if not np.any(usable):
-        return empty_parental_sources()
-
-    return ParentalSources(
-        affected_samples=child_pos[usable],
-        observed_parent_cols=np.column_stack([father_pos[usable], mother_pos[usable]]),
-        imputed_rows=None,
-        imputed_file=None,
-        snipar_metadata=None)
-
-# -------------------------
-def map_samples_to_imputed_families(pedigree: np.ndarray, families: np.ndarray,
-                                    full_fam_ids: pd.DataFrame
-                                    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Resolves each pedigree record to its parents' bed positions and its imputed row
-
-    snipar's pedigree supplies the relationships; the genotypes of any parent that WAS genotyped
-    still come from the bed file, so both have to be looked up.  Note families is sorted
-    lexicographically while pedigree is not, so the two must be matched by value rather than by
-    position.
-
-    Args:
-        pedigree: (n, 6) snipar pedigree records, header row already removed
-        families: (f,) family IDs, indexing the rows of the imputed parental genotype arrays
-        full_fam_ids: The unfiltered fam file's ID columns, as strings
-
-    Returns:
-        A tuple (child_pos, parent_pos, imputed_rows) of (n,), (n, 2) and (n,) arrays holding
-        positions into the unfiltered fam file and into the imputed arrays, with -1 wherever
-        there is no match
-
-    Raises:
-        ValueError: If the fam file repeats an IID that the pedigree refers to
-    """
-
-    # snipar records relationships by IID alone rather than by FID and IID together, so a repeated
-    # IID is ambiguous -- but only where the pedigree actually refers to it.  Two unrelated
-    # samples sharing an IID under different FIDs have nothing to do with the families snipar
-    # imputed for, and should not stop the run.
-    positions = pd.Series(np.arange(len(full_fam_ids)), index=full_fam_ids[FAM_IID_COL])
-    ambiguous = positions.index.duplicated(keep=False)
-
-    referenced = (set(pedigree[:, SNIPAR_PED_IID_COL]) |
-                  set(pedigree[:, SNIPAR_PED_FATHER_COL]) |
-                  set(pedigree[:, SNIPAR_PED_MOTHER_COL]))
-    clashing = sorted(set(positions.index[ambiguous]) & referenced)
-    if clashing:
-        raise ValueError(f"The imputed parental genotype file records relationships by IID alone, "
-                         f"so an IID appearing more than once in the fam file cannot be resolved. "
-                         f"The fam file repeats {describe_offenders(clashing, noun='IID(s)')} that "
-                         f"the file's pedigree refers to.")
-
-    # The guard above means no ambiguous IID is ever looked up, so this only has to leave them
-    # out of the way.  Dropping every copy rather than keeping the first is belt and braces: if
-    # the guard were ever loosened, resolving to nothing is the safer failure.
-    positions = positions[~ambiguous]
-
-    def resolve(column):
-        return positions.reindex(pedigree[:, column]).fillna(-1).astype(np.int64).to_numpy()
-
-    child_pos = resolve(SNIPAR_PED_IID_COL)
-    parent_pos = np.column_stack([resolve(SNIPAR_PED_FATHER_COL),
-                                  resolve(SNIPAR_PED_MOTHER_COL)])
-
-    # families is snipar's own list and is unique by construction, so it needs no such care
-    imputed_rows = pd.Index(families).get_indexer(pedigree[:, SNIPAR_PED_FID_COL])
-
-    return child_pos, parent_pos, imputed_rows
-
-# -------------------------
-def process_imputed_parents(imputed_parental_file: str, full_fam_df: pd.DataFrame,
-                            fam_df: pd.DataFrame, rel_df: pd.DataFrame) -> ParentalSources:
-    """Identifies the individuals whose genotypes can be residualized against their parents,
-    using snipar's imputed parental genotype file
-
-    The file describes more families than can be used.  Three populations appear in it:
-
-        the family has an imputed row                 -- use it, plus any genotyped parent
-        no imputed row, but both parents genotyped    -- use the bed file for both
-        no imputed row and no genotyped parent        -- NOT usable; ordinary within-group
-                                                         residualization applies instead
-
-    The third is easy to overlook, since the obvious reading of "absent from families" is that
-    both parents were genotyped and there was nothing to impute.  That holds for some families but
-    not all: snipar also omits families it could not impute for.
-
-    The fam file's parental ID columns are not consulted at all -- the relationships come from
-    snipar's own pedigree, which is validated against KING in the same way (see
-    validate_parents_against_king).
-
-    Args:
-        imputed_parental_file: String path to the imputed parental genotype file
-        full_fam_df: The whole fam file, UNFILTERED, as read by process_relatedness() with every
-            column as text
-        fam_df: The already-filtered sample IDs, as returned by process_phenotypes()
-        rel_df: Relatedness pairs, as positions in the WHOLE fam file (full_fam_df), with
-            integer degrees -- see map_king_to_fam_positions().  Not the analysis sample's
-            positions: a parent filtered out of the analysis must keep their pairs (notes §13.1)
-
-    Returns:
-        A ParentalSources describing the individuals with imputed or observed parents
-
-    Raises:
-        ValueError: If a relationship snipar states is contradicted by KING
-    """
-
-    logging.info(f"\tTaking parental relationships from {imputed_parental_file}.  The fam file's "
-                 f"parental ID columns will not be consulted.")
-
-    metadata = snipar.read_snipar_metadata(imputed_parental_file)
-    pedigree = metadata[snipar.SNIPAR_PEDIGREE_KEY]
-    families = metadata[snipar.SNIPAR_FAMILIES_KEY]
-
-    full_fam_ids = as_id_strings(full_fam_df, [FAM_FID_COL, FAM_IID_COL])
-
-    child_pos, parent_pos, imputed_rows = map_samples_to_imputed_families(
-        pedigree=pedigree, families=families, full_fam_ids=full_fam_ids)
-
-    # An individual is usable if there is anything to residualize them against: either the family
-    # has an imputed row, or at least one parent was genotyped
-    has_imputed = imputed_rows != -1
-    has_observed_parent = (parent_pos != -1).any(axis=1)
-
-    # ...and only if they are themselves in the analysis sample
-    analysis_index = pd.Index(as_id_strings(fam_df, FAM_KEY)[FAM_IID_COL])
-    in_analysis = analysis_index.get_indexer(pedigree[:, SNIPAR_PED_IID_COL]) != -1
-
-    usable = in_analysis & (child_pos != -1) & (has_imputed | has_observed_parent)
-
-    logging.info(f"\t\t{len(pedigree)} pedigree record(s) in the imputed parental genotype file")
-    logging.info(f"\t\t{int((in_analysis & ~(has_imputed | has_observed_parent)).sum())} not "
-                 f"usable (no imputed row and no genotyped parent)")
-    logging.info(f"\t\t{int(usable.sum())} individual(s) to residualize against their parents")
-
-    # snipar records which of each individual's parents IT had genotypes for, and what its imputed
-    # row holds depends on that: the missing parent where one was genotyped, both parents' AVERAGE
-    # where neither was, nothing where both were.  The parental mean is built from the parents GRMA
-    # finds in its own fam file, so the two must agree, or a parent is counted twice, read as an
-    # average when it is one parent, or treated as zero (notes §13.4).  They can only disagree when
-    # snipar was run on a different fileset, which cannot be repaired here -- an average of two
-    # parents cannot be split -- so it is raised rather than worked around.
-    def flags(column):
-        return np.char.lower(pedigree[:, column].astype(str)) == "true"
-    checked = in_analysis & (child_pos != -1)
-    mismatched = checked & ((flags(SNIPAR_PED_HAS_FATHER_COL) != (parent_pos[:, 0] != -1)) |
-                            (flags(SNIPAR_PED_HAS_MOTHER_COL) != (parent_pos[:, 1] != -1)))
-    if np.any(mismatched):
-        offenders = describe_offenders(pedigree[mismatched, SNIPAR_PED_IID_COL])
-        raise ValueError(f"The imputed parental genotype file and the fileset given to GRMA "
-                         f"disagree about which parents are genotyped, for {offenders}: snipar's "
-                         f"pedigree records whether it had each parent's genotypes, and GRMA finds "
-                         f"a different set of those parents in the fam file.  This happens when "
-                         f"snipar was run on a different fileset.  Run snipar's impute.py on the "
-                         f"same fileset given to GRMA.")
-
-    validate_parents_against_king(
-        iids=pedigree[:, SNIPAR_PED_IID_COL], child_pos=child_pos,
-        father_pos=parent_pos[:, 0], mother_pos=parent_pos[:, 1], usable=usable, rel_df=rel_df,
-        source="the imputed parental genotype file's pedigree")
-
-    if not np.any(usable):
-        return empty_parental_sources()
-
-    return ParentalSources(
-        affected_samples=child_pos[usable],
-        observed_parent_cols=parent_pos[usable],
-        imputed_rows=imputed_rows[usable],
-        imputed_file=imputed_parental_file,
-        snipar_metadata=metadata)
-
-
-# -------------------------
-def map_king_to_fam_positions(king_df: pd.DataFrame, fam_ids: pd.DataFrame) -> pd.DataFrame:
-    """KING pairs between samples of a fam file, as positions in that file, with degrees
-
-    For parental processing, which works in the whole fam file's positions.  IDs are compared as
-    strings, as the parental code compares them, since the fam file is read as text while KING's
-    types are inferred (see as_id_strings()).  Pairs beyond SE_RELATEDNESS are dropped, as for the
-    analysis sample's mapping in process_relatedness().
-
-    Args:
-        king_df: The KING file, with NEEDED_KING_COLS
-        fam_ids: The fam file, or at least its FID and IID columns
-
-    Returns:
-        A frame with FAM_INDEX_1, FAM_INDEX_2 (positions in fam_ids) and KING_REL_COL (degrees)
-    """
-
-    fam_mi = pd.MultiIndex.from_frame(as_id_strings(fam_ids, FAM_KEY))
-    pos1 = fam_mi.get_indexer(pd.MultiIndex.from_frame(as_id_strings(king_df, KING_KEY_1)))
-    pos2 = fam_mi.get_indexer(pd.MultiIndex.from_frame(as_id_strings(king_df, KING_KEY_2)))
-    mask = (pos1 != -1) & (pos2 != -1)
-
-    mapped = pd.DataFrame({FAM_INDEX_1 : pos1[mask], FAM_INDEX_2 : pos2[mask],
-                           KING_REL_COL : king_df[KING_REL_COL].to_numpy()[mask]})
-    mapped[KING_REL_COL] = mapped[KING_REL_COL].map(INFTYPE_TO_DEG_MAP)
-    return mapped[mapped[KING_REL_COL] <= SE_RELATEDNESS].reset_index(drop=True)
-
-
-# -------------------------
-def to_analysis_positions(fam_positions: np.ndarray, full_fam_df: pd.DataFrame,
-                          fam_df: pd.DataFrame) -> np.ndarray:
-    """Translates positions in the whole fam file into positions in the analysis sample
-
-    Parental processing reports affected samples as whole-fam-file positions; R's rows are the
-    analysis sample's.  Every affected sample must be in the analysis sample, so one that is not
-    means the two have come apart, and is raised rather than silently dropped.
-
-    Args:
-        fam_positions: Positions in the whole fam file
-        full_fam_df: The whole fam file, or at least its FID and IID columns
-        fam_df: The analysis sample, in its own order
-
-    Raises:
-        ValueError: If any of the positions is not a sample in the analysis
-
-    Returns:
-        The corresponding positions in fam_df
-    """
-
-    analysis_mi = pd.MultiIndex.from_frame(as_id_strings(fam_df, FAM_KEY))
-    full_mi = pd.MultiIndex.from_frame(as_id_strings(full_fam_df, FAM_KEY))
-    positions = analysis_mi.get_indexer(full_mi[np.asarray(fam_positions, dtype=int)])
-
-    if np.any(positions == -1):
-        missing = full_mi[np.asarray(fam_positions, dtype=int)[positions == -1]]
-        raise ValueError(f"Internal error: samples reported as affected are not in the analysis "
-                         f"sample: {describe_offenders([iid for _, iid in missing])}")
-    return positions
-
-
-# -------------------------
-def deduplicate_relatedness_pairs(rel_df: pd.DataFrame, fam_df: pd.DataFrame) -> pd.DataFrame:
-    """Each pair of samples once, whichever order it was listed in
-
-    KING writes one row per pair, but a concatenated file, merged KING runs or a hand edit can list
-    a pair more than once, and calculate_R() and calculate_omega() would then count it more than
-    once (notes §7.4f).  A pair repeated at the same degree says the same thing twice, so it is
-    kept once, with a warning.  A pair given two DIFFERENT degrees is a contradiction that cannot
-    be resolved here, so it is raised.
-
-    Only pairs between analysis samples reach this, so a duplicate involving someone filtered out
-    of the analysis never stops a run.
-
-    Args:
-        rel_df: Relatedness pairs as analysis-sample positions (FAM_INDEX_1, FAM_INDEX_2), with
-            degrees in KING_REL_COL
-        fam_df: The analysis sample, for naming offending pairs
-
-    Raises:
-        ValueError: If any pair is listed with more than one degree
-
-    Returns:
-        rel_df with each unordered pair once, keeping its first row
-    """
-
-    low = np.minimum(rel_df[FAM_INDEX_1].to_numpy(), rel_df[FAM_INDEX_2].to_numpy())
-    high = np.maximum(rel_df[FAM_INDEX_1].to_numpy(), rel_df[FAM_INDEX_2].to_numpy())
-    pairs = pd.DataFrame({"low" : low, "high" : high, "degree" : rel_df[KING_REL_COL].to_numpy()})
-
-    # Named as the user's file names them: IIDs, and KING's own InfType labels
-    iids = fam_df[FAM_IID_COL].astype(str).to_numpy()
-    inftype = {degree : label for label, degree in INFTYPE_TO_DEG_MAP.items()}
-
-    degrees_per_pair = pairs.groupby(["low", "high"])["degree"].unique()
-    conflicting = degrees_per_pair[degrees_per_pair.map(len) > 1]
-    if len(conflicting) > 0:
-        details = [f"{iids[low]}-{iids[high]} ({', '.join(inftype[d] for d in sorted(degrees))})"
-                   for (low, high), degrees in conflicting.items()]
-        raise ValueError(f"The relatedness file gives some pairs more than one degree of "
-                         f"relatedness, which cannot be resolved: "
-                         f"{describe_offenders(details, noun='pair(s)')}.  KING writes one row "
-                         f"per pair, so this usually comes from combining files.")
-
-    repeated = pairs.duplicated(subset=["low", "high"], keep="first").to_numpy()
-    if np.any(repeated):
-        names = [f"{iids[low]}-{iids[high]}"
-                 for low, high in zip(pairs["low"][repeated], pairs["high"][repeated])]
-        logging.warning(f"\tThe relatedness file lists some pairs more than once, at the same "
-                        f"degree; each is counted once: "
-                        f"{describe_offenders(names, noun='pair(s)')}")
-        rel_df = rel_df.loc[~repeated].reset_index(drop=True)
-
-    return rel_df
-
-
-# -------------------------
-def calculate_R(rel_df: pd.DataFrame, N: int, affected_samples: np.ndarray = None
-                ) -> sp.csr_array:
-    """Builds the residualization matrix
-
-    Each sample's row centers them within their relatedness group, so that multiplying by R
-    subtracts that group's mean.
-
-    Samples listed in affected_samples instead receive an IDENTITY row, passing their values
-    through unchanged.  Those are the individuals whose genotypes have already been residualized
-    against their parents, so centering them a second time would be wrong.  Note this differs from
-    what a sample with no relatives receives, which is a ZERO row: an unrelated sample has no
-    within-family contrast and so contributes nothing, whereas an affected sample contributes its
-    own Mendelian residual.
-
-    Affected samples are excluded only from their OWN rows.  They remain as columns in the rows of
-    their relatives, who continue to center against them, and they still count when determining
-    those relatives' minimum relatedness degree.
-
-    Args:
-        rel_df: Relatedness pairs, mapped to sample indices and integer degrees
-        N: Number of samples
-        affected_samples: Indices of samples to be given identity rows, or None for none
-
-    Returns:
-        The residualization matrix
-    """
-
-    i1 = rel_df[FAM_INDEX_1].to_numpy(np.int64)
-    i2 = rel_df[FAM_INDEX_2].to_numpy(np.int64)
-    rel_vals = rel_df[KING_REL_COL].to_numpy(np.int8)  # Values should fit in a single byte
-
-    min_rel_per_index = np.full(N, max(INFTYPE_TO_DEG_MAP.values()) + 1, dtype=np.int8)
-    np.minimum.at(min_rel_per_index, i1, rel_vals)
-    np.minimum.at(min_rel_per_index, i2, rel_vals)
-
-    mask_i1 = (rel_vals == min_rel_per_index[i1])  # Where rel is min for INDEX 1
-    mask_i2 = (rel_vals == min_rel_per_index[i2])  # Where rel is min for INDEX 2
-
-    # Affected samples contribute no entries to their own rows, which leaves those rows empty
-    # through the normalization below, so that the final identity term yields an identity row
-    is_affected = np.zeros(N, dtype=bool)
-    if affected_samples is not None:
-        is_affected[affected_samples] = True
-        mask_i1 = mask_i1 & ~is_affected[i1]
-        mask_i2 = mask_i2 & ~is_affected[i2]
-
-    unaffected = np.flatnonzero(~is_affected)
-    rows = np.concatenate([i1[mask_i1], i2[mask_i2], unaffected])
-    cols = np.concatenate([i2[mask_i1], i1[mask_i2], unaffected])
-    data = np.ones(rows.size, dtype=float)
-
-    R = sp.coo_array((data, (rows, cols)), shape=(N, N)).tocsr()
-
-    # Normalize only the rows that have entries.  Affected rows are empty here, and an unguarded
-    # reciprocal of their zero row sum emits a divide-by-zero warning -- harmless as it happens,
-    # since multiplying an empty sparse row by the resulting infinity touches nothing, but not
-    # something to leave in the output of an ordinary run.
-    row_sums = R.sum(axis=1).reshape((N, 1))
-    scale = np.zeros_like(row_sums)
-    np.divide(-1.0, row_sums, out=scale, where=(row_sums != 0.0))
-    R *= scale
-    R += sp.identity(N, dtype=float)
-
-    return R
-
-def process_relatedness(
-    rel_file: Union[str, pd.DataFrame],
-    fam_file: Union[str, pd.DataFrame],
-    fam_df: pd.DataFrame,
-    rel_degree: int,
-    unresidualized_phenotypes: np.ndarray,
-    imputed_parental_file: str = None
-    ) -> Tuple[sp.csr_array, sp.csr_array, np.ndarray, "ParentalSources"]:
-    """Performs processing of the KING-formatted relatedness / pedigree file
-
-    Function to read in the relatedness / pedigree file, filter based on the already-processed
-    fam file / sample IDs and the user-specified relatedness threshold, and generate the 
-    residualization matrix and the the matrix used to calculate standard errors.
-
-    Args:
-        rel_file: String path to the pedigree file, or the Dataframe itself (already read in).
-            (see https://www.kingrelatedness.com/manual.shtml)
-        fam_df: Contains the already-filtered sample IDs (two columns, FID and IID)
-        rel_degree: The maximum relatedness degree desired by the user, either an integer from
-            0 to MAX_GRMA_RELATEDNESS or those same values in string form.  NOT the KING InfTypes.
-        unresidualized_phenotypes: Phenotypes that have been processed up to the point of
-            (but not including!) residualization based on relatedness groups.
-
-    Returns:
-        A tuple (R, gls_weights, resid_phenotypes, parental_sources) where:
-
-            R is the residualization matrix (multiplication by this matrix residualizes within
-                relatedness groups)
-            gls_weights is the matrix the regression weights observations by: the pseudo-inverse
-                of R @ Omega @ R.T, the covariance of the residualized phenotypes
-            resid_phenotypes are the relatedness-residualized phenotypes
-            parental_sources describes whose genotypes were residualized against their parents
-    """
-
-
-    # Make sure the relatedness threshold is of the correct type
-    if isinstance(rel_degree, str):
-        try:
-            rel_degree = int(rel_degree)
-        except ValueError as exc:
-            raise ValueError(f"Could not interpret rel_degree ({rel_degree!r}) as an integer.  "
-                             f"Expected a value from 0 to {MAX_GRMA_RELATEDNESS} (note that KING "
-                             f"InfTypes such as \"FS\" are not valid for this parameter).") from exc
-    else:
-        try:
-            rel_degree = operator.index(rel_degree)
-        except TypeError as exc:
-            raise TypeError(f"Expected str or int for parameter rel_degree, but "
-                            f"received {type(rel_degree)}") from exc
-
-    # Make sure the relatedness threshold is in range.
-    if not 0 <= rel_degree <= MAX_GRMA_RELATEDNESS:
-        raise ValueError(f"Received rel_degree = {rel_degree}, but it must be between 0 and "
-                         f"{MAX_GRMA_RELATEDNESS} (inclusive).")
-
-
-    # Read in relatedness file (should be in KING format).  Kept whole as unfiltered_rel_df, since
-    # parental processing maps it onto the whole fam file below; rel_df is the analysis sample's
-    # view of it.
-    unfiltered_rel_df, _ = get_df(rel_file, "rel_file", {"header":0})
-    unfiltered_rel_df = unfiltered_rel_df[NEEDED_KING_COLS]
-    logging.info(f"\tRead in {len(unfiltered_rel_df)} rows from relatedness file")
-    logging.info(f"\tRelatedness counts: {get_rel_report(unfiltered_rel_df)}\n")
-
-    # Take note of the sample indices for each FID, IID pair to map to bed file and phenotypes
-    N = len(fam_df)
-    fam_mi = pd.MultiIndex.from_frame(fam_df[FAM_KEY])
-    fam_index_vals = fam_df.index.to_numpy()
-
-    pos1 = fam_mi.get_indexer(pd.MultiIndex.from_frame(unfiltered_rel_df[KING_KEY_1]))
-    pos2 = fam_mi.get_indexer(pd.MultiIndex.from_frame(unfiltered_rel_df[KING_KEY_2]))
-    mask = (pos1 != -1) & (pos2 != -1)
-
-    rel_df = unfiltered_rel_df.loc[mask].drop(columns=KING_KEY_1+KING_KEY_2).reset_index(drop=True)
-    rel_df[FAM_INDEX_1] = fam_index_vals[pos1[mask]]
-    rel_df[FAM_INDEX_2] = fam_index_vals[pos2[mask]]
-    logging.debug(f"\tRestricted the KING file to relevant samples")
-    logging.debug(f"\tRelatedness degree counts: {get_rel_report(rel_df)}\n")
-
-
-    # Make sure the InfType column is a number rather than a string
-    rel_df[KING_REL_COL] = rel_df[KING_REL_COL].map(INFTYPE_TO_DEG_MAP)
-    logging.debug(f"\tMapping KING relatedness to relatedness degree")
-    logging.debug(f"\tRelatedness degree counts: {get_rel_report(rel_df)}\n")
-
-    # Each pair once, before anything builds a matrix from them: the sparse constructors in
-    # calculate_R() and calculate_omega() SUM entries that land in the same cell (notes §7.4f)
-    rel_df = deduplicate_relatedness_pairs(rel_df=rel_df, fam_df=fam_df)
-
-
-    # Filter out relatedness that's too far away
-    # TODO(jonbjala) This will need to change if we bring back higher degree thresholds
-    rel_df = rel_df[rel_df[KING_REL_COL] <= SE_RELATEDNESS]
-    logging.debug(f"\tAfter restricting to SE relatedness threshold, "
-                  f"{len(rel_df)} rows remaining in relatedness file")
-    logging.debug(f"\tRelatedness degree counts: {get_rel_report(rel_df)}\n")
-
-
-    # Determine whose genotypes are residualized against their parents, and where those parents'
-    # genotypes come from.  This works in the WHOLE fam file's positions, not the analysis
-    # sample's: it must see parents who were filtered out of the analysis (notes §6.2.9a), and its
-    # positions index the full-width genotype matrix.  So it gets the fam file, read once here, and
-    # its own mapping of the KING pairs onto it, with nobody dropped -- not rel_df, whose positions
-    # are the analysis sample's and from which every pair involving a filtered-out sample is gone
-    # (notes §13.1).
-    full_fam_df, _ = get_df(fam_file, "fam_file", {"names" : FAM_COLS, "dtype" : str})
-    full_rel_df = map_king_to_fam_positions(king_df=unfiltered_rel_df, fam_ids=full_fam_df)
-    parental_sources = (
-        process_imputed_parents(imputed_parental_file=imputed_parental_file,
-                                full_fam_df=full_fam_df, fam_df=fam_df, rel_df=full_rel_df)
-        if imputed_parental_file is not None
-        else determine_fam_file_trios(full_fam_df=full_fam_df, fam_df=fam_df, rel_df=full_rel_df))
-
-    # Assign samples to relatedness components once.  Both the shrinkage inside calculate_omega()
-    # and the block-wise inversion in calculate_gls_weights() need this same partition, and both
-    # must use omega's components rather than R's.
-    labels = get_relatedness_components(rel_df=rel_df, N=N)
-
-    # Create omega matrix
-    omega = calculate_omega(rel_df=rel_df, N=N,
-                            unresidualized_phenotypes=unresidualized_phenotypes, labels=labels)
-
-    # Create R matrix
-    rel_df = rel_df[rel_df[KING_REL_COL] <= rel_degree]
-    logging.debug(f"\tAfter restricting to user-specified relatedness threshold, "
-                  f"{len(rel_df)} rows remaining in relatedness file")
-    logging.debug(f"\tRelatedness degree counts: {get_rel_report(rel_df)}")
-    # affected_samples are whole-fam-file positions; R's rows are the analysis sample's
-    R = calculate_R(rel_df=rel_df, N=N,
-                    affected_samples=to_analysis_positions(
-                        fam_positions=parental_sources.affected_samples,
-                        full_fam_df=full_fam_df, fam_df=fam_df))
-
-
-    # Residualize the phenotypes using R
-    resid_phenotypes = R @ unresidualized_phenotypes
-
-    # Build the GLS weight matrix.  The covariance it inverts, R @ omega @ R.T, is a local
-    # intermediate: everything downstream wants the weights rather than the covariance.
-    gls_weights = calculate_gls_weights(R=R, omega=omega, labels=labels)
-    del omega
-
-
-    return R, gls_weights, resid_phenotypes, parental_sources
-
-
-# -------------------------
-class SnpAlignment(NamedTuple):
-    """Maps the imputed parental genotype file's SNPs onto GRMA's retained ones
-
-    Both arrays are aligned to the SNPs that survive filtering, in the same order as snp_filter.
+@dataclasses.dataclass
+class ParentColumns:
+    """For each child in the PO regression, where its parents' data is
 
     Attributes:
-        hdf5_indices: Position within the imputed file of each retained SNP's data
-        flip_mask: True where the imputed genotypes are coded to the other allele and must be
-            subtracted from 2 before use
+        father, mother: The parent's column among the genotypes the loop reads, (children,), -1
+            where that parent is not genotyped
+        family: The child's family's row in snipar's imputed data, (children,), -1 where snipar
+            has none
     """
 
-    hdf5_indices: np.ndarray
-    flip_mask: np.ndarray
+    father: np.ndarray
+    mother: np.ndarray
+    family: np.ndarray
 
 
-# -------------------------
-def classify_allele_orientation(grma_alleles: np.ndarray, snipar_alleles: np.ndarray
-                                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compares two sets of allele pairs and determines what each requires
+@dataclasses.dataclass
+class Regression:
+    """One regression, as the genotype loop needs it
+
+    Attributes:
+        name: Which regression: one of REGRESSION_ORDER
+        focal: The focal samples' positions in Omega, (focal,)
+        phenotype_map: The matrix A taking Omega's phenotypes to this regression's: a selection
+            matrix for PO, a residualization matrix R for a relative regression,
+            (focal, omega samples)
+        phenotypes: This regression's phenotypes, A y, (focal,)
+        gls_weights: The GLS weight matrix Q, the pseudo-inverse of A Omega A', (focal, focal)
+        parents: For the PO regression, where each child's parents' data is; None otherwise
+    """
+
+    name: str
+    focal: np.ndarray
+    phenotype_map: sp.csr_array
+    phenotypes: np.ndarray
+    gls_weights: sp.csr_array
+    parents: ParentColumns = None
+
+
+def build_residualization_matrix(samples: pd.DataFrame, graph: pd.DataFrame, group: str):
+    """The matrix R turning each focal sample's value into its deviation from its relatives' mean
+
+    The focal samples are those in the group.  Each focal sample's relatives are the samples in
+    Omega with the group's relationship to it, whatever group THEY are in; the mean is over the
+    focal sample and all of them.  So a focal sample's row holds 1 - 1/(k+1) for itself and
+    -1/(k+1) for each of its k relatives, and sums to zero -- which is what makes the regression
+    unaffected by adding a constant to every phenotype or to every genotype.
 
     Args:
-        grma_alleles: (n, 2) array of A1 and A2 from GRMA's bim file
-        snipar_alleles: (n, 2) array of allele1 and allele2 from the imputed file
+        samples: The sample table, after select_omega_sample()
+        graph: The relatedness graph, after resolve_duplicates()
+        group: GROUP_FS, GROUP_2ND or GROUP_3RD
 
     Returns:
-        A tuple (agrees, swapped, strand_differs) of (n,) boolean masks.  They are not mutually
-        exclusive: a palindromic SNP's strand cannot be told from its letters, so it is both
-        strand_differs and whichever of agrees or swapped applies.  A SNP matching none of the
-        three has incompatible alleles and is a different variant altogether.
+        A tuple (focal, R): the focal samples' Omega positions, (focal,), in Omega order; and R,
+        (focal, omega samples)
+    """
+
+    omega_idx = samples[SAMPLE_OMEGA_IDX_COL].to_numpy()
+    is_focal = (samples[SAMPLE_GROUP_COL] == group).to_numpy() & (omega_idx != -1)
+    focal = omega_idx[is_focal]
+    num_omega = int(omega_idx.max()) + 1
+
+    first, second, relationship = get_omega_pairs(samples, graph)
+    of_group = relationship == RELATIVE_REGRESSION_RELATIONSHIP[group]
+    relatives = {f : [] for f in focal}
+    for a, b in zip(first[of_group], second[of_group]):
+        if a in relatives:
+            relatives[a].append(b)
+        if b in relatives:
+            relatives[b].append(a)
+
+    rows, cols, values = [], [], []
+    for row, f in enumerate(focal):
+        members = [f] + relatives[f]
+        share = 1.0 / len(members)
+        rows.extend([row] * len(members))
+        cols.extend(members)
+        values.extend([1.0 - share] + [-share] * (len(members) - 1))
+    R = sp.csr_array((values, (rows, cols)), shape=(len(focal), num_omega))
+    return focal, R
+
+
+def calculate_gls_weights(vcv: sp.csr_array) -> sp.csr_array:
+    """The GLS weight matrix: the pseudo-inverse of a regression's phenotypic covariance
+
+    The covariance is block-diagonal over its connected components, so it is inverted block by
+    block.  Each block's cutoff for treating a direction as null scales with the block's size, as
+    the rounding noise in those directions does: a residualization matrix makes every block
+    singular by construction, and a fixed cutoff would invert that noise in large blocks, giving
+    weights around 1e14.
+
+    Args:
+        vcv: The regression's phenotypic covariance, A Omega A', (focal, focal)
+
+    Returns:
+        Its pseudo-inverse, (focal, focal), with the same block structure
+    """
+
+    size = vcv.shape[0]
+    _, labels = csgraph.connected_components(vcv, directed=False)
+    rows, cols, values = [], [], []
+    for c in range(labels.max() + 1 if size else 0):
+        idx = np.flatnonzero(labels == c)
+        block = vcv[idx][:, idx].toarray()
+        inverse = np.linalg.pinv(block, rcond=max(block.shape) * np.finfo(float).eps,
+                                 hermitian=True)
+        r, k = np.meshgrid(idx, idx, indexing="ij")
+        rows.append(r.ravel())
+        cols.append(k.ravel())
+        values.append(inverse.ravel())
+    if not rows:
+        return sp.csr_array((size, size))
+    return sp.csr_array((np.concatenate(values), (np.concatenate(rows), np.concatenate(cols))),
+                        shape=(size, size))
+
+
+def build_relative_regressions(samples: pd.DataFrame, graph: pd.DataFrame, phenotypes: np.ndarray,
+                               omega: sp.csr_array, rel_degree: int = MAX_REL_DEGREE) -> list:
+    """The sibling, 2nd- and 3rd-degree regressions that rel_degree allows
+
+    A regression whose group is empty is left out, with a warning: estimates that would include it
+    are still reported, so that the output's layout depends only on the options, but they equal
+    the estimates without it.
+
+    Args:
+        samples: The sample table, after select_omega_sample()
+        graph: The relatedness graph, after resolve_duplicates()
+        phenotypes: prepare_phenotypes()'s result, (omega samples,)
+        omega: build_omega()'s result
+        rel_degree: As for assign_groups()
+
+    Returns:
+        A list of Regression, in REGRESSION_ORDER
+    """
+
+    regressions = []
+    for group, relationship in RELATIVE_REGRESSION_RELATIONSHIP.items():
+        if rel_degree < GROUP_MIN_REL_DEGREE[group]:
+            continue
+        focal, R = build_residualization_matrix(samples, graph, group)
+        if len(focal) == 0:
+            logging.warning(f"No sample qualifies for the {group} regression, so it is omitted; "
+                            f"every reported estimate that would include it equals the one "
+                            f"without it")
+            continue
+        vcv = sp.csr_array(R @ omega @ R.T)
+        regressions.append(Regression(name=group, focal=focal, phenotype_map=R,
+                                      phenotypes=R @ phenotypes,
+                                      gls_weights=calculate_gls_weights(vcv)))
+        logging.info(f"\t{group} regression: {len(focal)} focal sample(s)")
+    return regressions
+
+
+def build_cross_covariances(regressions: list, omega: sp.csr_array) -> dict:
+    """The phenotypic covariance between every two regressions' phenotypes, A_i Omega A_j'
+
+    Computed once, so that the genotype loop can find the covariance of the estimates from each
+    regression's own quantities alone, never spreading weights over all of Omega.
+
+    Args:
+        regressions: The regressions
+        omega: build_omega()'s result
+
+    Returns:
+        (name_i, name_j) -> A_i Omega A_j', (focal_i, focal_j), for every ordered pair i <= j in
+        the list's order
+    """
+
+    cross = {}
+    for i, first in enumerate(regressions):
+        weighted = first.phenotype_map @ omega
+        for second in regressions[i:]:
+            cross[(first.name, second.name)] = sp.csr_array(weighted @ second.phenotype_map.T)
+    return cross
+
+
+def reported_estimates(has_po: bool, rel_degree: int = MAX_REL_DEGREE) -> list:
+    """The estimates reported, each as the regressions it combines
+
+    Cumulative, in REGRESSION_ORDER: PO alone, then PO+FS, PO+FS+2ND, PO+FS+2ND+3RD, as far as
+    rel_degree allows.  Without PO (no imputed parental genotype file), the same without it: FS,
+    FS+2ND, FS+2ND+3RD.  This depends only on the options, never on the data, so the output's
+    columns do too.
+
+    Args:
+        has_po: Whether there is a PO regression to include, i.e. an imputed parental file
+        rel_degree: As for assign_groups()
+
+    Returns:
+        A list of tuples of regression names
+    """
+
+    allowed = [g for g in REGRESSION_ORDER[1:] if rel_degree >= GROUP_MIN_REL_DEGREE[g]]
+    included = ([GROUP_PO] if has_po else []) + allowed
+    return [tuple(included[:n + 1]) for n in range(len(included))]
+
+
+# SNPs ============================================================================================
+
+@dataclasses.dataclass
+class SnpPlan:
+    """Which SNPs are analysed, and where each is in snipar's file
+
+    Attributes:
+        bim_rows: The analysed SNPs' rows in the bim file, (snps,), increasing
+        snipar_positions: Each SNP's position in snipar's file, (snps,), -1 where it has no usable
+            data; None without a snipar file
+        flip: Whether each SNP's alleles are swapped in snipar's file relative to the bim file,
+            (snps,); None without a snipar file
+    """
+
+    bim_rows: np.ndarray
+    snipar_positions: np.ndarray = None
+    flip: np.ndarray = None
+
+
+def classify_allele_orientation(grma_alleles: np.ndarray, snipar_alleles: np.ndarray):
+    """How each SNP's alleles in snipar's file relate to the bim file's
+
+    Args:
+        grma_alleles: The bim file's A1 and A2, (snps, 2)
+        snipar_alleles: snipar's allele1 and allele2, (snps, 2)
+
+    Returns:
+        A tuple (agrees, swapped, strand_differs), each (snps,): the same alleles in the same
+        order; the same alleles in the other order; and the alleles of the opposite strand, in
+        either order
     """
 
     complemented = np.vectorize(ALLELE_COMPLEMENTS.get)(snipar_alleles)
-
     agrees = (grma_alleles == snipar_alleles).all(axis=1)
     swapped = (grma_alleles == snipar_alleles[:, ::-1]).all(axis=1)
     strand_differs = ((grma_alleles == complemented).all(axis=1) |
                       (grma_alleles == complemented[:, ::-1]).all(axis=1))
-
     return agrees, swapped, strand_differs
 
 
-# -------------------------
-def align_imputed_file_to_bim(bim_df: pd.DataFrame, metadata: dict
-                              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Matches the imputed parental genotype file's SNPs onto GRMA's, and resolves their
-    orientation
+def align_snipar_to_bim(bim: pd.DataFrame, snipar_metadata: dict):
+    """Where each bim SNP is in snipar's file, and whether its alleles are swapped there
 
-    The bim file is the authority: every SNP GRMA analyses comes from it, in its order, and a
-    variant present only in the imputed file is never looked at.  What this produces is, for each
-    retained bim SNP, where to find its imputed data -- not a reordering of the analysis around
-    the imputed file's variant set.
+    SNPs are matched by rsid.  A SNP snipar does not have, or has with alleles that cannot be
+    reconciled with the bim file's, has no usable imputed data: it is still analysed, but children
+    with one parent genotyped have no residual at it.  Palindromic SNPs (A/T, C/G) can be used only
+    if no non-palindromic SNP is recorded on opposite strands in the two files, since their strand
+    cannot be read from the letters.
 
-    Matching is by variant ID, with chromosome and position confirmed afterwards so that two files
-    reusing an ID for different variants are caught rather than silently combined.
-
-    Orientation matters because a disagreement means the imputed genotypes count the other allele,
-    and subtracting an oppositely-coded parental mean produces plausible but wrong numbers.  Only
-    heterozygotes are unaffected, so the error would not be obvious in aggregate.
-
-    PALINDROMIC SNPs (A/T and C/G) cannot be resolved from the allele letters at all: on the
-    opposite strand, (A,T) still reads as (A,T), with only the roles of the two alleles exchanged.
-    Both hypotheses -- same strand, or opposite strand with the alleles swapped -- produce
-    identical letters.  They are resolved here by looking at the UNAMBIGUOUS SNPs instead: if no
-    non-palindromic SNP shows a strand difference, the two files share a strand, and palindromic
-    SNPs can then be read literally.  If any does, the files disagree about strand and every
-    palindromic SNP becomes genuinely ambiguous.
-
-    TODO(jonbjala): rescue ambiguous palindromic SNPs by allele frequency.  Comparing standard_f
-    against GRMA's own frequency distinguishes the two hypotheses wherever the frequency is far
-    enough from 0.5 -- simulation puts that at ~93% of them at a threshold of 0.05, with no
-    errors.  It needs a targeted pre-pass over the bed file, which this function has no access to,
-    and a threshold calibrated from the non-palindromic SNPs rather than hardcoded.  Until then
-    they are dropped, which is conservative but wasteful.
+    Raises:
+        ValueError: If an rsid the bim file names appears more than once in snipar's file, so the
+            match is ambiguous; or if an rsid is at different positions in the two files, so they
+            are not the same variant
 
     Args:
-        bim_df: GRMA's bim file, restricted to the SNPs that survive other filtering
-        metadata: Output of read_snipar_metadata()
+        bim: The bim rows to align, as grma_io.read_bim() returns them
+        snipar_metadata: snipar_hdf5.read_snipar_metadata()'s result
 
     Returns:
-        A tuple (keep_mask, hdf5_indices, flip_mask), each aligned to bim_df's rows.  hdf5_indices
-        and flip_mask are meaningful only where keep_mask is True.
+        A tuple (positions, flip), each (snps,): the position in snipar's file, -1 where unusable;
+        and whether the alleles are swapped
     """
 
-    bim_values = metadata[snipar.SNIPAR_BIM_VALUES_KEY]
-    bim_columns = metadata[snipar.SNIPAR_BIM_COLUMNS_KEY]
+    values = snipar_metadata[snipar_hdf5.SNIPAR_BIM_VALUES_KEY]
+    columns = snipar_metadata[snipar_hdf5.SNIPAR_BIM_COLUMNS_KEY]
 
-    def snipar_column(names):
-        return bim_values[:, snipar.get_snipar_bim_column_index(bim_columns, names)]
+    def column(names):
+        return values[:, snipar_hdf5.get_snipar_bim_column_index(columns, names)].astype(str)
 
-    hdf5_indices = pd.Index(snipar_column(snipar.SNIPAR_BIM_ID_NAMES)).get_indexer(
-        bim_df[BIM_RSID_COL].astype(str))
-    matched = hdf5_indices != -1
+    snipar_ids = pd.Series(np.arange(len(values)), index=column(snipar_hdf5.SNIPAR_BIM_ID_NAMES))
+    rsids = bim[bbf.BIM_RSID_COL].to_numpy()
+    repeated = set(snipar_ids.index[snipar_ids.index.duplicated(keep=False)])
+    ambiguous = sorted(repeated & set(rsids))
+    if ambiguous:
+        raise ValueError(f"The imputed parental genotype file lists some rsids more than once, "
+                         f"so they cannot be matched to the bim file: "
+                         f"{grma_util.describe_offenders(ambiguous, noun='rsid(s)')}")
+    snipar_ids = snipar_ids[~snipar_ids.index.duplicated(keep=False)]
 
-    # Confirm the matched variants really are the same ones.  Positions are stringified in the
-    # imputed file, so both sides are compared as integers rather than as text.
-    position_agrees = np.zeros(len(bim_df), dtype=bool)
-    position_agrees[matched] = (
-        (snipar_column(snipar.SNIPAR_BIM_CHR_NAMES)[hdf5_indices[matched]].astype(str) ==
-         bim_df[BIM_CHR_COL].to_numpy().astype(str)[matched]) &
-        (snipar_column(snipar.SNIPAR_BIM_BP_NAMES)[hdf5_indices[matched]].astype(np.int64) ==
-         bim_df[BIM_BP_COL].to_numpy().astype(np.int64)[matched]))
+    found = snipar_ids.reindex(rsids).to_numpy()
+    matched = ~np.isnan(found)
+    positions = np.where(matched, found, -1).astype(int)
 
-    if np.any(matched & ~position_agrees):
-        offenders = bim_df[BIM_RSID_COL].to_numpy()[matched & ~position_agrees]
-        raise ValueError(f"{len(offenders)} variant ID(s) appear in both the bim file and the "
-                         f"imputed parental genotype file but describe different positions, so "
-                         f"they are not the same variant.  First few: {sorted(offenders)[:5]}")
+    at = positions[matched]
+    same_place = np.ones(len(bim), dtype=bool)
+    same_place[matched] = (
+        (column(snipar_hdf5.SNIPAR_BIM_CHR_NAMES)[at] == bim[bbf.BIM_CHR_COL].to_numpy()[matched]) &
+        (column(snipar_hdf5.SNIPAR_BIM_BP_NAMES)[at].astype(np.int64) ==
+         bim[bbf.BIM_BP_COL].to_numpy()[matched]))
+    if not same_place.all():
+        raise ValueError(f"Some rsids are at different positions in the bim file and the imputed "
+                         f"parental genotype file, so they are not the same variant: "
+                         f"{grma_util.describe_offenders(rsids[~same_place], noun='rsid(s)')}")
 
-    grma_alleles = bim_df[[BIM_A1_COL, BIM_A2_COL]].to_numpy().astype(str)
-    snipar_alleles = np.column_stack([snipar_column(snipar.SNIPAR_BIM_A1_NAMES),
-                                      snipar_column(snipar.SNIPAR_BIM_A2_NAMES)]
-                                     )[np.where(matched, hdf5_indices, 0)]
-
+    grma_alleles = bim[[bbf.BIM_A1_COL, bbf.BIM_A2_COL]].to_numpy().astype(str)
+    snipar_alleles = np.column_stack([column(snipar_hdf5.SNIPAR_BIM_A1_NAMES),
+                                      column(snipar_hdf5.SNIPAR_BIM_A2_NAMES)]
+                                     )[np.maximum(positions, 0)]
     agrees, swapped, strand_differs = classify_allele_orientation(grma_alleles, snipar_alleles)
     palindromic = np.array([set(pair) in PALINDROMIC_ALLELE_PAIRS for pair in grma_alleles])
 
-    # The unambiguous SNPs decide whether the two files share a strand
     strand_evidence = int((matched & ~palindromic & strand_differs).sum())
-    strands_agree = strand_evidence == 0
-    if not strands_agree:
-        logging.warning(f"\t{strand_evidence} SNP(s) are recorded on opposite strands in the bim "
-                        f"file and the imputed parental genotype file.  Those, and all "
-                        f"palindromic SNPs, cannot be used.")
+    if strand_evidence:
+        logging.warning(f"{strand_evidence} SNP(s) are recorded on opposite strands in the bim "
+                        f"file and the imputed parental genotype file.  Their imputed data, and "
+                        f"every palindromic SNP's, cannot be used.")
+    usable = matched & (agrees | swapped) & (~palindromic | (strand_evidence == 0))
 
-    usable_palindromic = palindromic & strands_agree
-    keep_mask = matched & position_agrees & (agrees | swapped) & (~palindromic | usable_palindromic)
-    flip_mask = keep_mask & swapped
-
-    log_dropped_snps(bim_df=bim_df, matched=matched, keep_mask=keep_mask,
-                     palindromic=palindromic, strand_differs=strand_differs,
-                     strands_agree=strands_agree)
-
-    return keep_mask, hdf5_indices, flip_mask
+    logging.info(f"\t{int(usable.sum())} of {len(bim)} SNP(s) have usable imputed parental data; "
+                 f"{int((~matched).sum())} are not in the file, "
+                 f"{int((matched & ~usable).sum())} have alleles that cannot be reconciled")
+    return np.where(usable, positions, -1), usable & swapped
 
 
-# -------------------------
-def log_dropped_snps(bim_df: pd.DataFrame, matched: np.ndarray, keep_mask: np.ndarray,
-                     palindromic: np.ndarray, strand_differs: np.ndarray, strands_agree: bool):
-    """Reports how many SNPs could not be aligned, and why
+def plan_snps(bim: pd.DataFrame, snp_list: pd.DataFrame = None,
+              snipar_metadata: dict = None) -> SnpPlan:
+    """The SNPs to analyse, and where each is in snipar's file
 
-    The counts matter more than the identities: a handful is ordinary data noise, while a large
-    fraction means the two files were built from materially different variant sets and the user
-    should know before trusting anything downstream.
+    Every bim SNP, or only those in the SNP list where one is given.  With a snipar file, each SNP
+    is aligned to it.  A SNP without usable imputed data is still analysed: the sibling, 2nd- and
+    3rd-degree regressions and children with both parents genotyped do not need it.  Only children
+    with one parent genotyped lose their residual at it, and a warning says how many SNPs this
+    affects, since many would suggest the files were built from different SNP sets.
 
     Args:
-        bim_df: GRMA's bim file, restricted to the SNPs that survive other filtering
-        matched: Which SNPs were found in the imputed file at all
-        keep_mask: Which SNPs survive alignment
-        palindromic: Which SNPs have palindromic alleles
-        strand_differs: Which SNPs' alleles are complements
-        strands_agree: Whether the two files were found to share a strand, which decides how a
-            palindromic drop is described
-    """
+        bim: grma_io.read_bim()'s result
+        snp_list: grma_io.read_snp_list()'s result, or None
+        snipar_metadata: snipar_hdf5.read_snipar_metadata()'s result, or None
 
-    dropped = ~keep_mask
-    if not np.any(dropped):
-        return
-
-    # A palindromic SNP is dropped for one of two quite different reasons, and saying which
-    # saves the reader working it out.  Where the two files share a strand it is kept, so a
-    # palindromic drop here means they do not -- and that is a property of the whole file rather
-    # than of this SNP, which the separate warning about opposite strands also reports.
-    palindromic_reason = ("palindromic, and the two files disagree about strand" if not
-                          strands_agree else "palindromic, so their orientation is ambiguous")
-
-    reasons = {
-        "not present in the imputed parental genotype file" : dropped & ~matched,
-        palindromic_reason : dropped & matched & palindromic,
-        "recorded on the opposite strand" :
-            dropped & matched & ~palindromic & strand_differs,
-        "incompatible alleles, so not the same variant" :
-            dropped & matched & ~palindromic & ~strand_differs
-    }
-
-    total = int(dropped.sum())
-    logging.info(f"\t{total} SNP(s) ({total / len(bim_df):.1%}) dropped -- they cannot be "
-                 f"aligned to the imputed parental genotype file")
-    for reason, mask in reasons.items():
-        if np.any(mask):
-            logging.info(f"\t\t{int(mask.sum())} {reason}")
-            logging.debug(f"\t\t\t{sorted(bim_df[BIM_RSID_COL].to_numpy()[mask])}")
-
-
-# -------------------------
-def process_bim_file(bim_file: Union[str, pd.DataFrame], snp_list: Union[str, pd.DataFrame],
-                     parental_sources: ParentalSources = None
-                     ) -> Tuple[int, int, np.ndarray, SnpAlignment]:
-    """Performs processing of the bim file
-
-    Function to read in the bim file and possibly filter based on the optional user-provided snp
-    list, and on aligning the imputed parental genotype file where one was supplied.
-
-    Alignment belongs here rather than alongside the rest of parental processing because dropping
-    an unalignable SNP is just another filtering criterion, and this function is what produces the
-    SNP filter.  Doing it elsewhere would mean computing the filter and then revising it.
-
-    Args:
-        bim_file: String path to the bim file, or the Dataframe itself (already read in).
-            (see https://www.cog-genomics.org/plink/1.9/formats#bim)
-        snp_list: Optional file that contains the rsIDs (one per line) that should be included
-            in the analysis
-        parental_sources: Describes parental processing, or None.  Alignment happens only when it
-            carries imputed parental genotypes.
+    Raises:
+        ValueError: If no SNP is left to analyse; if snipar's file lists the analysed SNPs in a
+            different order from the bim file; or as align_snipar_to_bim() raises
 
     Returns:
-        A tuple (M_orig, M, snp_filter, snp_alignment) where:
-
-            M_orig is the initial number of SNPs in the bim file
-            M is the final number of SNPs after filtering
-            snp_filter is the list of numerical (values from 0 to M_orig-1) indices to use when
-                filtering, say, the values in the bed file by SNP.  None when nothing was filtered
-            snp_alignment maps the imputed parental genotype file onto the retained SNPs, or is
-                None when no such file was supplied
+        A SnpPlan
     """
 
-    aligning = (parental_sources is not None and parental_sources.snipar_metadata is not None)
-
-    # Alignment needs the position and allele columns as well, so read the whole file for it
-    read_params = ({"names" : list(BIM_COLS)} if aligning
-                   else {"usecols" : [BIM_COLS.index(BIM_RSID_COL)], "names" : [BIM_RSID_COL]})
-    bim_df, _ = get_df(bim_file, "bim_file", read_params)
-
-    M_orig = len(bim_df)
-    bim_name = bim_file if isinstance(bim_file, str) else "bim file"
-    logging.info(f"\tThere are {M_orig} SNPs in {bim_name}")
-
-    snp_filter = None
-
-    # Read in snp list (if it exists)
+    rows = np.arange(len(bim))
     if snp_list is not None:
-        snp_df, _ = get_df(snp_list, "snp_list", {"names" : [BIM_RSID_COL]})
-        snplist_name = snp_list if isinstance(snp_list, str) else "SNP list"
-        logging.info(f"\tThere are {len(snp_df)} SNPs in {snplist_name}")
+        listed = set(snp_list[bbf.BIM_RSID_COL])
+        in_list = bim[bbf.BIM_RSID_COL].isin(listed).to_numpy()
+        unknown = len(listed - set(bim[bbf.BIM_RSID_COL]))
+        if unknown:
+            logging.warning(f"{unknown} SNP(s) in the SNP list are not in the bim file")
+        rows = rows[in_list]
+    if len(rows) == 0:
+        raise ValueError("No SNP is left to analyse: the SNP list names none of the bim file's")
+    logging.info(f"\t{len(rows)} SNP(s) to analyse")
 
-        bim_index = pd.Index(bim_df[BIM_RSID_COL])
-        positions = bim_index.get_indexer(snp_df[BIM_RSID_COL])
-        missing_mask = (positions == -1)
-        num_missing = int(missing_mask.sum())
-        logging.debug(f"\tThere are {num_missing} SNPs listed in SNP list that are not in "
-                      f"the bim file")
-        logging.info(f"\tThere are {len(snp_df) - num_missing} SNPs remaining after filtering")
+    if snipar_metadata is None:
+        return SnpPlan(bim_rows=rows)
 
-        snp_filter = np.sort(positions[~missing_mask])
+    analysed = bim.iloc[rows].reset_index(drop=True)
+    positions, flip = align_snipar_to_bim(analysed, snipar_metadata)
 
-    if not aligning:
-        return M_orig, M_orig if snp_filter is None else len(snp_filter), snp_filter, None
-
-    # Alignment needs an explicit filter to narrow, even when nothing has been filtered yet
-    retained = np.arange(M_orig) if snp_filter is None else snp_filter
-
-    keep_mask, hdf5_indices, flip_mask = align_imputed_file_to_bim(
-        bim_df=bim_df.iloc[retained], metadata=parental_sources.snipar_metadata)
-
-    snp_filter = retained[keep_mask]
-    snp_alignment = SnpAlignment(hdf5_indices=hdf5_indices[keep_mask],
-                                 flip_mask=flip_mask[keep_mask])
-
-    # read_imputed_block() only ever reads forward through the imputed file, so the file must list
-    # the SNPs in the bim's order.  A step backwards would make it read another SNP's data,
-    # silently (notes §13.2).  A repeated position is fine: it can only come from the bim listing
-    # one SNP twice.
-    backwards = np.flatnonzero(np.diff(snp_alignment.hdf5_indices) < 0) + 1
-    if backwards.size > 0:
-        rsids = bim_df[BIM_RSID_COL].to_numpy()[snp_filter[backwards]]
+    # The reader moves forward through snipar's file, so the positions must never decrease.  A
+    # repeated position is fine: it can only come from the bim file listing one SNP twice.
+    present = np.flatnonzero(positions != -1)
+    backwards = present[1:][np.diff(positions[present]) < 0]
+    if backwards.size:
+        rsids = analysed[bbf.BIM_RSID_COL].to_numpy()[backwards]
         raise ValueError(f"The imputed parental genotype file lists SNPs in a different order "
-                         f"from the bim file: {describe_offenders(rsids, noun='SNP(s)')} come "
-                         f"earlier in the imputed file than the SNP before them in the bim file.  "
-                         f"GRMA reads the imputed file in the bim file's order, so the two must "
-                         f"match.  Run snipar's impute.py on a fileset whose variants are in the "
-                         f"same order as the one given to GRMA.")
+                         f"from the bim file: "
+                         f"{grma_util.describe_offenders(rsids, noun='SNP(s)')} come earlier in "
+                         f"the imputed file than the SNP before them in the bim file.  GRMA reads "
+                         f"the imputed file in the bim file's order, so the two must match.  Run "
+                         f"snipar's impute.py on a fileset whose variants are in the same order "
+                         f"as the one given to GRMA.")
 
-    logging.info(f"\tThere are {len(snp_filter)} SNPs remaining after aligning the imputed "
-                 f"parental genotype file")
-
-    return M_orig, len(snp_filter), snp_filter, snp_alignment
-        
-
-# -------------------------
-def calculate_parental_means(G: np.ndarray, parental_sources: ParentalSources,
-                             imputed_gts: np.ndarray = None,
-                             num_obs_par_alleles: np.ndarray = None,
-                             standard_f: np.ndarray = None) -> np.ndarray:
-    """Calculates the value to subtract from each affected individual's genotypes
-
-    What is subtracted depends on how many of an individual's parents were genotyped:
-
-        both observed:    (g_father + g_mother) / 2
-        one observed:     g_observed / 2, plus the transmitted allele from the unobserved parent
-        neither observed: the corrected imputed value, which snipar has already averaged
+    missing = int((positions == -1).sum())
+    if missing:
+        logging.warning(f"{missing} of {len(rows)} SNP(s) have no usable imputed parental data.  "
+                        f"They are still analysed, but children with one parent genotyped "
+                        f"contribute nothing at them.")
+    return SnpPlan(bim_rows=rows, snipar_positions=positions, flip=flip)
 
 
-    The asymmetry in the middle case is deliberate.  For the OBSERVED parent the genotype is
-    known, so g/2 is the expected transmitted allele and what remains is that parent's Mendelian
-    deviation -- the actual randomness.  For the UNOBSERVED parent only the transmitted allele is
-    known, so subtracting it exactly makes that parent's contribution vanish rather than
-    contribute a deviation.  Subtracting half the transmitted allele instead would leave a
-    family-level quantity behind, which is precisely what this is meant to remove.
+# The PO regression ===============================================================================
 
-    G must be the FULL-WIDTH genotype array, before any sample filtering, since a parent may have
-    been dropped from the analysis for a missing phenotype while their genotypes remain usable.
-    It is only ever read: the means are returned for the caller to subtract, so that an affected
-    individual who is themselves a parent is differenced against raw genotypes rather than
-    against values that have already been adjusted.
+def plan_genotype_samples(samples: pd.DataFrame, parents: pd.DataFrame):
+    """The samples whose genotypes the loop reads, and in what order
 
-    Every affected individual is expected to have at least one parental source -- a genotyped
-    parent, an imputed row, or both.  GRMA code guarantees that by excluding
-    anyone who has neither, and both of its branches report how many were excluded.  That is not
-    re-checked here: this function runs once per block, so a check would repeat thousands of
-    times what was settled once before the block loop began.  An individual with no source at all
-    would simply have zero subtracted.
+    The Omega samples first, in Omega order, so that the first columns of a genotype block are
+    exactly Omega's; then each genotyped parent outside Omega, in sample table order.  A parent
+    outside Omega has no phenotype, but their genotype is still needed for their child's residual.
 
     Args:
-        G: Genotypes for this block, (snps, N_orig), unfiltered by sample
-        parental_sources: Describes the affected individuals and where their parents are
-        imputed_gts: Imputed parental genotypes for this block, (families, snps), or None
-        num_obs_par_alleles: Observed parental allele counts for this block, same shape, or None
-        standard_f: Per-SNP allele frequencies for this block, or None
+        samples: The sample table, after select_omega_sample()
+        parents: identify_parents()'s result
 
     Returns:
-        The values to subtract, (snps, n_affected)
+        A tuple (bed_cols, column_of_row): the bed file columns to read, (loaded samples,), in
+        that order; and each sample table row's column among them, (sample table rows,), -1 for
+        a sample not read
     """
 
-    father_cols = parental_sources.observed_parent_cols[:, 0]
-    mother_cols = parental_sources.observed_parent_cols[:, 1]
+    omega_idx = samples[SAMPLE_OMEGA_IDX_COL].to_numpy()
+    bed = samples[SAMPLE_BED_COL].to_numpy()
+    in_omega = np.flatnonzero(omega_idx != -1)
+    in_omega = in_omega[np.argsort(omega_idx[in_omega])]
 
-    # Sum of the observed parents' genotypes, counting only parents that were genotyped.  A NaN
-    # in an observed parent propagates, which makes that SNP missing for the child.
-    parental_sum = np.zeros((G.shape[0], len(father_cols)), dtype=float)
-    for parent_cols in (father_cols, mother_cols):
-        observed = parent_cols != -1
-        if np.any(observed):
-            parental_sum[:, observed] += G[:, parent_cols[observed]]
+    parent_rows = np.concatenate([parents[PARENTS_FATHER_COL].to_numpy(),
+                                  parents[PARENTS_MOTHER_COL].to_numpy()])
+    extra = np.unique(parent_rows[(parent_rows != -1)])
+    extra = extra[omega_idx[extra] == -1]
 
-    # Call the imputed branch only when somebody actually has an imputed row.  A -1 throughout
-    # means every affected family had both parents genotyped, and the imputed arrays are then not
-    # merely unused but potentially absent, so this is a guard rather than an optimisation.
-    if (parental_sources.imputed_rows is not None
-            and np.any(parental_sources.imputed_rows != -1)):
-        parental_sum += calculate_imputed_contribution(
-            parental_sources=parental_sources, imputed_gts=imputed_gts,
-            num_obs_par_alleles=num_obs_par_alleles, standard_f=standard_f)
-
-    return parental_sum / 2.0
+    loaded_rows = np.concatenate([in_omega, extra]).astype(int)
+    column_of_row = np.full(len(samples), -1)
+    column_of_row[loaded_rows] = np.arange(len(loaded_rows))
+    return bed[loaded_rows], column_of_row
 
 
-# -------------------------
-def calculate_imputed_contribution(parental_sources: ParentalSources, imputed_gts: np.ndarray,
-                                   num_obs_par_alleles: np.ndarray,
-                                   standard_f: np.ndarray) -> np.ndarray:
-    """Calculates the imputed parents' contribution to the parental sum
+def build_po_regression(samples: pd.DataFrame, parents: pd.DataFrame, phenotypes: np.ndarray,
+                        omega: sp.csr_array, column_of_row: np.ndarray):
+    """The PO regression: children with a genotyped parent, regressed on their own phenotypes
 
-    snipar folds the population allele frequency into its imputed genotypes, standing in for the
-    parental alleles it could not observe.  That term carries population structure, so it is
-    removed here and only genuinely observed alleles are kept.
-
-    The divisor depends on what the imputed value represents, which differs by parental status:
-    where ONE parent was observed it is that single missing parent's genotype, and where NEITHER
-    was it is the AVERAGE of the two.  An average has half the frequency contribution of a sum,
-    so the correction must be halved for it.  Without that, the neither-observed case
-    over-subtracts and produces negative observed-allele counts, which is impossible by
-    construction.
+    Its phenotype map is a selection matrix, so its phenotypic covariance is the children's block
+    of Omega.  It also records where each child's parents' data is.
 
     Args:
-        parental_sources: Describes the affected individuals and their imputed rows
-        imputed_gts: Imputed parental genotypes for this block, (families, snps)
-        num_obs_par_alleles: Observed parental allele counts for this block, same shape
-        standard_f: Per-SNP allele frequencies for this block
+        samples: The sample table, after select_omega_sample()
+        parents: identify_parents()'s result
+        phenotypes: prepare_phenotypes()'s result, (omega samples,)
+        omega: build_omega()'s result
+        column_of_row: plan_genotype_samples()'s second result
 
     Returns:
-        The imputed contribution to the parental sum, (snps, n_affected)
+        A Regression, or None if there are no such children (without a snipar file, for instance)
     """
 
-    rows = parental_sources.imputed_rows
-    has_imputed = rows != -1
+    if len(parents) == 0:
+        return None
+    omega_idx = samples[SAMPLE_OMEGA_IDX_COL].to_numpy()
+    focal = omega_idx[parents[PARENTS_CHILD_COL].to_numpy()]
+    num_omega = len(phenotypes)
+    A = sp.csr_array((np.ones(len(focal)), (np.arange(len(focal)), focal)),
+                     shape=(len(focal), num_omega))
 
-    contribution = np.zeros((imputed_gts.shape[1], len(rows)), dtype=float)
-    if not np.any(has_imputed):
-        return contribution
+    def column(rows):
+        return np.where(rows != -1, column_of_row[np.maximum(rows, 0)], -1)
 
-    # Transposed to (snps, affected) to match the genotype block's orientation
-    imputed = imputed_gts[rows[has_imputed], :].T.astype(float)
-    counts = num_obs_par_alleles[rows[has_imputed], :].T.astype(float)
-    frequency = standard_f[:, None]
-
-    # Where neither parent was observed, the imputed value is an average of two parents rather
-    # than one parent's genotype, so its frequency contribution is halved
-    neither_observed = (parental_sources.observed_parent_cols[has_imputed] == -1).all(axis=1)
-    divisor = np.where(neither_observed[None, :], 2.0, 1.0)
-
-    corrected = imputed - (frequency * (SNIPAR_TOTAL_PARENTAL_ALLELES - counts)) / divisor
-
-    # An average of two parents stands for both of them, so it contributes twice to the sum
-    corrected *= np.where(neither_observed[None, :], 2.0, 1.0)
-
-    contribution[:, has_imputed] = corrected
-
-    return contribution
+    columns = ParentColumns(father=column(parents[PARENTS_FATHER_COL].to_numpy()),
+                            mother=column(parents[PARENTS_MOTHER_COL].to_numpy()),
+                            family=parents[PARENTS_SNIPAR_FAMILY_COL].to_numpy())
+    logging.info(f"\tPO regression: {len(focal)} focal sample(s)")
+    return Regression(name=GROUP_PO, focal=focal, phenotype_map=A, phenotypes=A @ phenotypes,
+                      gls_weights=calculate_gls_weights(sp.csr_array(A @ omega @ A.T)),
+                      parents=columns)
 
 
-# -------------------------
-def get_block_snp_bounds(snp_filter: np.ndarray, M_start: int, num_to_read: int
-                         ) -> Tuple[int, int]:
-    """Finds which of the retained SNPs fall within a block
+def po_genotype_residuals(genotypes: np.ndarray, snipar_block,
+                          regression: Regression) -> np.ndarray:
+    """The PO regression's genotype residuals, for a block of SNPs
 
-    Returns positions into snp_filter, not SNP indices.  Both the block loop and
-    get_residualized_genotype_data() need this, and they must agree exactly: the first uses it to
-    fetch the matching imputed data, the second to slice the genotypes, and a disagreement would
-    pair each SNP with another SNP's parental values.
+    For each child at each SNP:
+        - both parents genotyped:                 g_c - (g_father + g_mother) / 2
+        - one parent genotyped, snipar k = 3:     g_c - g_obs / 2 - t, where t = imputed - f is
+                                                  the allele the other parent transmitted
+        - one parent genotyped, snipar k = 4:     g_c - (g_obs + g_other) / 2, where g_other =
+                                                  imputed is the other parent's genotype
+        - anything else -- k = 2 or missing, a SNP snipar lacks, a missing genotype -- is missing,
+          and a missing residual is zero.
+    t and g_other are rounded to whole numbers (SNIPAR_ALLELE_TOLERANCE).
 
     Args:
-        snp_filter: Indices of the SNPs retained for analysis, sorted
-        M_start: First SNP of the block, as an index into the unfiltered bim
-        num_to_read: Number of SNPs in the block
+        genotypes: The loaded samples' genotypes, (snps, loaded samples), NaN where missing; the
+            first columns are Omega's
+        snipar_block: SniparReader.read()'s result for the block, or None without a snipar file
+        regression: The PO regression
 
     Returns:
-        A tuple (lower, upper) of positions into snp_filter.  The SNPs they select are
-        snp_filter[lower:upper], so lower == upper means no retained SNP falls in this block.
+        The residuals, (snps, children)
     """
 
-    lower = np.searchsorted(snp_filter, M_start, side="left")
-    upper = np.searchsorted(snp_filter, M_start + num_to_read, side="left")
+    columns = regression.parents
+    num_snps, num_children = genotypes.shape[0], len(regression.focal)
 
-    return int(lower), int(upper)
+    def genotypes_of(cols):
+        out = np.full((num_snps, num_children), np.nan)
+        has = cols != -1
+        out[:, has] = genotypes[:, cols[has]]
+        return out
+
+    child = genotypes[:, regression.focal]
+    father, mother = genotypes_of(columns.father), genotypes_of(columns.mother)
+    both = (columns.father != -1) & (columns.mother != -1)
+    observed = np.where(columns.father != -1, father, mother)
+
+    residuals = np.full((num_snps, num_children), np.nan)
+    residuals[:, both] = (child - (father + mother) / 2)[:, both]
+
+    one = ~both & (columns.family != -1)
+    if snipar_block is not None and one.any():
+        imputed, counts, f = snipar_block
+        family = columns.family[one]
+        k, value = counts[:, family], imputed[:, family]
+        g_c, g_obs = child[:, one], observed[:, one]
+
+        transmitted = value - f[:, None]
+        other_genotype = value
+        result = np.full(k.shape, np.nan)
+        unfit = 0
+        for count, quantity, formula in (
+                (3, transmitted, lambda q: g_c - g_obs / 2 - q),
+                (4, other_genotype, lambda q: g_c - (g_obs + q) / 2)):
+            at = k == count
+            whole = np.rint(quantity)
+            fits = at & (np.abs(quantity - whole) <= SNIPAR_ALLELE_TOLERANCE)
+            unfit += int((at & ~fits & ~np.isnan(quantity)).sum())
+            result = np.where(fits, formula(whole), result)
+        if unfit:
+            logging.warning(f"{unfit} imputed parental value(s) in this block are not a whole "
+                            f"number of alleles as their observed-allele count implies, and are "
+                            f"treated as missing")
+        residuals[:, one] = result
+
+    # Every residual is an exact multiple of 1/2 -- whole-number genotypes, and snipar's values
+    # rounded to whole numbers above -- so unlike a relative regression's, none carries rounding
+    # noise needing GENOTYPE_RESIDUAL_TOLERANCE
+    return np.nan_to_num(residuals, nan=0.0)
 
 
-# -------------------------
-def read_imputed_block(imputed_hdf5, metadata: dict, block_hdf5_indices: np.ndarray,
-                       block_flip_mask: np.ndarray, chunk: dict) -> dict:
-    """Fetches one block's imputed parental data, maintaining a sliding chunk cache
+# Regressions: the genotype loop ==================================================================
 
-    HDF5 cannot serve a partial chunk: asking for a block's worth of SNPs reads and discards the
-    whole chunk containing them, and the next block does it again.  Chunk widths run from a few
-    hundred to several thousand SNPs while a block is typically a hundred, so reading per block
-    costs an order of magnitude more than necessary.  This keeps ONE chunk and slides it forward,
-    copying out each part of the block as it goes, which is valid because blocks are processed in
-    ascending SNP order and so the frontier never moves back.
+def relative_genotype_residuals(genotypes: np.ndarray, regression: Regression) -> np.ndarray:
+    """A relative regression's genotype residuals, R g, for a block of SNPs
 
-    The flip is applied HERE, to the raw genotypes and frequencies, rather than to the corrected
-    values further downstream.  A genotype always flips as 2 - g and a frequency as 1 - f, whereas
-    flipping a corrected value needs a constant that varies with how many parental alleles were
-    observed -- see calculate_imputed_contribution().
+    A missing genotype makes missing every residual it enters -- the focal sample's own, and those
+    of the focal samples it is a relative of -- and a missing residual is zero.  Residuals that are
+    only rounding noise are zero too (GENOTYPE_RESIDUAL_TOLERANCE).
 
     Args:
-        imputed_hdf5: Open handle to the imputed parental genotype file
-        metadata: Output of read_snipar_metadata()
-        block_hdf5_indices: Positions within the imputed file of this block's SNPs
-        block_flip_mask: Which of this block's SNPs need their imputed genotypes flipped
-        chunk: The cache, mutated in place.  Keys "cached_start" and "cached_stop" bound the SNP
-            range currently held, as a half-open interval into the imputed file's own ordering,
-            and "gts" and "counts" hold it.  cached_start is -1 before anything has been read
+        genotypes: The Omega samples' genotypes, (snps, omega samples), NaN where missing
+        regression: The regression
 
     Returns:
-        A dict of the keyword arguments calculate_parental_means() needs for this block
+        The residuals, (snps, focal)
     """
 
-    chunk_width = snipar.get_snipar_chunk_width(imputed_hdf5)
-    snp_count = snipar.get_snipar_snp_count(imputed_hdf5)
+    # Only R's stored entries are multiplied, so a NaN reaches only the residuals it enters
+    residuals = np.nan_to_num(np.asarray((regression.phenotype_map @ genotypes.T).T), nan=0.0)
+    residuals[np.abs(residuals) < GENOTYPE_RESIDUAL_TOLERANCE] = 0.0
+    return residuals
 
-    imputed_gts = None
-    num_obs_par_alleles = None
 
-    # Fill from the cached chunk, advancing whenever this block runs past its end.  Only ONE
-    # chunk is held at a time: the next is read, the part of the block it covers is copied out,
-    # and it then replaces the current one.  Caching a range spanning several chunks instead
-    # would be simpler but keeps them all resident, where this stays bounded at a single chunk
-    # however snps_per_block and the file's chunk width happen to line up.
-    #
-    # Advancing is only ever forward, which is what makes discarding the previous chunk safe:
-    # blocks are processed in ascending SNP order, and process_bim_file() rejects an imputed file
-    # whose SNPs are not in the bim's order (notes §13.2), so the frontier never moves back.
-    filled = 0
-    while filled < len(block_hdf5_indices):
-        if chunk["cached_start"] == -1 or block_hdf5_indices[filled] >= chunk["cached_stop"]:
-            start = (int(block_hdf5_indices[filled]) // chunk_width) * chunk_width
-            stop = min(start + chunk_width, snp_count)
+def regression_statistics(residuals: np.ndarray, regression: Regression):
+    """A regression's estimate for each SNP, and the quantities the covariance of estimates needs
 
-            # Rebinding drops the previous chunk, so the two coexist only between this read and
-            # the assignment completing
-            chunk["gts"], chunk["counts"] = snipar.read_snipar_snp_range(
-                imputed_hdf5, start, stop)
-            chunk["cached_start"], chunk["cached_stop"] = start, stop
-            logging.debug(f"\t\tRead imputed parental SNPs [{start}, {stop})")
-
-        if imputed_gts is None:
-            imputed_gts = np.empty((chunk["gts"].shape[0], len(block_hdf5_indices)), dtype=float)
-            num_obs_par_alleles = np.empty_like(imputed_gts)
-
-        # Take every SNP of this block that the current chunk covers, then go round again
-        covered = filled + int(np.searchsorted(block_hdf5_indices[filled:],
-                                               chunk["cached_stop"], side="left"))
-        offsets = block_hdf5_indices[filled:covered] - chunk["cached_start"]
-        imputed_gts[:, filled:covered] = chunk["gts"][:, offsets]
-        num_obs_par_alleles[:, filled:covered] = chunk["counts"][:, offsets]
-        filled = covered
-
-    standard_f = metadata[snipar.SNIPAR_STANDARD_F_KEY][block_hdf5_indices].astype(float)
-
-    if np.any(block_flip_mask):
-        imputed_gts[:, block_flip_mask] = (SNIPAR_ALLELES_PER_PARENT
-                                           - imputed_gts[:, block_flip_mask])
-        standard_f[block_flip_mask] = 1.0 - standard_f[block_flip_mask]
-
-    return {"imputed_gts" : imputed_gts,
-            "num_obs_par_alleles" : num_obs_par_alleles,
-            "standard_f" : standard_f}
-
-# -------------------------
-def get_residualized_genotype_data(bed_file: Union[str, np.ndarray], M_orig: int, N_orig: int,
-                                   snp_filter: np.ndarray, sample_filter: np.ndarray,
-                                   R: sp.csr_array, M_start: int,
-                                   num_snps: int, parental_sources: "ParentalSources" = None,
-                                   imputed_block: dict = None) -> Tuple[np.ndarray, int]:
-    """Performs processing of the bed file
-
-    Function to read in the bed file, possibly filter based on either user-provided snp or sample
-    lists as well as samples or SNPs dropped due to NaN / missing values, and then residualize
-    based on relatedness grouping.  Using the M_start and num_snps parameter, a subset / chunk
-    of the data can be read in (for all samples but only some of the SNPs).  Any values that are
-    NaN are set to 0.0 after residualization.
+    With Z the genotype residuals, Q the GLS weights and y the regression's phenotypes:
+    u = Z Q, d = Z'QZ per SNP, and beta = u y / d.  A SNP with no information in this regression
+    (d = 0, e.g. no variation among its samples) has no estimate: NaN.
 
     Args:
-        bed_file: String path to the bed file, or the ndarray itself (already read in).
-            (see https://www.cog-genomics.org/plink/1.9/formats#bed)
-        M_orig: Number of SNPs provided in the bim/bed file (prior to filtering)
-        N_orig: Number of samples provided in the fam/bed file (prior to filtering)
-        snp_filter: Indices (valued 0 to M_orig-1) of SNPs to include in analysis.  If None,
-            all SNPs are included
-        sample_filter: Indices (valued 0 to N_orig-1) of samples to include in analysis.  If None,
-            all samples are included
-        R: Matrix used to residualize based on relatedness groups
-        M_start: The index of the SNP to start at when reading in the data.  Should be between 0 and
-            M_orig - 1, inclusive
-        num_snps: The number of SNPs (prior to filtering) that should be read in.  If this would
-            cause more SNPs to be read in than are available (given the value of M_start), as many
-            as possible are read in
+        residuals: The genotype residuals Z, (snps, focal)
+        regression: The regression
 
     Returns:
-        A tuple (G, M) where:
-
-            G is the residualized genotype array
-            M is the number of SNPs in G / the number of SNPs actually read in
+        A tuple (u, d, beta): (snps, focal), (snps,) and (snps,)
     """
 
-    if M_start < 0 or M_start >= M_orig:
-        raise ValueError(f"Invalid value for M_start ({M_start}), which should be between "
-                         f"0 and {M_orig-1}")
-
-    if num_snps <= 0:
-        raise ValueError(f"Invalid value for num_snps ({num_snps}), which should be > 0")
-
-
-    # Figure out if a full block should be read or if we're near the end and it's a partial block
-    num_to_read = min(num_snps, M_orig - M_start)
-
-    # If we're filtering SNPs, find out what portion of the filter array (if any) is relevant
-    # and adjust for the offset.  Return early if the filter means skipping this whole block
-    if snp_filter is not None:
-        lower_index, upper_index = get_block_snp_bounds(snp_filter, M_start, num_to_read)
-
-        logging.debug(f"\t\t{lower_index=} {upper_index=}")
-        if lower_index == len(snp_filter) or lower_index == upper_index:
-            return None, 0
-
-        mod_snp_filter = snp_filter[lower_index:upper_index] - M_start
+    u = np.asarray((regression.gls_weights @ residuals.T).T)
+    d = np.einsum("sf,sf->s", residuals, u)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        beta = np.where(d > 0, (u @ regression.phenotypes) / d, np.nan)
+    return u, d, beta
 
 
-    # Read the bed file (or do nothing if we already have the genotype array)
-    G = read_bed_file(bed_filename=bed_file, M=M_orig, N=N_orig, M_start=M_start,
-                      num_snps=num_to_read) if isinstance(bed_file, str) else \
-        bed_file[M_start:M_start+num_to_read]
+def covariance_of_estimates(us: list, ds: list, names: list, cross: dict) -> np.ndarray:
+    """The covariance matrix C of the regressions' estimates, for each SNP
 
-
-    # Filter by SNP first.  The parental means below are computed from the FULL-WIDTH array,
-    # before any sample filtering, because a parent may have been dropped from the analysis for a
-    # missing phenotype while their genotypes remain perfectly usable.
-    G = G[mod_snp_filter] if snp_filter is not None else G
-
-    # Subtract the parental means BEFORE multiplying by R, not after.  For the affected
-    # individuals themselves the order makes no difference, since their identity rows pass them
-    # through either way.  It differs for everyone else in their relatedness groups: subtracting
-    # first means a relative centers against the differenced value, which is the intended
-    # behaviour.  Note also that every mean is computed before any subtraction is applied, so a
-    # multi-generation pedigree differences against raw parental genotypes rather than against
-    # values that have already been adjusted.
-    if parental_sources is not None and len(parental_sources.affected_samples) > 0:
-        # When bed_file is passed in as an array rather than a path, the slice above is a VIEW of
-        # the caller's data, and subtracting in place would modify it.  Fancy indexing by SNP
-        # already copies, so this only matters when there is no SNP filter.
-        if snp_filter is None:
-            G = G.copy()
-
-        parental_means = calculate_parental_means(G=G, parental_sources=parental_sources,
-                                                  **(imputed_block or {}))
-        G[:, parental_sources.affected_samples] -= parental_means
-
-    # Filter by sample now that the parental means have been taken
-    G = G[:, sample_filter] if sample_filter is not None else G
-
-    # Residualize the genotypes
-    residualized_genotypes = G @ R.T
-
-    # Replace NaN values with 0.0
-    np.nan_to_num(residualized_genotypes, copy=False)
-
-    return residualized_genotypes, residualized_genotypes.shape[0]
-
-
-
-# -------------------------
-
-def process_genotypes(bed_file: Union[str, np.ndarray], M_orig: int, N_orig: int, M: int, N: int,
-                      resid_phenotypes: np.ndarray, snp_filter: np.ndarray,
-                      sample_filter: np.ndarray,
-                      R: sp.csr_array, gls_weights: sp.csr_array, snps_per_block: int,
-                      parental_sources: ParentalSources = None,
-                      snp_alignment: SnpAlignment = None
-                      ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Performs the main GRMA processing (calculating betas and SEs)
-
-    Function that combines all the pre-processing and filtering, and then uses that to read in
-    the appropriate chunks of the bed file, and then calculate the betas and SEs.
+    C_ij = u_i (A_i Omega A_j') u_j' / (d_i d_j), the same as W Omega W' with each regression's
+    weights w = A'QZ/d spread over all of Omega, but without forming them.  C_ii equals 1/d_i,
+    each regression's own GLS variance.  Rows and columns of a regression without an estimate at a
+    SNP are NaN there.
 
     Args:
-        bed_file: String path to the bed file, or the ndarray itself (already read in).
-            (see https://www.cog-genomics.org/plink/1.9/formats#bed)
-        M_orig: Number of SNPs provided in the bim/bed file (prior to filtering)
-        N_orig: Number of samples provided in the fam/bed file (prior to filtering)
-        M: Number of SNPs used in the analysis (post-filtering)
-        N: Number of samples used in the analysis (post-filtering)
-        resid_phenotypes: Phenotypes that have been residualized by relatedness groups
-        snp_filter: Indices (valued 0 to M_orig-1) of SNPs to include in analysis.  If None,
-            all SNPs are included
-        sample_filter: Indices (valued 0 to N_orig-1) of samples to include in analysis.  If None,
-            all samples are included
-        R: Matrix used to residualize based on relatedness groups
-        gls_weights: Matrix the regression weights observations by (see calculate_gls_weights)
-        snps_per_block: The number of SNPs to process at a time (prior to filtering, so some blocks
-            will potentially include less than this).  If more are specified here than are
-            available, then all SNPs will be processed together in one block.
-        parental_sources: Describes whose genotypes are residualized against their parents, or
-            None when no parental residualization applies
-        snp_alignment: Maps the retained SNPs onto the imputed parental genotype file, or None
-            when no such file was supplied
+        us, ds: Each regression's u, (snps, focal_i), and d, (snps,), from regression_statistics()
+        names: The regressions' names, in the same order
+        cross: build_cross_covariances()'s result
 
     Returns:
-        A tuple (betas, ses, XtWX) where:
-
-            betas are the per-SNP effect estimates
-            ses are their standard errors
-            XtWX is the per-SNP weighted sum of squares, reported as SUM_SQ_X
+        C, (snps, regressions, regressions)
     """
 
-    # Error checking
-    if not isinstance(bed_file, (str, np.ndarray)):
-        raise TypeError(f"Expected str or Numpy array for parameter bed_file, but "
-                        f"received {type(bed_file)}")
-
-    if snps_per_block <= 0:
-        raise ValueError(f"Invalid value for snps_per_block ({snps_per_block}).  "
-                         f"Must be > 0")
-    
-    # Debug logging
-    logging.debug(f"\t{M_orig=} {M=} {N_orig=} {N=} {snps_per_block=}")
-    logging.debug(f"\t{snp_filter=}")
-    logging.debug(f"\t{sample_filter=}")
-
-    # Create a place for results to be stored
-    betas, ses, XtWX = np.zeros(M), np.zeros(M), np.zeros(M)
-
-    # The phenotypes do not change between blocks, so weight them once rather than every pass
-    weighted_phenotypes = gls_weights @ resid_phenotypes
-
-    # Process data in blocks of SNPs
-    num_blocks = int(np.ceil(M_orig / snps_per_block))
-    logging.info(f"\tGenotype data will be processed in {num_blocks} "
-                  f"block{"s" if num_blocks > 1 else ""}\n")
-    current_position = 0
-
-    # The imputed parental genotype file is held open for the whole loop rather than reopened per
-    # block, and its data is cached a chunk at a time (see read_imputed_block).  nullcontext lets
-    # a single with-statement cover both modes.
-    reading_imputed = parental_sources is not None and parental_sources.imputed_file is not None
-    file_context = (snipar.open_snipar_file(parental_sources.imputed_file) if reading_imputed
-                    else contextlib.nullcontext())
-
-    with file_context as imputed_hdf5:
-        chunk = {"cached_start" : -1, "cached_stop" : -1, "gts" : None, "counts" : None}
-
-        for block_num in range(num_blocks):
-            logging.debug(f"\tProcessing block {block_num}")
-
-            M_start = block_num * snps_per_block
-            num_to_read = min(snps_per_block, M_orig - M_start)
-
-            # Fetch this block's imputed parental data before the genotypes, so that the two are
-            # sliced by the same bounds and each SNP is paired with its own parental values
-            imputed_block = None
-            if reading_imputed:
-                lower, upper = get_block_snp_bounds(snp_filter, M_start, num_to_read)
-                if lower == upper:
-                    logging.debug(f"\tAll SNPs filtered out in this block!")
-                    continue
-
-                imputed_block = read_imputed_block(
-                    imputed_hdf5=imputed_hdf5,
-                    metadata=parental_sources.snipar_metadata,
-                    block_hdf5_indices=snp_alignment.hdf5_indices[lower:upper],
-                    block_flip_mask=snp_alignment.flip_mask[lower:upper],
-                    chunk=chunk)
-
-            block_genotypes, snps_read = get_residualized_genotype_data(
-                bed_file=bed_file,
-                M_orig=M_orig,
-                N_orig=N_orig,
-                snp_filter=snp_filter,
-                sample_filter=sample_filter,
-                R=R,
-                M_start=M_start,
-                num_snps=snps_per_block,
-                parental_sources=parental_sources,
-                imputed_block=imputed_block
-            )
-            if snps_read == 0:
-                logging.debug(f"\tAll SNPs filtered out in this block!")
-                continue
-
-            # Calculate betas and SEs for this block of SNPs
-            block_betas, block_ses, block_XtWX = calculate_gls_estimates(
-                genotypes=block_genotypes,
-                gls_weights=gls_weights,
-                weighted_phenotypes=weighted_phenotypes
-            )
-
-            # Record the values and increment the current result position
-            betas[current_position:current_position+snps_read] = block_betas
-            ses[current_position:current_position+snps_read] = block_ses
-            XtWX[current_position:current_position+snps_read] = block_XtWX
-            current_position += snps_read
-
-    logging.info("\tDone processing bed file blocks.\n")
-    logging.info(f"\tNumber of SNPs used: {M}")
-    logging.info(f"\tNumber of samples used: {N}")
-    return betas, ses, XtWX
-
-# -------------------------
-def calculate_pvals(betas: np.ndarray, ses: np.ndarray) -> np.ndarray:
-    z_scores = betas / ses
-
-    # Since P = 2 * normal_cdf(-|Z|), P = e ^ (log_normal_cdf(-|Z|) + ln 2)
-    # This can be changed to base 10 as P = 10 ^ ((log_normal_cdf(-|Z|) + ln 2) / ln 10)
-    log_10_p = RECIP_LN_10 * (norm.logcdf(-np.abs(z_scores)) + LN_2)
-
-    # Break up the log based 10 of P values into the integer and fractional part
-    # To handle the case of Z = 0 (and not result in "10e-1"), set initial values to (-1.0, 1.0)
-    frac_part, int_part = np.full_like(z_scores, -1.0), np.full_like(z_scores, 1.0)
-    np.modf(log_10_p, out=(frac_part, int_part), where=(z_scores != 0.0))
-
-    # A SNP carrying no information gives XtWX = 0, hence a NaN beta and an infinite standard
-    # error (see calculate_gls_estimates).  Those cannot be formatted as a number and must not be
-    # cast to int, so they are reported as NaN and excluded from the arithmetic below.
-    usable = np.isfinite(z_scores)
-    frac_part = np.where(usable, frac_part, 0.0)
-    int_part = np.where(usable, int_part, 1.0)
-
-    # Construct strings for the P values
-    # 1) Add one to the fractional part to ensure that the result mantissa is between 1 and 10
-    # 2) Subtract one from the integer part to compensate and keep the overall value correct
-    result = np.char.add(np.char.add(np.power(10.0, (frac_part + 1.0)).astype(str), 'e'),
-                         (int_part - 1).astype(int).astype(str))
-
-    return np.where(usable, result, str(np.nan))
+    num_snps, num = len(ds[0]), len(ds)
+    C = np.full((num_snps, num, num), np.nan)
+    for i in range(num):
+        for j in range(i, num):
+            weighted = np.asarray((cross[(names[i], names[j])].T @ us[i].T).T)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                value = np.einsum("sf,sf->s", weighted, us[j]) / (ds[i] * ds[j])
+            valid = (ds[i] > 0) & (ds[j] > 0)
+            C[:, i, j] = C[:, j, i] = np.where(valid, value, np.nan)
+    return C
 
 
-def calculate_chisqs(betas: np.ndarray, ses: np.ndarray) -> np.ndarray:
-    return np.square(betas / ses)
+def meta_analyze(betas: np.ndarray, C: np.ndarray):
+    """The optimally weighted combination of estimates, for each SNP
+
+    Weights a = C^+ 1 / (1' C^+ 1), estimate a'b, standard error sqrt(a' C a), with C^+ the
+    pseudo-inverse in case C is singular.  An estimate missing at a SNP is left out there: zeroing
+    its row and column of C makes its pseudo-inverse weight exactly zero.
+
+    Args:
+        betas: The estimates to combine, (snps, k), NaN where missing
+        C: Their covariance, (snps, k, k), NaN where missing
+
+    Returns:
+        A tuple (estimate, standard error), each (snps,), NaN where every estimate is missing
+    """
+
+    present = ~np.isnan(betas)
+    b = np.where(present, betas, 0.0)
+    mask = present[:, :, None] & present[:, None, :]
+    C = np.where(mask, C, 0.0)
+
+    weights = np.linalg.pinv(C, hermitian=True) @ np.ones(betas.shape[1])
+    total = weights.sum(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        a = weights / total[:, None]
+        estimate = np.where(present.any(axis=1), np.einsum("sk,sk->s", a, b), np.nan)
+        variance = np.einsum("sk,skl,sl->s", a, C, a)
+    se = np.where(present.any(axis=1), np.sqrt(variance), np.nan)
+    return estimate, se
 
 
-def create_output(bim_file: Union[str, pd.DataFrame], snp_filter: np.ndarray,
-                  betas: np.ndarray, ses: np.ndarray, sum_sq_x: np.ndarray) -> pd.DataFrame:
+def estimate_block(genotypes: np.ndarray, regressions: list, cross: dict, estimates: list,
+                   snipar_block=None):
+    """Every reported estimate and its standard error, for a block of SNPs
 
-    # Read in bim file
-    bim_df, _ = get_df(bim_file, "bim_file", {"usecols" : list(range(len(BIM_COLS))), 
-                                              "names" : BIM_COLS})
+    Args:
+        genotypes: The loaded samples' genotypes (plan_genotype_samples()), (snps, loaded
+            samples), NaN where missing; the first columns are Omega's
+        regressions: The regressions
+        cross: build_cross_covariances()'s result
+        estimates: reported_estimates()'s result
+        snipar_block: SniparReader.read()'s result for the block, or None without a snipar file
 
-    # Filter dataframe if need be
-    bim_df = bim_df.iloc[snp_filter].reset_index(drop=True) if snp_filter is not None else bim_df
+    Returns:
+        A tuple (betas, ses), each (snps, estimates)
+    """
 
-    # Calculate P values
-    p_values = calculate_pvals(betas=betas, ses=ses)
+    names = [r.name for r in regressions]
+    us, ds, betas = [], [], []
+    for regression in regressions:
+        if regression.parents is not None:
+            residuals = po_genotype_residuals(genotypes, snipar_block, regression)
+        else:
+            num_omega = regression.phenotype_map.shape[1]
+            residuals = relative_genotype_residuals(genotypes[:, :num_omega], regression)
+        u, d, beta = regression_statistics(residuals, regression)
+        us.append(u)
+        ds.append(d)
+        betas.append(beta)
+    num_snps = genotypes.shape[0]
+    all_betas = np.column_stack(betas) if betas else np.empty((num_snps, 0))
+    C = (covariance_of_estimates(us, ds, names, cross) if regressions
+         else np.empty((num_snps, 0, 0)))
 
-    # Calculate chi squared values
-    chisqs = calculate_chisqs(betas=betas, ses=ses)
-
-    # Create new dataframe with output columns
-    flip_betas = -betas  # Betas should be reported for A2, so flip sign
-    extra_cols_df = pd.DataFrame(data={
-            OUTPUT_BETA_COL : flip_betas, 
-            OUTPUT_SE_COL : ses,
-            OUTPUT_P_COL: p_values,
-            OUTPUT_SUMSQX_COL: sum_sq_x
-        }
-    )
-
-    # Combine dataframes
-    results_df = pd.concat([bim_df, extra_cols_df], axis=1)
-
-
-    # Log some results
-    summary_df = pd.DataFrame(
-        {
-            "Beta" : [flip_betas.min(), flip_betas.mean(), flip_betas.std(), flip_betas.max()],
-            "SE" : [ses.min(), ses.mean(), ses.std(), ses.max()],
-            "CHI_SQ" : [chisqs.min(), chisqs.mean(), chisqs.std(), chisqs.max()]
-        },
-        index=["MIN", "MEAN", "STD_DEV", "MAX"]
-    )
-    logging.info(f"\tSummary table:\n{textwrap.indent(summary_df.to_string(), "\t")}")
-
-
-    return results_df
+    out_betas = np.full((num_snps, len(estimates)), np.nan)
+    out_ses = np.full((num_snps, len(estimates)), np.nan)
+    for e, combined in enumerate(estimates):
+        idx = [names.index(n) for n in combined if n in names]
+        if idx:
+            out_betas[:, e], out_ses[:, e] = meta_analyze(all_betas[:, idx],
+                                                          C[:, idx][:, :, idx])
+    return out_betas, out_ses
 
 
-# -------------------------
-def grma(
-    *,
-    rel_file: Union[str, pd.DataFrame],
-    bed_file: Union[str, np.ndarray],
-    bim_file: Union[str, pd.DataFrame],
-    fam_file: Union[str, pd.DataFrame],
-    rel_degree: Union[str, int],
-    pheno_file: Union[str, pd.DataFrame] = None,
-    covar_file: Union[str, pd.DataFrame] = None,
-    snps_per_block: int = DEFAULT_SNPS_PER_BLOCK,
-    id_list: Union[str, pd.DataFrame] = None,
-    snp_list: Union[str, pd.DataFrame] = None,
+# Planning and running ============================================================================
+
+@dataclasses.dataclass
+class AnalysisPlan:
+    """Everything the genotype loop needs, and nothing else
+
+    Built by plan_analysis() from every input except the genotypes.  Every table used to build it
+    is released when plan_analysis() returns, so that memory is left for the genotype data.
+
+    Attributes:
+        regressions: The regressions, in REGRESSION_ORDER
+        cross: build_cross_covariances()'s result
+        estimates: reported_estimates()'s result
+        bed_cols: The bed file columns to read, (loaded samples,)
+        snps: The SNP plan
+        bim: The analysed SNPs' bim rows, for the output
+        num_file_snps, num_file_samples: The bed file's dimensions
+        imputed_parental_file: snipar's file, or None
+        standard_f: snipar's allele frequency for each SNP in its file, or None
+    """
+
+    regressions: list
+    cross: dict
+    estimates: list
+    bed_cols: np.ndarray
+    snps: SnpPlan
+    bim: pd.DataFrame
+    num_file_snps: int
+    num_file_samples: int
     imputed_parental_file: str = None
-) -> pd.DataFrame:
-
-    logging.debug(f"GRMA called with: {locals()}\n\n")
-
-    grma_time = time.time()
-    logging.info("Beginning grma() processing\n")
-
-    # Process fam file and phenotype data
-    fam_time = time.time()
-    logging.info("Processing fam file / phenotype data")
-    N_orig, N, sample_filter, fam_df, unresidualized_phenotypes = process_phenotypes(
-        fam_file=fam_file,
-        pheno_file=pheno_file,
-        sample_id_file=id_list,
-        covar_file=covar_file
-    )
-    if len(sample_filter) == 0:
-        raise ValueError("Resulting sample filter is empty.")
-    logging.info(f"Processing fam file / phenotype data took {time.time() - fam_time} seconds\n")
+    standard_f: np.ndarray = None
 
 
+def plan_analysis(*, rel_file, bim_file, fam_file, rel_degree, pheno_file=None, covar_file=None,
+                  id_list=None, snp_list=None, imputed_parental_file: str = None) -> AnalysisPlan:
+    """Reads and checks every input except the genotypes, and builds the analysis plan
 
-    # Process relatedness file (generate R and the SE matrix)
-    rel_time = time.time()
-    logging.info("Processing relatedness info")
-    R, gls_weights, resid_phenotypes, parental_sources = process_relatedness(
-        rel_file=rel_file,
-        fam_file=fam_file,
-        fam_df=fam_df,
-        rel_degree=rel_degree,
-        unresidualized_phenotypes=unresidualized_phenotypes,
-        imputed_parental_file=imputed_parental_file
-    )
-    del unresidualized_phenotypes
-    logging.info(f"Processing relatedness info took {time.time() - rel_time} seconds\n")
+    Every check runs here, so a problem with any input is reported before any genotype is read.
+
+    Args:
+        As for grma()
+
+    Raises:
+        ValueError: If any input fails a check
+
+    Returns:
+        The AnalysisPlan
+    """
+
+    rel_degree = int(rel_degree)
+
+    logging.info("Reading the samples")
+    samples = build_sample_table(
+        grma_io.read_fam(fam_file),
+        pheno=None if pheno_file is None else grma_io.read_pheno(pheno_file),
+        covar=None if covar_file is None else grma_io.read_covar(covar_file),
+        id_list=None if id_list is None else grma_io.read_id_list(id_list))
+
+    logging.info("Reading the relatedness file")
+    graph = build_relatedness_graph(samples, grma_io.read_king(rel_file))
+    samples, graph = resolve_duplicates(samples, graph)
+
+    logging.info("Identifying parents and groups")
+    snipar_metadata = (None if imputed_parental_file is None
+                       else snipar_hdf5.read_snipar_metadata(imputed_parental_file))
+    parents = identify_parents(samples, graph, snipar_metadata)
+    samples = assign_groups(samples, graph, parents, rel_degree=rel_degree)
+
+    logging.info("Building Omega")
+    samples = select_omega_sample(samples, parents)
+    phenotypes = prepare_phenotypes(samples)
+    omega = build_omega(samples, graph, phenotypes)
+
+    logging.info("Setting up the regressions")
+    bed_cols, column_of_row = plan_genotype_samples(samples, parents)
+    po = build_po_regression(samples, parents, phenotypes, omega, column_of_row)
+    if snipar_metadata is not None and po is None:
+        logging.warning("No sample qualifies for the PO regression, so it is omitted; every "
+                        "reported estimate that would include it equals the one without it")
+    regressions = (([po] if po is not None else []) +
+                   build_relative_regressions(samples, graph, phenotypes, omega,
+                                              rel_degree=rel_degree))
+    cross = build_cross_covariances(regressions, omega)
+    estimates = reported_estimates(has_po=snipar_metadata is not None, rel_degree=rel_degree)
+
+    logging.info("Reading the SNPs")
+    bim = grma_io.read_bim(bim_file)
+    snps = plan_snps(bim, snp_list=None if snp_list is None else grma_io.read_snp_list(snp_list),
+                     snipar_metadata=snipar_metadata)
+
+    return AnalysisPlan(
+        regressions=regressions, cross=cross, estimates=estimates, bed_cols=bed_cols, snps=snps,
+        bim=bim.iloc[snps.bim_rows].reset_index(drop=True), num_file_snps=len(bim),
+        num_file_samples=len(samples), imputed_parental_file=imputed_parental_file,
+        standard_f=(None if snipar_metadata is None
+                    else snipar_metadata[snipar_hdf5.SNIPAR_STANDARD_F_KEY]))
 
 
-    # Process bim file (generate SNP filter)
-    bim_time = time.time()
-    logging.info("Processing bim file")
-    M_orig, M, snp_filter, snp_alignment = process_bim_file(
-        bim_file=bim_file, snp_list=snp_list, parental_sources=parental_sources)
-    if snp_filter is not None and len(snp_filter) == 0:
-        raise ValueError("Resulting SNP filter is empty.")
-    logging.info(f"Processing bim file took {time.time() - bim_time} seconds\n")
+def run_analysis(plan: AnalysisPlan, bed_file,
+                 snps_per_block: int = DEFAULT_SNPS_PER_BLOCK) -> pd.DataFrame:
+    """Streams the genotypes through the plan, a block of SNPs at a time
+
+    Args:
+        plan: plan_analysis()'s result
+        bed_file: As for grma()
+        snps_per_block: How many SNPs to process at a time
+
+    Returns:
+        GRMA's results, as grma_io.build_output() describes them
+    """
+
+    num_snps = len(plan.snps.bim_rows)
+    betas = np.full((num_snps, len(plan.estimates)), np.nan)
+    ses = np.full((num_snps, len(plan.estimates)), np.nan)
+    reader = (grma_io.SniparReader(plan.imputed_parental_file, plan.standard_f)
+              if plan.imputed_parental_file is not None else None)
+    try:
+        for start in range(0, num_snps, snps_per_block):
+            block = slice(start, min(start + snps_per_block, num_snps))
+            genotypes = grma_io.read_genotype_block(bed_file, plan.num_file_snps,
+                                                     plan.num_file_samples,
+                                                     plan.snps.bim_rows[block], plan.bed_cols)
+            snipar_block = (None if reader is None
+                            else reader.read(plan.snps.snipar_positions[block],
+                                             plan.snps.flip[block]))
+            betas[block], ses[block] = estimate_block(genotypes, plan.regressions, plan.cross,
+                                                      plan.estimates, snipar_block=snipar_block)
+            logging.debug(f"\tSNPs {block.start} to {block.stop - 1} done")
+    finally:
+        if reader is not None:
+            reader.close()
+    logging.info(f"\t{num_snps} SNP(s) analysed")
+    return grma_io.build_output(plan.bim, plan.estimates, betas, ses)
 
 
-    # Process bed file (generate betas and SEs)
-    bed_time = time.time()
-    logging.info("Processing bed file / running regressions / calculating standard errors")
-    betas, ses, sum_sq_x = process_genotypes(
-        bed_file=bed_file,
-        M_orig=M_orig,
-        N_orig=N_orig,
-        M=M,
-        N=N,
-        resid_phenotypes=resid_phenotypes,
-        snp_filter=snp_filter,
-        sample_filter=sample_filter,
-        R=R,
-        gls_weights=gls_weights,
-        snps_per_block=snps_per_block,
-        parental_sources=parental_sources,
-        snp_alignment=snp_alignment
-    )
-    logging.info(f"Processing bed file took {time.time() - bed_time} seconds\n")
- 
-    # Collate results and output them
-    output_time = time.time()
-    logging.info("Creating output (combining results with values from bim file)")
-    results = create_output(bim_file=bim_file, snp_filter=snp_filter,
-                            betas=betas, ses=ses, sum_sq_x=sum_sq_x)
-    logging.info(f"Creating output took {time.time() - output_time} seconds\n")
+def grma(*, rel_file, bed_file, bim_file, fam_file, rel_degree, pheno_file=None,
+          covar_file=None, snps_per_block: int = DEFAULT_SNPS_PER_BLOCK, id_list=None,
+          snp_list=None, imputed_parental_file: str = None) -> pd.DataFrame:
+    """GRMA: plans the analysis from every input but the genotypes, then runs it
 
+    Takes the same keyword arguments as the original implementation's grma(), so the command line
+    can switch to it with no other change.  Each input may be a path or, for testing, its contents.
 
-    logging.info(f"Finished grma() processing.  It took {time.time() - grma_time} seconds.\n")
-    return results
+    Args:
+        rel_file: KING's relatedness file
+        bed_file: The bed file, or its genotypes as an array, (file snps, file samples)
+        bim_file, fam_file: The bim and fam files
+        rel_degree: The highest relationship degree to run a regression for, 0 to MAX_REL_DEGREE
+        pheno_file, covar_file, id_list, snp_list: Optional inputs, as their readers describe
+        snps_per_block: How many SNPs to process at a time
+        imputed_parental_file: snipar's imputed parental genotype file, or None
+
+    Raises:
+        ValueError: If any input fails a check, before any genotype is read
+
+    Returns:
+        GRMA's results, as grma_io.build_output() describes them
+    """
+
+    plan = plan_analysis(rel_file=rel_file, bim_file=bim_file, fam_file=fam_file,
+                         rel_degree=rel_degree, pheno_file=pheno_file, covar_file=covar_file,
+                         id_list=id_list, snp_list=snp_list,
+                         imputed_parental_file=imputed_parental_file)
+    return run_analysis(plan, bed_file, snps_per_block=snps_per_block)
 
 
 #################################
 if __name__ == "__main__":
-    print("This script is not meant to be called directly.")
 
-    
+    print("This script is not meant to be called directly.")

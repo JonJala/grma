@@ -27,8 +27,9 @@ This should produce files user_3_tutorial.res and user_3.log in the tutorial dir
 In this case, the .res file has results using the degree 3 relationship threshold.
 
 
-Compare the "user" files with the provided "tutorial" files to make sure things are running correctly.
-The results should be very close (different package versions and hardware could introduce negligible deviations).
+Compare the "user" results files with the provided "tutorial" files (tutorial_FS.res and
+tutorial_3.res) to make sure things are running correctly.  The results should be very close
+(different package versions and hardware could introduce negligible deviations).
 
 You can also run "pytest" in the main GRMA folder to run through the suite of GRMA tests (especially
 useful if the results of the previous steps differ too much from the provided results, since it could
@@ -37,40 +38,93 @@ provide information about what portions of the code might be running into issues
 
 ========================================================
 
+Output:
+
+GRMA writes one tab-separated results file per fileset, named [--out prefix]_[fileset name].res,
+and a log file, [--out prefix].log.  Each results file has one row per SNP analysed: the bim file's
+columns (CHR, RSID, CM, BP, A1, A2), then three columns for each reported estimate:
+
+  BETA_<label>    the estimate, for the A2 allele
+  SE_<label>      its standard error
+  P_<label>       its two-sided p-value
+
+GRMA runs up to four regressions -- parent-offspring (PO), full sibling (FS), 2nd-degree (2ND) and
+3rd-degree (3RD) -- and reports their cumulative, optimally weighted combinations.  Each <label>
+names the regressions an estimate combines:
+
+  With --imputed-parents:     PO, PO_FS, PO_FS_2ND, PO_FS_2ND_3RD
+  Without:                    FS, FS_2ND, FS_2ND_3RD
+
+--rel-thresh decides how far the list goes: FS or 1 stops at FS, 2 at 2ND, 3 at 3RD.  The columns
+depend only on the options given, never on the data: a regression no sample qualifies for
+contributes nothing (with a warning in the log), so an estimate including it equals the one before
+it.  Missing values are written as NA.
+
+Parents, and the parent-offspring regression, come only from the --imputed-parents files (snipar's
+imputed parental genotypes, one file per chromosome); the fam file's parental ID columns are never
+used.
+
+========================================================
+
 Usage info:
 
-usage: ./grma.py [-h] --bfile GLOB_PATH [GLOB_PATH ...] [--fam FILE] [--pheno FILE] [--covar FILE] --rel-pedigree FILE [--rel-thresh THRESHOLD] [--id-list FILE] [--snp-list FILE]
-                 [--out FILE_PREFIX] [--snps-per-block SNPS_PER_BLOCK] [--quiet | --verbose]
+usage: grma.py [-h] --bfile GLOB_PATH [GLOB_PATH ...] [--fam FILE] [--pheno FILE] [--covar FILE]
+               --rel-pedigree FILE [--imputed-parents GLOB_PATH [GLOB_PATH ...]] [--rel-thresh THRESHOLD]
+               [--id-list FILE] [--snp-list FILE] [--out FILE_PREFIX] [--snps-per-block SNPS_PER_BLOCK]
+               [--quiet | --verbose]
 
 options:
   -h, --help            show this help message and exit
 
 Input Specifications:
   --bfile GLOB_PATH [GLOB_PATH ...]
-                        Paths to PLINK 1 binary files. See python glob module for documentation on the string(s) to be provided here (full path with support for "*", "?", and "[]").
-                        These strings should be encased in quotes.  Files must
-                            be split by chromosome (one and only one chromosome per file)
-  --fam FILE            Optional input to specify full path and filename of input fam file. Overrides --bfile flag if specified
-  --pheno FILE          Optional input to specify a (Plink-style) phenotype file: https://www.cog-genomics.org/plink/1.9/input#pheno
-  --covar FILE          Optional input to specify a (Plink-style) covariates file: https://www.cog-genomics.org/plink/2.0/input#covar
-  --rel-pedigree FILE   Path to KING-formatted relatedness file (ASCII). Needs the following columns: ['FID1', 'ID1', 'FID2', 'ID2', 'Kinship', 'InfType']
+                        Paths to PLINK 1 binary files. See python glob module for documentation on the
+                        string(s) to be provided here (full path with support for "*", "?", and "[]"). These
+                        strings should be encased in quotes. Files must be split by chromosome (one and only
+                        one chromosome per file)
+  --fam FILE            Optional input to specify full path and filename of input fam file. Overrides
+                        --bfile flag if specified
+  --pheno FILE          Optional input to specify a (Plink-style) phenotype file: https://www.cog-
+                        genomics.org/plink/1.9/input#pheno
+  --covar FILE          Optional input to specify a (Plink-style) covariates file: https://www.cog-
+                        genomics.org/plink/2.0/input#covar
+  --rel-pedigree FILE   Path to KING-formatted relatedness file (ASCII). Needs the following columns:
+                        ['FID1', 'ID1', 'FID2', 'ID2', 'InfType']
+  --imputed-parents GLOB_PATH [GLOB_PATH ...]
+                        Optional input to specify imputed parental genotype files (HDF5, as written by
+                        snipar's impute.py). One file per chromosome, matched to the --bfile filesets by the
+                        chromosome recorded inside each file. See python glob module for documentation on
+                        the string(s) to be provided here (full path, including the file's suffix, with
+                        support for "*", "?", and "[]"). These strings should be encased in quotes. Parents,
+                        and the parent-offspring regression, come only from these files: without them there
+                        is no parent-offspring regression, and the fam file's parental ID columns are never
+                        consulted. Parents whose genotypes are OBSERVED (i.e. are part of the sample) have
+                        genotypes read from the bed file(s).
 
 Analysis Options:
   --rel-thresh THRESHOLD
-                        Relatedness threshold. Can be one of ['FS', '1', '2', '3']. Default is 1
+                        Relatedness threshold: which regressions to run and report. FS or 1: parent-
+                        offspring (with --imputed-parents) and full siblings; 2: adds 2nd-degree relatives;
+                        3: adds 3rd-degree relatives. Can be one of ['FS', '1', '2', '3']. Default is 1
 
 Input Filtering Options:
-  --id-list FILE        Optional input to specify a whitespace-delimited sample ID file of sample FIDs and IIDs to include. No header allowed. See Plink flag --keep.
-  --snp-list FILE       Optional input to specify a whitespace-delimited variant ID file of variant IDs to include. No header allowed. See Plink flag --extract.
+  --id-list FILE        Optional input to specify a whitespace-delimited sample ID file of sample FIDs and
+                        IIDs to include. No header allowed. See Plink flag --keep.
+  --snp-list FILE       Optional input to specify a whitespace-delimited variant ID file of variant IDs to
+                        include. No header allowed. See Plink flag --extract.
 
 Output Specifications:
-  --out FILE_PREFIX     Full prefix of output files (logs, sumstats results, etc.). If not set, [current working directory]/grma will
-                        be used. Note: The containing directory specified must already exist.
+  --out FILE_PREFIX     Full prefix of output files (logs, sumstats results, etc.). If not set, [current
+                        working directory]/grma = "/home/claude/repo/grma/grma" will be used. Note: The
+                        containing directory specified must already exist.
 
 General Options:
   --snps-per-block SNPS_PER_BLOCK
                         Number of SNPs to process at a time. Default is 100
-  --quiet               This option will cause the program to limit logging and terminal output to warnings and errors and reduce output compared to the default/standard logging mode. It
-                        is mutually exclusive with the --verbose option.
-  --verbose             This option will greatly increase the logging and terminal output of the program compared to the default/standard logging mode. This is useful for debugging and
-                        greater visibility into the processing that is occurring. It is mutually exclusive with the --quiet option.
+  --quiet               This option will cause the program to limit logging and terminal output to warnings
+                        and errors and reduce output compared to the default/standard logging mode. It is
+                        mutually exclusive with the --verbose option.
+  --verbose             This option will greatly increase the logging and terminal output of the program
+                        compared to the default/standard logging mode. This is useful for debugging and
+                        greater visibility into the processing that is occurring. It is mutually exclusive
+                        with the --quiet option.

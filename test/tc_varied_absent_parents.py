@@ -1,30 +1,59 @@
 """
-VARIED_ABSENT_PARENTS: VARIED with parent columns that name people who are not in the fam file, so
-no one has two genotyped parents and parental residualization is a no-op.  Results must be exactly
-VARIED's (EQUIVALENT_TO).
+VARIED_ABSENT_PARENTS: VARIED, with fam-file parent columns naming people who are not in the fam
+file.  GRMA takes parents only from snipar's pedigree and ignores these columns, so the results
+must be exactly VARIED's.
 
-Three patterns, each of which must leave a sample unaffected in fam file trio mode:
-
-    IIDs 0, 1, 2    both parents named, neither in the fam file
-    IID 7           only a father named, and absent
-    IID 11          only a mother named, and absent
+    IIDs 0, 1, 2    both parents named
+    IID 7           only a father named
+    IID 11          only a mother named
 """
 
-import bedbimfam as bbf
-
-import tc_varied as _base
-from tc_varied import (REL_DF, BIM_DF, G, SNP_LIST, RETAINED_RSIDS, R_MATRICES, RESID_PHENOS,
-                       RESID_GENOS)
+import numpy as np
+import pandas as pd
 
 
-_NAMED = {0 : ("absent_dad_0", "absent_mum_0"), 1 : ("absent_dad_0", "absent_mum_0"),
-          2 : ("absent_dad_0", "absent_mum_0"), 7 : ("absent_dad_2", "0"),
-          11 : ("0", "absent_mum_4")}
+FAM_DF = pd.DataFrame({'FID' : [0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10], 'IID' : [0,
+                       1,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17], 'IIDF' : ['absent_dad_0',
+    'absent_dad_0', 'absent_dad_0', '0', '0', '0', '0', 'absent_dad_2', '0', '0', '0', '0',
+    '0', '0', '0', '0', '0', '0'], 'IIDM' : ['absent_mum_0', 'absent_mum_0', 'absent_mum_0',
+    '0', '0', '0', '0', '0', '0', '0', '0', 'absent_mum_4', '0', '0', '0', '0', '0', '0'],
+    'SEX' : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 'PHENO' : [1.0, 2.0, 3.0,
+    4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0]})
 
-FAM_DF = _base.FAM_DF.copy()
-FAM_DF[bbf.FAM_IIDF_COL] = [_NAMED.get(iid, ("0", "0"))[0] for iid in FAM_DF[bbf.FAM_IID_COL]]
-FAM_DF[bbf.FAM_IIDM_COL] = [_NAMED.get(iid, ("0", "0"))[1] for iid in FAM_DF[bbf.FAM_IID_COL]]
+REL_DF = pd.DataFrame({'FID1' : [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 4, 5, 7, 7, 9],
+    'ID1' : [0, 0, 1, 3, 3, 3, 3, 4, 4, 4, 6, 6, 7, 8, 8, 11, 12, 14, 14, 16], 'FID2' : [0,
+    0, 0, 1, 1, 1, 2, 1, 1, 2, 2, 2, 2, 2, 3, 5, 6, 8, 9, 10], 'ID2' : [1, 2, 2, 4, 5, 6, 7,
+    5, 6, 7, 7, 9, 9, 9, 10, 12, 13, 15, 16, 17], 'Kinship' : [0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 'InfType' : ['FS',
+    'FS', 'FS', 'FS', 'PO', 'PO', '3rd', 'PO', 'PO', '3rd', '2nd', '3rd', 'PO', 'PO', '3rd',
+    '3rd', '3rd', '2nd', '4th', '4th']})
 
-AFFECTED = []
+BIM_DF = pd.DataFrame({'CHR' : [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], 'RSID' : ['rs01', 'rs02', 'rs03',
+    'rs04', 'rs05', 'rs06', 'rs07', 'rs08', 'rs09', 'rs10'], 'CM' : [0.0, 1.0, 2.0, 3.0, 4.0,
+    5.0, 6.0, 7.0, 8.0, 9.0], 'BP' : [0, 100, 200, 300, 400, 500, 600, 700, 800, 900],
+    'A1' : ['A', 'G', 'A', 'C', 'T', 'C', 'G', 'T', 'A', 'A'], 'A2' : ['C', 'T', 'G', 'T',
+    'G', 'A', 'A', 'C', 'T', 'C']})
 
-EQUIVALENT_TO = "VARIED"
+SNP_LIST = pd.DataFrame({'RSID' : ['rs01', 'rs03', 'rs05', 'rs07', 'rs09']})
+
+G = np.array([[1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+               0.0],
+              [2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0,
+               1.0],
+              [0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0,
+               2.0],
+              [1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+               0.0],
+              [2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0,
+               1.0],
+              [0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0,
+               2.0],
+              [1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+               0.0],
+              [2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0,
+               1.0],
+              [0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0,
+               2.0],
+              [1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+               0.0]])

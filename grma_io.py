@@ -13,7 +13,7 @@ DataFrames), and returns a DataFrame in one normalized form:
 Each file's layout is stated once, as a tuple of column names, and positions and counts are derived
 from it.  The fam and bim layouts come from bedbimfam; the KING layout is defined here.  This module
 only reads: filtering samples and checking one input against another are planning steps, done in
-grma2_lib.
+grma_lib.
 """
 
 import logging
@@ -23,7 +23,7 @@ import pandas as pd
 import scipy.stats as stats
 
 import bedbimfam as bbf
-import grma2_util
+import grma_util
 import snipar_hdf5
 
 
@@ -139,7 +139,7 @@ def _numeric_column(df: pd.DataFrame, column: str, name: str, row_ids: pd.Series
     unreadable = values.isna() & ~blank
     if unreadable.any():
         raise ValueError(f"The {name} has values in column {column} that are not numbers, for "
-                         f"{grma2_util.describe_offenders(row_ids[unreadable].tolist())}")
+                         f"{grma_util.describe_offenders(row_ids[unreadable].tolist())}")
     return values.astype(float)
 
 

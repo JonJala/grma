@@ -1,57 +1,78 @@
 """
-VARIED_OPTIONS: VARIED's families and genotypes, run with every option that filters or adjusts the
-samples -- the one case whose expected values pass through a phenotype file, covariate regression
-and sample filtering end to end.  Replaces tc_allopt, which exercised the same options but could only
-check which rsids came out.
-
-Each dropped sample is removed by a different mechanism:
+VARIED_OPTIONS: VARIED's families and genotypes, with every option that filters or adjusts the
+samples.  Each removes different samples:
 
     IIDs 5, 13    absent from the phenotype file
     IID 9         missing a covariate value
     IIDs 2, 16    left out of the ID list
 
-leaving 13 of the 18.  The phenotype file's values differ from the fam file's, so the fam file's must
-be overridden; they are residualized on two non-collinear covariates plus an intercept.  VARIED's SNP
-list, with blocks of 3, puts the retained SNPs in different blocks.
-
-No parent columns, so parental residualization is a no-op (AFFECTED is empty).  Expected values are
-derived by the mocks, except ANALYSIS_IIDS, stated from the list above and checked against them.
+The phenotype file's values differ from the fam file's, so the fam file's must be overridden; they
+are residualized on two covariates.  A SNP list keeps a subset of the SNPs, three per block.
 """
 
 import numpy as np
 import pandas as pd
 
-import bedbimfam as bbf
 
-from tc_varied import FAM_DF, REL_DF, BIM_DF, G, SNP_LIST, RETAINED_RSIDS
+FAM_DF = pd.DataFrame({'FID' : [0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10], 'IID' : [0,
+                       1,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17], 'IIDF' : [0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 'IIDM' : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0], 'SEX' : [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 'PHENO' : [1.0,
+    2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0,
+    18.0]})
 
+REL_DF = pd.DataFrame({'FID1' : [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 4, 5, 7, 7, 9],
+    'ID1' : [0, 0, 1, 3, 3, 3, 3, 4, 4, 4, 6, 6, 7, 8, 8, 11, 12, 14, 14, 16], 'FID2' : [0,
+    0, 0, 1, 1, 1, 2, 1, 1, 2, 2, 2, 2, 2, 3, 5, 6, 8, 9, 10], 'ID2' : [1, 2, 2, 4, 5, 6, 7,
+    5, 6, 7, 7, 9, 9, 9, 10, 12, 13, 15, 16, 17], 'Kinship' : [0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 'InfType' : ['FS',
+    'FS', 'FS', 'FS', 'PO', 'PO', '3rd', 'PO', 'PO', '3rd', '2nd', '3rd', 'PO', 'PO', '3rd',
+    '3rd', '3rd', '2nd', '4th', '4th']})
 
-_IDS = FAM_DF[[bbf.FAM_FID_COL, bbf.FAM_IID_COL]]
+BIM_DF = pd.DataFrame({'CHR' : [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], 'RSID' : ['rs01', 'rs02', 'rs03',
+    'rs04', 'rs05', 'rs06', 'rs07', 'rs08', 'rs09', 'rs10'], 'CM' : [0.0, 1.0, 2.0, 3.0, 4.0,
+    5.0, 6.0, 7.0, 8.0, 9.0], 'BP' : [0, 100, 200, 300, 400, 500, 600, 700, 800, 900],
+    'A1' : ['A', 'G', 'A', 'C', 'T', 'C', 'G', 'T', 'A', 'A'], 'A2' : ['C', 'T', 'G', 'T',
+    'G', 'A', 'A', 'C', 'T', 'C']})
 
-# Chosen by a seeded search (seed 389 of a family-effect-plus-noise model, rounded to one decimal) so
-# that omega is positive definite WITHOUT shrinkage (smallest eigenvalue 0.80 x variance) and
-# R omega R' is well-conditioned (worst condition number 4.1).  See notes §7.4j for why that matters.
-_PHENOS = [-2.7, -1.2, 1.7, -1.4, -0.1, 1.4, -1.7, -1.1, 2.3, 2.8, -2.4, 1.4, 1.1, 2.0, 0.8, 0.2,
-           -1.5, -0.2]
+PHENO_DF = pd.DataFrame({'FID' : [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 4, 5, 7, 8, 9, 10], 'IID' : [0, 1,
+                         2, 3,
+    4, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17], 'PHENO' : [-2.7, -1.2, 1.7, -1.4, -0.1, -1.7,
+    -1.1, 2.3, 2.8, -2.4, 1.4, 1.1, 0.8, 0.2, -1.5, -0.2]})
 
-PHENO_DF = _IDS.copy()
-PHENO_DF[bbf.FAM_PHENO_COL] = _PHENOS
-PHENO_DF = PHENO_DF[~FAM_DF[bbf.FAM_IID_COL].isin([5, 13])].reset_index(drop=True)
+COVAR_DF = pd.DataFrame({'FID' : [0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                         'IID' : [0, 1,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17], 'AGE' : [51.0, 65.0, 59.0, 31.0,
+    35.0, 64.0, 20.0, 61.0, 60.0, 43.0, 35.0, 34.0, 33.0, 42.0, 45.0, 48.0, 70.0, 60.0],
+    'PC1' : [-1.9, -1.29, -1.84, -0.24, -1.27, 0.27, 0.16, -0.19, -2.52, np.nan, -0.05, 0.11,
+    -1.53, -0.48, -0.98, -0.81, 1.06, -0.81]})
 
-# From a seeded generator (seed 7); PC1 is missing for IID 9
-COVAR_DF = _IDS.copy()
-COVAR_DF["AGE"] = [51.0, 65.0, 59.0, 31.0, 35.0, 64.0, 20.0, 61.0, 60.0, 43.0, 35.0, 34.0, 33.0, 42.0,
-                   45.0, 48.0, 70.0, 60.0]
-COVAR_DF["PC1"] = [-1.9, -1.29, -1.84, -0.24, -1.27, 0.27, 0.16, -0.19, -2.52, np.nan, -0.05, 0.11,
-                   -1.53, -0.48, -0.98, -0.81, 1.06, -0.81]
+ID_LIST = pd.DataFrame({'FID' : [0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 4, 5, 6, 7, 8, 10], 'IID' : [0, 1, 3,
+                        4,
+    5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17]})
 
-ID_LIST = _IDS[~FAM_DF[bbf.FAM_IID_COL].isin([2, 16])].reset_index(drop=True)
+SNP_LIST = pd.DataFrame({'RSID' : ['rs01', 'rs03', 'rs05', 'rs07', 'rs09']})
+
+G = np.array([[1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+               0.0],
+              [2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0,
+               1.0],
+              [0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0,
+               2.0],
+              [1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+               0.0],
+              [2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0,
+               1.0],
+              [0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0,
+               2.0],
+              [1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+               0.0],
+              [2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0,
+               1.0],
+              [0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0,
+               2.0],
+              [1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0,
+               0.0]])
 
 SNPS_PER_BLOCK = 3
-
-
-# Stated facts and intermediates =================================================================
-
-AFFECTED = []
-
-ANALYSIS_IIDS = [str(iid) for iid in FAM_DF[bbf.FAM_IID_COL] if iid not in (2, 5, 9, 13, 16)]

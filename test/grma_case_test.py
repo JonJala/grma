@@ -1,7 +1,7 @@
 """
-grma2_lib.grma2() on every case in tcs2.py, at every relatedness degree.
+grma_lib.grma() on every case in tcs.py, at every relatedness degree.
 
-    TestCaseEndToEnd     against mock2's independent implementation of the specification
+    TestCaseEndToEnd     against grma_mock's independent implementation of the specification
     TestCaseInvariance   changes to the inputs that must leave the results unchanged, or (for
                          recoded alleles) exactly negated
     TestCaseEquivalence  cases that must give exactly the results of another
@@ -18,17 +18,17 @@ main_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(main_directory)
 
 import bedbimfam as bbf
-import grma2_lib as sut
-import mock2
-import tc2_parental_snipar
-import tcs2
+import grma_lib as sut
+import grma_mock
+import tc_parental_snipar
+import tcs
 
 
 PALINDROMIC = ({"A", "T"}, {"C", "G"})
 
 
 def run(key, degree, tmp_path, case=None, **extra):
-    return sut.grma2(**{**tcs2.grma2_kwargs(key, degree, tmp_path, case=case), **extra})
+    return sut.grma(**{**tcs.grma_kwargs(key, degree, tmp_path, case=case), **extra})
 
 
 def value_columns(results):
@@ -40,7 +40,7 @@ def numeric(column):
 
 
 def assert_same_results(actual, expected, rows=None):
-    """The same estimates, SEs and p-values, up to floating-point rounding (see grma2_lib_test)"""
+    """The same estimates, SEs and p-values, up to floating-point rounding (see grma_lib_test)"""
     assert value_columns(actual) == value_columns(expected)
     for column in value_columns(actual):
         a, e = numeric(actual[column]), numeric(expected[column])
@@ -50,7 +50,7 @@ def assert_same_results(actual, expected, rows=None):
 
 
 def copy_case(key):
-    case = dict(tcs2.get(key))
+    case = dict(tcs.get(key))
     for name, value in case.items():
         if isinstance(value, pd.DataFrame):
             case[name] = value.copy()
@@ -64,10 +64,10 @@ def copy_case(key):
 # --------------------------------------------------------------------------------------------------
 class TestCaseEndToEnd:
 
-    @pytest.mark.parametrize("key, degree", tcs2.params())
+    @pytest.mark.parametrize("key, degree", tcs.params())
     def test__results__the_mock_implementations(self, key, degree, tmp_path):
         actual = run(key, degree, tmp_path)
-        rsids, expected = mock2.mock_grma2(**tcs2.mock_kwargs(key, degree))
+        rsids, expected = grma_mock.mock_grma(**tcs.mock_kwargs(key, degree))
 
         assert actual["RSID"].tolist() == rsids
         assert [c[len("BETA_"):] for c in actual.columns if c.startswith("BETA_")] == list(expected)
@@ -77,14 +77,14 @@ class TestCaseEndToEnd:
             assert np.allclose(actual["SE_" + label], ses, rtol=1e-8, atol=1e-12,
                                equal_nan=True), label
 
-    @pytest.mark.parametrize("degree", tcs2.REL_DEGREES)
+    @pytest.mark.parametrize("degree", tcs.REL_DEGREES)
     def test__snipar_case__exercises_the_po_regression(self, degree, tmp_path):
         # A case meant to test the PO regression must actually produce PO estimates -- at most
         # SNPs, and in particular at the one snipar's file lacks, where only the children with
         # both parents genotyped can contribute
         actual = run("PARENTAL_SNIPAR", degree, tmp_path)
 
-        missing_from_snipar = f"rs{tc2_parental_snipar.MISSING_FROM_SNIPAR}"
+        missing_from_snipar = f"rs{tc_parental_snipar.MISSING_FROM_SNIPAR}"
         assert actual["BETA_PO"].notna().sum() >= len(actual) - 2
         assert actual.loc[actual["RSID"] == missing_from_snipar, "BETA_PO"].notna().all()
 
@@ -92,7 +92,7 @@ class TestCaseEndToEnd:
 # --------------------------------------------------------------------------------------------------
 class TestCaseInvariance:
 
-    @pytest.mark.parametrize("key, degree", tcs2.params())
+    @pytest.mark.parametrize("key, degree", tcs.params())
     def test__phenotypes_shifted__same_results(self, key, degree, tmp_path):
         case = copy_case(key)
         for name in ("FAM_DF", "PHENO_DF"):
@@ -102,7 +102,7 @@ class TestCaseInvariance:
 
         assert_same_results(run(key, degree, tmp_path, case=case), run(key, degree, tmp_path))
 
-    @pytest.mark.parametrize("key, degree", tcs2.params())
+    @pytest.mark.parametrize("key, degree", tcs.params())
     def test__alleles_swapped__those_estimates_negated(self, key, degree, tmp_path):
         # Swap A1 and A2 in the bim file and recode the genotypes to match.  snipar's file is left
         # as it is, so where it has the SNP, the flip is applied in reading it.  Palindromic SNPs
@@ -124,7 +124,7 @@ class TestCaseInvariance:
                 e = np.where(swapped, -e, e)
             assert np.allclose(a, e, rtol=1e-9, atol=1e-12, equal_nan=True), column
 
-    @pytest.mark.parametrize("key, degree", tcs2.params())
+    @pytest.mark.parametrize("key, degree", tcs.params())
     def test__samples_renamed__same_results(self, key, degree, tmp_path):
         case = copy_case(key)
         fam = case["FAM_DF"]
@@ -151,7 +151,7 @@ class TestCaseInvariance:
 
         assert_same_results(run(key, degree, tmp_path, case=case), run(key, degree, tmp_path))
 
-    @pytest.mark.parametrize("key, degree", tcs2.params())
+    @pytest.mark.parametrize("key, degree", tcs.params())
     def test__snps_renamed__same_results(self, key, degree, tmp_path):
         case = copy_case(key)
         new_rsid = {r : f"snp_{n}" for n, r in enumerate(case["BIM_DF"]["RSID"].astype(str))}
@@ -165,7 +165,7 @@ class TestCaseInvariance:
 
         assert_same_results(run(key, degree, tmp_path, case=case), run(key, degree, tmp_path))
 
-    @pytest.mark.parametrize("key, degree", tcs2.params())
+    @pytest.mark.parametrize("key, degree", tcs.params())
     def test__singletons_added__same_results(self, key, degree, tmp_path):
         # Samples related to nobody are in no regression, so must not affect Omega's variance or
         # the phenotypes' centering.  The original implementation failed this.
@@ -192,7 +192,7 @@ class TestCaseInvariance:
 
         assert_same_results(run(key, degree, tmp_path, case=case), run(key, degree, tmp_path))
 
-    @pytest.mark.parametrize("key, degree", tcs2.params())
+    @pytest.mark.parametrize("key, degree", tcs.params())
     def test__one_snp_per_block__same_results(self, key, degree, tmp_path):
         assert_same_results(run(key, degree, tmp_path, snps_per_block=1),
                             run(key, degree, tmp_path))
@@ -201,22 +201,22 @@ class TestCaseInvariance:
 # --------------------------------------------------------------------------------------------------
 class TestCaseEquivalence:
 
-    @pytest.mark.parametrize("key, degree", tcs2.params(tcs2.equivalent_keys()))
+    @pytest.mark.parametrize("key, degree", tcs.params(tcs.equivalent_keys()))
     def test__same_results_as_the_equivalent_case(self, key, degree, tmp_path):
-        case = tcs2.get(key)
+        case = tcs.get(key)
         actual = run(key, degree, tmp_path)
         expected = run(case["EQUIVALENT_TO"], degree, tmp_path)
 
         excepted = actual["RSID"].isin(case["EQUIVALENT_EXCEPT"] or []).to_numpy()
         assert_same_results(actual, expected, rows=~excepted)
 
-    @pytest.mark.parametrize("degree", tcs2.REL_DEGREES)
+    @pytest.mark.parametrize("degree", tcs.REL_DEGREES)
     def test__hidden_mother__differs_where_snipar_lacks_the_snp(self, degree, tmp_path):
         # The exception is real: with the mother hidden, her children have no residual where snipar
         # lacks the SNP, so the PO estimate there changes
         actual = run("PARENTAL_SNIPAR_HIDDEN_MOTHER", degree, tmp_path)
         expected = run("PARENTAL_SNIPAR", degree, tmp_path)
 
-        at = (actual["RSID"] == f"rs{tc2_parental_snipar.MISSING_FROM_SNIPAR}").to_numpy()
+        at = (actual["RSID"] == f"rs{tc_parental_snipar.MISSING_FROM_SNIPAR}").to_numpy()
         assert not np.allclose(numeric(actual["BETA_PO"])[at], numeric(expected["BETA_PO"])[at],
                                equal_nan=True)

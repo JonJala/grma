@@ -1,16 +1,16 @@
 """
-An independent implementation of GRMA, written from the specification, for checking grma2_lib.
+An independent implementation of GRMA, written from the specification, for checking grma_lib.
 
-It shares no code with grma2_lib, and deliberately works differently wherever it can: dense
+It shares no code with grma_lib, and deliberately works differently wherever it can: dense
 matrices instead of sparse ones, plain loops over samples and SNPs instead of vectorized arrays, an
 eigendecomposition of each block of Omega instead of a screen followed by ARPACK, one
 pseudo-inverse of each regression's whole covariance instead of a block-wise one, and the covariance
-of the estimates computed literally as W Omega W'.  Agreement with grma2_lib is then a real
+of the estimates computed literally as W Omega W'.  Agreement with grma_lib is then a real
 cross-check, not a restatement.
 
-It assumes inputs that pass grma2_lib's checks: it validates nothing.
+It assumes inputs that pass grma_lib's checks: it validates nothing.
 
-The one entry point is mock_grma2(), taking the same inputs as grma2_lib.grma2() but always as
+The one entry point is mock_grma(), taking the same inputs as grma_lib.grma() but always as
 DataFrames and arrays, plus snipar's data as arrays rather than a file.
 """
 
@@ -38,7 +38,7 @@ def _number(value):
     return np.nan if x == MISSING_PHENOTYPE else x
 
 
-def mock_grma2(*, fam, king, bim, genotypes, rel_degree, pheno=None, covar=None, id_list=None,
+def mock_grma(*, fam, king, bim, genotypes, rel_degree, pheno=None, covar=None, id_list=None,
                snp_list=None, snipar=None):
     """GRMA's estimates, from the specification
 
@@ -46,7 +46,7 @@ def mock_grma2(*, fam, king, bim, genotypes, rel_degree, pheno=None, covar=None,
         fam, king, bim: DataFrames, with their formats' column names
         genotypes: (bim snps, fam samples), NaN where missing
         rel_degree: 0 to 3
-        pheno, covar, id_list, snp_list: DataFrames as grma2_io reads them, or None
+        pheno, covar, id_list, snp_list: DataFrames as grma_io reads them, or None
         snipar: snipar's data as given to snipar_hdf5.write_snipar_file(), or None
 
     Returns:

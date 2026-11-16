@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 
 import bedbimfam as bbf
-import grma2_io
+import grma_io
 
 
 _rng = np.random.default_rng(seed=20261114)
@@ -94,7 +94,7 @@ _PAIRS = ([(p, k, "PO") for p in ("dad_a", "mum_a") for k in ("a1", "a2", "a3")]
           [("mum_c", "c1", "PO"), ("d1", "d2", "FS"), ("u_d", "d1", "2nd"), ("u_d", "d2", "2nd"),
            ("z", "c1", "3rd")])
 REL_DF = pd.DataFrame([("F", a, "F", b, t) for a, b, t in _PAIRS],
-                      columns=list(grma2_io.KING_COLS))
+                      columns=list(grma_io.KING_COLS))
 
 _ALLELES = [("A", "C"), ("G", "T"), ("C", "A"), ("A", "G"), ("T", "C"), ("G", "A"),
             ("C", "T"), ("A", "C"), ("T", "G"), ("G", "C"), ("A", "G"), ("C", "A")]

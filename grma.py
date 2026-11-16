@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 import bedbimfam as bbf
+import grma_io
 import grma_lib as lib
 import snipar_hdf5 as snipar
 
@@ -202,6 +203,22 @@ def bfile_glob_path(s_input: str) -> Set[str]:
     file_path_prefixes = {os.path.splitext(f)[0] for f in file_path_list}
     return file_path_prefixes
 
+def file_glob_path(s_input: str) -> Set[str]:
+    """
+    Used for parsing inputs that name whole files by a glob pattern, suffix included (unlike
+    bfile_glob_path, which names filesets by their prefix).
+
+    :param s_input: String passed in by argparse
+
+    :return: Set of file paths
+    """
+    file_path_list = glob.glob(s_input)
+
+    if not file_path_list:
+        raise ValueError(f"Invalid glob pattern, no files found for: {s_input}")
+
+    return set(file_path_list)
+
 #################################
 def get_grma_parser(progname: str) -> argp.ArgumentParser:
     """
@@ -242,25 +259,29 @@ def get_grma_parser(progname: str) -> argp.ArgumentParser:
 
     infile_opt.add_argument("--rel-pedigree", metavar="FILE", type=input_file, required=True,
                             help=f"Path to KING-formatted relatedness file (ASCII). "
-                                 f"Needs the following columns: {lib.NEEDED_KING_COLS}")
-    infile_opt.add_argument("--imputed-parents", type=bfile_glob_path, required=False,
+                                 f"Needs the following columns: {list(grma_io.KING_COLS)}")
+    infile_opt.add_argument("--imputed-parents", type=file_glob_path, required=False,
                             metavar="GLOB_PATH", nargs="+",
                             help="Optional input to specify imputed parental genotype files "
                                  "(HDF5, as written by snipar's impute.py).  One file per "
                                  "chromosome, matched to the --bfile filesets by the chromosome "
                                  "recorded inside each file.  See python glob module for "
-                                 "documentation on the string(s) to be provided here (full path "
-                                 "with support for \"*\", \"?\", and \"[]\").  These strings should "
-                                 "be encased in quotes.  When supplied, parental relationships and "
-                                 "IMPUTED parental genotypes come from these files.  The fam "
-                                 "file's parental ID columns are not consulted.  However, any "
-                                 "parents whose genotypes are OBSERVED (i.e. are part of the "
-                                 "sample) have genotypes read from the bed file(s).")
+                                 "documentation on the string(s) to be provided here (full path, "
+                                 "including the file's suffix, with support for \"*\", \"?\", "
+                                 "and \"[]\").  These strings should be encased in quotes.  "
+                                 "Parents, and the parent-offspring regression, come only from "
+                                 "these files: without them there is no parent-offspring "
+                                 "regression, and the fam file's parental ID columns are never "
+                                 "consulted.  Parents whose genotypes are OBSERVED (i.e. are part "
+                                 "of the sample) have genotypes read from the bed file(s).")
 
     a_opt = parser.add_argument_group(title="Analysis Options")
     a_opt.add_argument("--rel-thresh", metavar="THRESHOLD",
                        default=DEFAULT_REL_DEG, type=rel_thresh_type,
-                       help=f"Relatedness threshold.  Can be one of {REL_DEG_INPUTS}.  "
+                       help=f"Relatedness threshold: which regressions to run and report.  "
+                            f"FS or 1: parent-offspring (with --imputed-parents) and full "
+                            f"siblings; 2: adds 2nd-degree relatives; 3: adds 3rd-degree "
+                            f"relatives.  Can be one of {REL_DEG_INPUTS}.  "
                             f"Default is {DEFAULT_REL_DEG}")
 
     
@@ -636,7 +657,7 @@ def write_results_to_file(filename: str, results: pd.DataFrame):
 
     res_start_time = time.time()
 
-    results.to_csv(filename, index = False, header=True, sep='\t')
+    grma_io.write_results(results, filename)
     logging.info(f"Time taken to write results is {time.time() - res_start_time}")
 
     
@@ -677,7 +698,8 @@ def main_func(argv: List[str]):
 
         # Run the GRMA pipeline
         logging.info("Calling main GRMA function\n")
-        for bed_file, bim_file, fam_file in zip(iargs[BED_FILES], iargs[BIM_FILES], iargs[FAM_FILES]):
+        for bed_file, bim_file, fam_file, imputed_parental_file in zip(
+                iargs[BED_FILES], iargs[BIM_FILES], iargs[FAM_FILES], imputed_parental_files):
             results = lib.grma(
                 rel_file=iargs[REL_FILE],
                 bed_file=bed_file,
@@ -688,7 +710,8 @@ def main_func(argv: List[str]):
                 covar_file=iargs[COVAR_FILE],
                 snps_per_block=iargs[SNPS_PER_BLOCK],
                 id_list=iargs[ID_LIST],
-                snp_list=iargs[SNP_LIST]
+                snp_list=iargs[SNP_LIST],
+                imputed_parental_file=imputed_parental_file
             )
 
             # Write out the results to disk per chromosome
