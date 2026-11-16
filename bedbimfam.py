@@ -58,6 +58,20 @@ FAM_SEX_COL = "SEX"
 FAM_PHENO_COL = "PHENO"
 FAM_COLS = (FAM_FID_COL, FAM_IID_COL, FAM_IIDF_COL, FAM_IIDM_COL, FAM_SEX_COL, FAM_PHENO_COL)
 
+# A "0" in a parent column means that parent is not in the dataset
+FAM_MISSING_PARENT = "0"
+
+# Sex codes.  Anything else (0, -9) means unknown.
+FAM_MALE_SEX = "1"
+FAM_FEMALE_SEX = "2"
+FAM_UNKNOWN_SEX = "0"
+FAM_KNOWN_SEXES = (FAM_MALE_SEX, FAM_FEMALE_SEX)
+
+# The missing phenotype code.  PLINK uses it in fam files and in alternate phenotype files alike.
+# 0 is NOT missing here: it is only a missing-value code for case/control phenotypes, and GRMA's
+# phenotypes are quantitative.
+FAM_MISSING_PHENOTYPE = -9.0
+
 # FAM file suffix
 FAM_SUFFIX = ".fam"
 
