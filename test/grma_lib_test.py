@@ -168,11 +168,26 @@ class TestBuildRelatednessGraph:
         samples = samples_of(["a", "b", "c", "d", "e", "f"])
 
         actual = graph_of(samples, [("b", "a", "PO"), ("a", "c", "FS"), ("d", "a", "2nd"),
-                                    ("a", "e", "3rd"), ("f", "a", "Dup/MZTwin")])
+                                    ("a", "e", "3rd"), ("f", "a", "Dup/MZ")])
 
         assert pairs(actual) == {(0, 1, sut.RELATIONSHIP_PO), (0, 2, sut.RELATIONSHIP_FS),
                                  (0, 3, sut.RELATIONSHIP_2ND), (0, 4, sut.RELATIONSHIP_3RD),
                                  (0, 5, sut.RELATIONSHIP_DUPLICATE)}
+
+    def test__king_file_from_disk__dup_mz_label_recognized(self, tmp_path):
+        # KING writes "Dup/MZ" for duplicates and MZ twins, as snipar's own reading of KING's
+        # output confirms.  Read from a file, as a real run does, it must be recognized, not
+        # rejected as a label KING does not define.
+        path = os.path.join(tmp_path, "king.kin0")
+        with open(path, "w") as f:
+            f.write("FID1\tID1\tFID2\tID2\tN_SNP\tKinship\tInfType\n"
+                    "F\ta\tF\tb\t1000\t0.49\tDup/MZ\n"
+                    "F\ta\tF\tc\t1000\t0.25\tFS\n")
+        samples = samples_of(["a", "b", "c"])
+
+        actual = sut.build_relatedness_graph(samples, grma_io.read_king(path))
+
+        assert pairs(actual) == {(0, 1, sut.RELATIONSHIP_DUPLICATE), (0, 2, sut.RELATIONSHIP_FS)}
 
     def test__fourth_degree_and_unrelated__left_out(self):
         samples = samples_of(["a", "b", "c"])
@@ -248,7 +263,7 @@ class TestResolveDuplicates:
         assert pairs(graph) == {(0, 1, sut.RELATIONSHIP_FS)}
 
     def test__pair__the_earlier_kept_the_later_dropped(self):
-        samples, graph = resolved(["a", "b", "c"], [("a", "b", "Dup/MZTwin"), ("b", "c", "FS"),
+        samples, graph = resolved(["a", "b", "c"], [("a", "b", "Dup/MZ"), ("b", "c", "FS"),
                                                     ("a", "c", "FS")])
 
         assert samples[sut.SAMPLE_DUPLICATE_OF_COL].tolist() == [-1, 0, -1]
@@ -257,26 +272,26 @@ class TestResolveDuplicates:
         assert pairs(graph) == {(0, 2, sut.RELATIONSHIP_FS)}
 
     def test__earlier_not_in_the_analysis__the_one_in_it_kept(self):
-        samples, _ = resolved(["a", "b"], [("a", "b", "Dup/MZTwin")], in_analysis={"b"})
+        samples, _ = resolved(["a", "b"], [("a", "b", "Dup/MZ")], in_analysis={"b"})
 
         assert samples[sut.SAMPLE_DUPLICATE_OF_COL].tolist() == [1, -1]
         assert samples[sut.SAMPLE_IN_ANALYSIS_COL].tolist() == [False, True]
 
     def test__chain_of_duplicates__one_cluster_one_kept(self):
-        samples, _ = resolved(["a", "b", "c", "d"], [("c", "b", "Dup/MZTwin"),
-                                                     ("b", "a", "Dup/MZTwin")])
+        samples, _ = resolved(["a", "b", "c", "d"], [("c", "b", "Dup/MZ"),
+                                                     ("b", "a", "Dup/MZ")])
 
         assert samples[sut.SAMPLE_DUPLICATE_OF_COL].tolist() == [-1, 0, 0, -1]
 
     def test__two_separate_pairs__one_kept_from_each(self):
-        samples, _ = resolved(["a", "b", "c", "d"], [("a", "b", "Dup/MZTwin"),
-                                                     ("c", "d", "Dup/MZTwin")])
+        samples, _ = resolved(["a", "b", "c", "d"], [("a", "b", "Dup/MZ"),
+                                                     ("c", "d", "Dup/MZ")])
 
         assert samples[sut.SAMPLE_DUPLICATE_OF_COL].tolist() == [-1, 0, -1, 2]
 
     def test__pair_left_with_neither_in_the_analysis__removed(self):
         # c is not in the analysis, and its only link to it was through b, now dropped
-        samples, graph = resolved(["a", "b", "c"], [("a", "b", "Dup/MZTwin"), ("b", "c", "FS")],
+        samples, graph = resolved(["a", "b", "c"], [("a", "b", "Dup/MZ"), ("b", "c", "FS")],
                                   in_analysis={"a", "b"})
 
         assert len(graph) == 0
@@ -335,7 +350,7 @@ class TestIdentifyParents:
     def test__parent_dropped_as_a_duplicate__replaced_by_the_one_kept(self):
         # mum and her twin are duplicates; the twin, later in the fam file, is dropped
         actual = self.parents_of(["mum", "twin", "kid"],
-                                 [("mum", "twin", "Dup/MZTwin"), ("mum", "kid", "PO"),
+                                 [("mum", "twin", "Dup/MZ"), ("mum", "kid", "PO"),
                                   ("twin", "kid", "PO")],
                                  [("S1", "kid", "0", "twin", False, True)], ["S1"])
 
@@ -343,7 +358,7 @@ class TestIdentifyParents:
 
     def test__child_dropped_as_a_duplicate__not_replaced(self):
         actual = self.parents_of(["dad", "kid", "kid_dup"],
-                                 [("kid", "kid_dup", "Dup/MZTwin"), ("dad", "kid", "PO"),
+                                 [("kid", "kid_dup", "Dup/MZ"), ("dad", "kid", "PO"),
                                   ("dad", "kid_dup", "PO")],
                                  [("S1", "kid", "dad", "0", True, False),
                                   ("S1", "kid_dup", "dad", "0", True, False)], ["S1"])

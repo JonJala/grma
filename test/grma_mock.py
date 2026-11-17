@@ -24,7 +24,7 @@ SNIPAR_TOLERANCE = 0.01
 EPSILON = 1e-10                     # Omega's floor
 
 RELATIONSHIP_OF_INFTYPE = {"PO" : "PO", "FS" : "FS", "2nd" : "2ND", "3rd" : "3RD",
-                           "Dup/MZTwin" : "DUP"}
+                           "Dup/MZ" : "DUP"}
 REGRESSIONS = ("PO", "FS", "2ND", "3RD")
 MIN_DEGREE = {"FS" : 0, "2ND" : 2, "3RD" : 3}
 

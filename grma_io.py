@@ -41,7 +41,7 @@ KING_ID_COLS = (KING_FID1_COL, KING_IID1_COL, KING_FID2_COL, KING_IID2_COL)
 KING_COLS = KING_ID_COLS + (KING_REL_COL,)
 
 # KING's inferred relationship types, as they appear in the InfType column
-INF_DUP_MZTWIN = "Dup/MZTwin"
+INF_DUP_MZTWIN = "Dup/MZ"
 INF_PARENT_OFFSPRING = "PO"
 INF_FULLSIB = "FS"
 INF_2ND = "2nd"
